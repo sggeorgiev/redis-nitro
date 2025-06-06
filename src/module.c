@@ -8950,15 +8950,17 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
     /* Remove irrelevant flags from the type mask */
     type &= ~(NOTIFY_KEYEVENT | NOTIFY_KEYSPACE);
 
+    RedisModuleCtx ctx;
+    moduleCreateContext(&ctx, NULL, REDISMODULE_CTX_TEMP_CLIENT);
+
     while((ln = listNext(&li))) {
         RedisModuleKeyspaceSubscriber *sub = ln->value;
         /* Only notify subscribers on events matching the registration,
          * and avoid subscribers triggering themselves */
         if ((sub->event_mask & type) &&
             (sub->active == 0 || (sub->module->options & REDISMODULE_OPTIONS_ALLOW_NESTED_KEYSPACE_NOTIFICATIONS))) {
-            RedisModuleCtx ctx;
-            moduleCreateContext(&ctx, sub->module, REDISMODULE_CTX_TEMP_CLIENT);
             selectDb(ctx.client, dbid);
+            ctx.module = sub->module;
 
             /* mark the handler as active to avoid reentrant loops.
              * If the subscriber performs an action triggering itself,
@@ -8969,10 +8971,10 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
             sub->notify_callback(&ctx, type, event, key);
             server.allow_access_expired--;
             sub->active = prev_active;
-            moduleFreeContext(&ctx);
         }
     }
 
+    moduleFreeContext(&ctx);
     exitExecutionUnit();
 }
 
