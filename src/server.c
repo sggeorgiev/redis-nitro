@@ -7601,6 +7601,55 @@ int main(int argc, char **argv) {
     }
     InitServerLast();
 
+
+// ---- Start benchmark block ----
+serverLog(LL_WARNING, "Starting notifyKeyspaceEvent() benchmark (50 runs)...");
+
+size_t count = 2000000; // 2 million calls per run
+int runs = 50;
+double total_time = 0.0;
+double min_time = -1.0; // Initialize as invalid
+double max_time = 0.0;
+
+for (int r = 0; r < runs; r++) {
+    robj *key = createStringObject("startupkey", 10);
+    struct timespec start, end;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t i = 0; i < count; i++) {
+        notifyKeyspaceEvent(NOTIFY_STRING, "set", key, 0);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    decrRefCount(key);
+
+    double elapsed_sec = (end.tv_sec - start.tv_sec) +
+                         (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    serverLog(LL_WARNING,
+        "Run %d: %zu calls in %.6f seconds",
+        r + 1, count, elapsed_sec);
+
+    total_time += elapsed_sec;
+
+    if (min_time < 0 || elapsed_sec < min_time) min_time = elapsed_sec;
+    if (elapsed_sec > max_time) max_time = elapsed_sec;
+}
+
+double avg_time = total_time / runs;
+
+serverLog(LL_WARNING,
+    "Average time over %d runs: %.6f seconds", runs, avg_time);
+serverLog(LL_WARNING,
+    "Minimum time: %.6f seconds", min_time);
+serverLog(LL_WARNING,
+    "Maximum time: %.6f seconds", max_time);
+// ---- End benchmark block ----
+
+
+
+
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_NOTICE,"Server initialized");
