@@ -662,7 +662,8 @@ void moduleReleaseTempClient(client *c) {
         moduleTempClientCap = moduleTempClientCap ? moduleTempClientCap*2 : 32;
         moduleTempClients = zrealloc(moduleTempClients, sizeof(c)*moduleTempClientCap);
     }
-    clearClientConnectionState(c);
+    if(c->conn)
+        clearClientConnectionState(c);
     listEmpty(c->reply);
     c->reply_bytes = 0;
     c->duration = 0;
