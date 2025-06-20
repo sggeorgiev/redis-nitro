@@ -110,9 +110,22 @@ void estoreIncrementalCascade(estore *es, uint64_t now, uint64_t maxCascade) {
     if (!server.cluster_enabled) {
         ebCascade(es->buckets + 0, es->bucket_type, now, maxCascade);
         return;
-    } else {
-        assert(0); // TODO_MOTI: Support cluster mode (See:kvstoreIncrementalCascade())
     }
+
+    for(int i = 0; i < es->num_buckets && maxCascade > 0; i++) 
+        maxCascade -= ebCascade(es->buckets + i, es->bucket_type, now, maxCascade);
+}
+
+void estoreCombineStats(ebucketsStats *from, ebucketsStats *into) {
+    into->totalItems += from->totalItems;
+    into->totalBuckets += from->totalBuckets;
+    into->totalSegments += from->totalSegments;
+
+    if (into->totalBuckets == 0) return;
+
+    into->avgItemsPerBucket = into->totalItems / into->totalBuckets;
+    into->avgItemsPerSegment = into->totalItems / into->totalSegments;
+    into->avgSegPerBucket = into->totalSegments / into->totalBuckets;        
 }
 
 void estoreGetStats(estore *es, char *buf, size_t bufsize, int full) {
@@ -121,8 +134,14 @@ void estoreGetStats(estore *es, char *buf, size_t bufsize, int full) {
         ebGetStats(es->buckets[0], es->bucket_type, &stats);
         ebGetStatsMsg(buf, bufsize, &stats, full);
     } else {
-        assert(0); // TODO_MOTI: Support cluster mode (See:kvstoreGetStats())
-    }        
+        ebucketsStats clusterStats = {0}; /* must be zeroed */
+        for (int i = 0; i < es->num_buckets; i++) {
+            ebucketsStats stats = {0}; /* must be zeroed */
+            ebGetStats(es->buckets[i], es->bucket_type, &stats);
+            estoreCombineStats(&stats, &clusterStats);
+        }
+        ebGetStatsMsg(buf, bufsize, &clusterStats, full);
+    }
 }
 
 /* Get the total number of items in the expiration store */
@@ -1107,3 +1126,417 @@ void touchCommand(client *c) {
         if (lookupKeyRead(c->db,c->argv[j]) != NULL) touched++;
     addReplyLongLong(c,touched);
 }
+
+#ifdef REDIS_TEST
+#include <stdio.h>
+#include "testhelp.h"
+
+#define TEST(name) printf("test — %s\n", name);
+typedef struct TestKVObj {
+    int index;
+    ExpireMeta mexpire;
+} TestKVObj;
+
+ExpireMeta *getTestKVObjExpireMeta(const void *item) {
+    return &((TestKVObj *)item)->mexpire;
+}
+
+void deleteTestKVObjCallback(eItem item, void *ctx) {
+    UNUSED(ctx);
+    UNUSED(item);
+}
+
+EbucketsType testEbType = {
+    .getExpireMeta = getTestKVObjExpireMeta,
+    .onDeleteItem = deleteTestKVObjCallback,
+    .itemsAddrAreOdd = 0,
+    .ebp.precision = 0,
+    .ebp.keySize = EB_PRECISION2KEYSIZE(0 /*.precision*/),
+};
+
+/* ./redis-server test expire */
+int expireTest(int argc, char **argv, int flags) {
+    UNUSED(argc);
+    UNUSED(argv);
+    UNUSED(flags);
+
+    TEST("Create estore with pre-allocated buckets") {
+        int num_bits = 3; // 2^3 = 8 buckets
+        int num_buckets = 1 << num_bits;
+
+        estore *es = estoreCreate(&testEbType, num_bits);
+
+        for (int i = 0; i < num_buckets; i++) {
+            ebuckets b = es->buckets[i];
+            assert(b == NULL); // ebCreate returns NULL
+        }
+
+        assert(es->num_buckets == num_buckets);
+        assert(es->num_buckets_bits == num_bits);
+        assert(es->bucket_type == &testEbType);
+        assert(es->count == 0);
+
+        estoreRelease(es); // Clean up
+    }
+
+    TEST("estoreGetBucket with cluster mode OFF") {
+        server.cluster_enabled = 0; // Non-cluster mode
+
+        estore *es = estoreCreate(&testEbType, 2); // 2^2 = 4 buckets
+        ebuckets *expected = &es->buckets[0];
+
+        for (int i = 0; i < 4; i++) {
+            ebuckets *b = estoreGetBucket(es, i);
+            assert(b == expected); // All slots should return the first bucket in non-cluster mode
+        }
+
+        estoreRelease(es);
+    }
+
+    TEST("estoreGetBucket with cluster mode ON") {
+        server.cluster_enabled = 1; // Cluster mode enabled
+
+        estore *es = estoreCreate(&testEbType, 2); // 4 buckets
+
+        for (int i = 0; i < 4; i++) {
+            ebuckets *b = estoreGetBucket(es, i);
+            assert(b == &es->buckets[i]); // Each slot should map to its corresponding bucket
+        }
+
+        estoreRelease(es);
+    }
+
+    TEST("estoreAdd inserts kvobj at correct address in expected bucket") {
+        server.cluster_enabled = 0;
+
+        estore *es = estoreCreate(&testEbType, 2); // 4 buckets (slots 0-3)
+        TestKVObj *kv = zmalloc(sizeof(TestKVObj));
+        long long expire_time = 1;
+        int slot = 1;
+
+        assert(estoreSize(es) == 0);
+
+        estoreAdd(es, (kvobj*)kv, slot, expire_time);
+        assert(estoreSize(es) == 1);
+
+        // Get the expected bucket
+        ebuckets *bucket = estoreGetBucket(es, slot);
+        EbucketsIterator iter;
+        int found = 0;
+
+        ebStart(&iter, *bucket, es->bucket_type);
+        while (iter.currItem) {
+            if (iter.currItem == kv) {
+                found = 1;
+                break;
+            }
+            ebNext(&iter);
+        }
+        ebStop(&iter);
+
+        assert(found == 1); // kvobj was found by pointer
+
+        zfree(kv);
+        estoreRelease(es);
+    }
+
+    TEST("estoreAdd handles NULL estore or kvobj gracefully") {
+        estore *es = estoreCreate(&testEbType, 2); // 4 buckets (slots 0-3)
+        TestKVObj *kv = zmalloc(sizeof(TestKVObj));
+
+        long long expire_time = 1;
+        unsigned long long original_count = estoreSize(es);
+
+        estoreAdd(NULL, (kvobj*)kv, 0, expire_time);
+        estoreAdd(es, NULL, 0, expire_time);
+
+        assert(estoreSize(es) == original_count);
+
+        zfree(kv);
+        estoreRelease(es);
+    }
+
+    TEST("estoreEmpty clears all buckets and resets count") {
+        server.cluster_enabled = 1;
+
+        // Create estore with 4 buckets
+        estore *es = estoreCreate(&testEbType, 2); // 2^2 = 4 buckets
+
+        TestKVObj *kv[4];
+        // Add one TestKVObj to each bucket
+        for (int slot = 0; slot < 4; slot++) {
+            kv[slot] = zmalloc(sizeof(TestKVObj));
+            estoreAdd(es, (kvobj*)kv[slot], slot, 1);
+        }
+
+        // Ensure total count is 4
+        assert(estoreSize(es) == 4);
+
+        // Confirm all buckets are not empty
+        for (int i = 0; i < es->num_buckets; i++) {
+            ebuckets *bucket = &es->buckets[i];
+            assert(!ebIsEmpty(*bucket));
+        }
+
+        // Call estoreEmpty
+        estoreEmpty(es);
+
+        // Confirm count is zero
+        assert(estoreSize(es) == 0);
+
+        // Confirm all buckets are empty
+        for (int i = 0; i < es->num_buckets; i++) {
+            ebuckets *bucket = &es->buckets[i];
+            assert(ebIsEmpty(*bucket));
+        }
+
+        estoreRelease(es);
+    }
+
+    TEST("estoreEmpty with NULL estore is a no-op") {
+        // This should not crash or produce side effects
+        estoreEmpty(NULL);
+        // No assertion needed — if it doesn't crash, it passes
+    }
+
+    TEST("estoreRelease with NULL does nothing") {
+        // Should not crash or do anything
+        estoreRelease(NULL);
+    }
+
+    TEST("estoreRelease frees all resources for valid estore") {
+        // Setup
+        estore *es = estoreCreate(&testEbType, 2); // 4 buckets
+
+        // Add an item to ensure some real content exists
+        TestKVObj *kv = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv, 1, 1);
+
+        // Just ensure it was added (not strictly necessary, but good check)
+        assert(estoreSize(es) == 1);
+
+        // Release the estore
+        estoreRelease(es);
+
+        // We can't assert anything post-release (pointer is now invalid),
+        // but Valgrind or AddressSanitizer will catch use-after-free if any.
+        zfree(kv); // Caller owns kvobj memory separately
+    }
+
+    TEST("estoreRemove removes kvobj and decrements count") {
+        server.cluster_enabled = 0;
+
+        // Create estore with 1 bucket
+        estore *es = estoreCreate(&testEbType, 1);
+
+        // Allocate and add a test kvobj
+        TestKVObj *kv = zmalloc(sizeof(TestKVObj));
+        long long expire_time = 1;
+
+        estoreAdd(es, (kvobj*)kv, 0, expire_time);
+        assert(estoreSize(es) == 1);
+
+        // Remove the kvobj
+        estoreRemove(es, 0, (kvobj*)kv);
+        assert(estoreSize(es) == 0);
+
+        // Cleanup
+        zfree(kv);
+        estoreRelease(es);
+    }
+
+    TEST("estoreRemove with NULL estore does nothing") {
+        // Should not crash or do anything
+        TestKVObj *kv = zmalloc(sizeof(TestKVObj));
+        estoreRemove(NULL, 0, (kvobj*)kv);
+        zfree(kv);
+    }
+
+    TEST("estoreSlotSize reports correct number of items in a slot") {
+        server.cluster_enabled = 1;
+        estore *es = estoreCreate(&testEbType, 2); // 4 slots
+
+        // Slot 1 should initially be 0
+        assert(estoreSlotSize(es, 1) == 0);
+
+        // Add two kvobj to slot 1
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv1, 1, 1);
+        
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv2, 1, 2);
+
+        // Add one kvobj to slot 2
+        TestKVObj *kv3 = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv3, 2, 1);
+
+        // Now slot 1 should report size 2
+        assert(estoreSlotSize(es, 1) == 2);
+
+        // Slot 2 should report size 1
+        assert(estoreSlotSize(es, 2) == 1);
+
+        // Other slots still 0
+        assert(estoreSlotSize(es, 0) == 0);
+        assert(estoreSlotSize(es, 3) == 0);
+
+        zfree(kv1);
+        zfree(kv2);
+        zfree(kv3);
+        estoreRelease(es);
+    }
+
+    TEST("estoreSlotSize returns 0 when estore is NULL") {
+        assert(estoreSlotSize(NULL, 0) == 0);
+        assert(estoreSlotSize(NULL, 1) == 0);
+    }
+
+    TEST("estoreSlotIsEmpty reflects whether a slot has items") {
+        server.cluster_enabled = 1;
+        estore *es = estoreCreate(&testEbType, 2); // 4 slots
+
+        // Slot 2 should be empty initially
+        assert(estoreSlotIsEmpty(es, 2) == 1);
+
+        // Add one kvobj to slot 2
+        TestKVObj *kv = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv, 2, 1234567890);
+
+        // Now slot 2 should not be empty
+        assert(estoreSlotIsEmpty(es, 2) == 0);
+
+        zfree(kv);
+        estoreRelease(es);
+    }
+
+    TEST("estoreSlotIsEmpty returns 1 when estore is NULL") {
+        assert(estoreSlotIsEmpty(NULL, 0) == 1);
+        assert(estoreSlotIsEmpty(NULL, 3) == 1);
+    }
+
+    TEST("estoreCombineStats correctly combines statistics") {
+        ebucketsStats from = {
+            .totalItems = 20,
+            .totalBuckets = 4,
+            .totalSegments = 2,
+            .avgItemsPerBucket = 0, // will be recalculated
+            .avgItemsPerSegment = 0,
+            .avgSegPerBucket = 0
+        };
+
+        ebucketsStats into = {
+            .totalItems = 10,
+            .totalBuckets = 2,
+            .totalSegments = 1,
+            .avgItemsPerBucket = 0,
+            .avgItemsPerSegment = 0,
+            .avgSegPerBucket = 0
+        };
+
+        estoreCombineStats(&from, &into);
+
+        // Validate combined totals
+        assert(into.totalItems == 30);
+        assert(into.totalBuckets == 6);
+        assert(into.totalSegments == 3);
+
+        // Validate recomputed averages
+        assert(into.avgItemsPerBucket == 5);   // 30 / 6
+        assert(into.avgItemsPerSegment == 10); // 30 / 3
+        assert(into.avgSegPerBucket == 0);     // 3 / 6 = 0 (integer division)
+
+        // Edge case: totalBuckets = 0
+        ebucketsStats zeroBucketsFrom = {
+            .totalItems = 5,
+            .totalBuckets = 0,
+            .totalSegments = 2
+        };
+
+        ebucketsStats zeroBucketsInto = {
+            .totalItems = 0,
+            .totalBuckets = 0,
+            .totalSegments = 0
+        };
+
+        estoreCombineStats(&zeroBucketsFrom, &zeroBucketsInto);
+
+        // Should add values, but skip average calculations
+        assert(zeroBucketsInto.totalItems == 5);
+        assert(zeroBucketsInto.totalBuckets == 0);
+        assert(zeroBucketsInto.totalSegments == 2);
+        assert(zeroBucketsInto.avgItemsPerBucket == 0);
+        assert(zeroBucketsInto.avgItemsPerSegment == 0);
+        assert(zeroBucketsInto.avgSegPerBucket == 0);
+    }
+
+    TEST("estoreGetStats returns correct stats in non-clustered mode") {
+        server.cluster_enabled = 0;
+
+        estore *es = estoreCreate(&testEbType, 1); // only one bucket
+
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv1, 0, 1);
+
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        estoreAdd(es, (kvobj*)kv2, 0, 1);
+
+        char buf[1024];
+        memset(buf, 0, sizeof(buf));
+
+        estoreGetStats(es, buf, sizeof(buf), 1);
+
+        // Validate that output includes expected stats
+        assert(strstr(buf, " total items: 2") != NULL);
+        assert(strstr(buf, " total buckets: 1") != NULL);
+        assert(strstr(buf, " total segments: 1") != NULL);
+
+        assert(strstr(buf, " avg items per bucket: 2") != NULL);
+        assert(strstr(buf, " avg items per segment: 2") != NULL);
+        assert(strstr(buf, " avg segments per bucket: 1") != NULL);
+
+        zfree(kv1);
+        zfree(kv2);
+        estoreRelease(es);
+    }
+
+    TEST("estoreGetStats returns combined stats in clustered mode") {
+        server.cluster_enabled = 1;
+
+        estore *es = estoreCreate(&testEbType, 2); // two buckets
+
+        // Add objects to different buckets
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv3 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv4 = zmalloc(sizeof(TestKVObj));
+
+        estoreAdd(es, (kvobj*)kv1, 0, 1); // bucket 0
+        estoreAdd(es, (kvobj*)kv2, 1, 1); // bucket 1
+        estoreAdd(es, (kvobj*)kv3, 1, 2); // bucket 1
+        estoreAdd(es, (kvobj*)kv4, 0, 2); // bucket 0
+
+        char buf[1024];
+        memset(buf, 0, sizeof(buf));
+
+        estoreGetStats(es, buf, sizeof(buf), 1); // full = 1 for verbose output
+
+        // Validate that combined values are present
+        assert(strstr(buf, " total items: 4") != NULL);
+        assert(strstr(buf, " total buckets: 2") != NULL);
+        assert(strstr(buf, " total segments: 2") != NULL);
+
+        assert(strstr(buf, " avg items per bucket: 2") != NULL);
+        assert(strstr(buf, " avg items per segment: 2") != NULL);
+        assert(strstr(buf, " avg segments per bucket: 1") != NULL);
+
+        zfree(kv1);
+        zfree(kv2);
+        zfree(kv3);
+        zfree(kv4);
+        estoreRelease(es);
+    }
+    
+    return 0;
+}
+#endif
+
