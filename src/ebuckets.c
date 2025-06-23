@@ -1423,6 +1423,70 @@ uint64_t ebCascade(ebuckets *eb, EbucketsType *type, uint64_t now, uint64_t maxC
     return info.itemsExpired; /* Number of items cascaded */
 }
 
+/**
+ * Calculate the memory usage of an ebuckets data structure.
+ *
+ * This function returns the total amount of memory (in bytes) consumed by a given
+ * ebuckets instance (`eb`). The calculation depends on the internal representation
+ * of the ebuckets, which is determined by the provided `type`.
+ *
+ * Logic Overview:
+ * - If the ebuckets instance is empty (`ebIsEmpty` returns true), the memory usage is 0.
+ * - Otherwise, the size starts with the base `sizeof(ebuckets)` structure.
+ * 
+ * - If the ebuckets type is a **stack**:
+ *   - Add the size of the `ebStack` structure.
+ *   - Recursively include memory used by its first (`l1`) and second (`l2`) levels,
+ *     which are themselves ebuckets.
+ *   - If the third level (`l3`) exists, include its memory.
+ *
+ * - If the ebuckets type is a **rax**:
+ *   - Add the size of the `rax` structure.
+ *   - Add memory for all `raxNode` and `FirstSegHdr` entries.
+ *   - Add additional memory for `NextSegHdr` entries, which are used
+ *     when the number of items exceeds a certain threshold.
+ *
+ * - If the ebuckets type is a **list**, no additional memory beyond the base
+ *   `ebuckets` structure is used.
+ *
+ * @param eb    - The ebuckets instance to analyze.
+ * @param type  - Pointer to an `EbucketsType` structure that defines the ebuckets layout.
+ * @return      - Total size in bytes of memory used by the ebuckets instance.
+ */
+size_t ebMemUsage(ebuckets eb, EbucketsType *type) {
+    if (ebIsEmpty(eb))
+        return 0;
+
+    size_t size = 0;
+    if (type->isEbStack) {
+        ebStack *stack = (ebStack *)eb;
+        size += sizeof(ebStack);
+        EB_STACK_EXEC_L1(type, size += ebMemUsage(stack->l1, type));
+        EB_STACK_EXEC_L1(type, size += ebMemUsage(stack->l2, type));
+        if (stack->l3) {
+            size += EB_STACK_L3_SIZEOF(stack->l3->vecSize);
+        }
+    } else if(!ebIsList(eb)) { /* If not a list, then it is a rax */
+        size += sizeof(rax); /* rax structure itself */
+
+        rax *rax = ebGetRaxPtr(eb);
+        raxIterator iter;
+        raxStart(&iter, rax);
+        raxSeek(&iter, "^", NULL, 0);
+        while (raxNext(&iter)) {
+            FirstSegHdr *seg = iter.data;
+            size += sizeof(raxNode) + iter.key_len; /* raxNode + key */
+            if(seg->numSegs > 0) {
+                /* If the bucket has segments, then add size of FirstSegHdr */
+                size += sizeof(FirstSegHdr);
+                size += (seg->numSegs - 1) * sizeof(NextSegHdr); /* NextSegHdr for each segment */
+            }
+        }
+        raxStop(&iter);
+    }
+    return size;
+}
+
 int ebAddToRax(ebuckets *eb, EbucketsType *type, eItem item, uint64_t bucketKeyItem) {
     EBucketNew newBucket; /* ebAddToBucket takes care to update newBucket.segment.head */
     raxIterator iter;
@@ -3085,6 +3149,107 @@ int ebucketsTest(int argc, char **argv, int flags) {
                 assert(items[i]->index == i);
             ebDestroy(&eb, &myEbType, NULL);
         }
+    }
+
+    TEST("ebMemUsage - empty ebucket returns 0") {
+        ebuckets eb = NULL;
+        size_t usage = ebMemUsage(eb, &myEbType);
+        assert(usage == 0);
+    }
+
+    TEST("ebMemUsage - list-based ebucket returns zero memory usage") {
+        ebuckets eb = NULL;
+        MyItem *items[EB_LIST_MAX_ITEMS];
+        for (int i = 0; i < EB_LIST_MAX_ITEMS; i++) {
+            items[i] = zmalloc(sizeof(MyItem));
+            ebAdd(&eb, &myEbType, items[i], i);
+        }
+
+        assert(ebIsList(eb));
+        size_t usage = ebMemUsage(eb, &myEbType);
+        assert(usage == 0);
+
+        ebDestroy(&eb, &myEbType, NULL);
+    }
+
+    TEST("ebMemUsage - rax-based ebucket with three segments returns correct memory usage") {
+        ebuckets eb = NULL;
+        for (int i = 0; i < EB_LIST_MAX_ITEMS + 10; i++) {
+            MyItem *item = zmalloc(sizeof(MyItem));
+            ebAdd(&eb, &myEbType, item, i + 1);
+        }
+
+        assert(!ebIsList(eb));
+        size_t usage = ebMemUsage(eb, &myEbType);
+        /*  Calculation breakdown:
+            3 * (16 bytes for FirstSegHdr + 4 bytes for raxNode + 6 bytes for key size) 
+            + 24 bytes for the rax structure
+            Total: 102 bytes
+        */
+        assert(usage == 102);
+
+        ebDestroy(&eb, &myEbType, NULL);
+    }
+
+    TEST("ebuckets - rax-based ebucket with extended segment returns correct memory usage") {
+        ebuckets eb = NULL;
+        for (int i = 0; i < 2*EB_SEG_MAX_ITEMS; i++) {
+            MyItem *item = zmalloc(sizeof(MyItem));
+            ebAdd(&eb, &myEbType, item, 1);
+        }
+
+        assert(!ebIsList(eb));
+        size_t usage = ebMemUsage(eb, &myEbType);
+        /* Calculation breakdown:
+           1 * (16 bytes for FirstSegHdr + 4 bytes for raxNode + 6 bytes for key size) 
+           + 1 * 24 bytes for NextSegHdr
+           + 24 bytes for the rax structure
+           Total: 74 bytes
+         */
+        assert(usage == 74);
+
+        ebDestroy(&eb, &myEbType, NULL);
+    }
+
+    TEST("ebMemUsage - ebStack-based ebucket returns memory usage for L1, L2 and L3") {
+        EbucketsType stackType = myEbType2;
+        stackType.isEbStack = 1;
+
+        ebuckets eb = zmalloc(sizeof(ebStack));
+        ebStack *stack = (ebStack *)eb;
+
+        stack->l1 = ebCreate();
+        stack->l2 = ebCreate();
+        stack->l3 = zmalloc(EB_STACK_L3_SIZEOF(2));
+        stack->l3->items = 0;
+        stack->l3->vecSize = 2;
+
+        for (int i = 0; i < EB_SEG_MAX_ITEMS + 10; i++) {
+            MyItem *item = zmalloc(sizeof(MyItem));
+            ebAdd(&stack->l1, &myEbType, item, i + 1);
+        }
+
+        for (int i = 0; i < 2*EB_SEG_MAX_ITEMS; i++) {
+            MyItem *item = zmalloc(sizeof(MyItem));
+            ebAdd(&stack->l2, &myEbType, item, 1);
+        }
+
+        size_t usage = ebMemUsage(eb, &stackType);
+        /*  Calculation breakdown:
+            L1:
+                3 * (16 bytes for FirstSegHdr + 4 bytes for raxNode + 6 bytes for key size) 
+                + 24 bytes for the rax structure
+                + 1 * (16 bytes for FirstSegHdr + 4 bytes for raxNode + 5 bytes for key size) 
+            L2:
+                + 1 * 24 bytes for NextSegHdr
+                + 24 bytes for the rax structure
+            L3:
+                + 2 * 4 for vector item + 16 bytes for ebVector
+            Total: 240 bytes
+        */
+        assert(usage == 240);
+
+        ebDestroy(&eb, &stackType, NULL);
     }
 
 //    TEST("segment - Add smaller item to full segment that all share same ebucket-key")

@@ -362,6 +362,8 @@ int ebAdd(ebuckets *eb, EbucketsType *type, eItem item, uint64_t expireTime);
 
 uint64_t ebCascade(ebuckets *eb, EbucketsType *type, uint64_t now, uint64_t maxCascade);
 
+size_t ebMemUsage(ebuckets eb, EbucketsType *type);
+
 uint64_t ebGetExpireTime(EbucketsType *type, eItem item);
 
 void ebStart(EbucketsIterator *iter, ebuckets eb, EbucketsType *type);
