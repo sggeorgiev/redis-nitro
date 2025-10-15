@@ -2761,23 +2761,23 @@ start_server {
             # Read all six messages with consumer1
             r XREADGROUP GROUP group1 consumer1 COUNT 1 STREAMS mystream >
 
-            after 50
+            after 100
             r XREADGROUP GROUP group1 consumer1 COUNT 1 STREAMS mystream > 
 
-            after 50
+            after 100
             r XREADGROUP GROUP group1 consumer1 COUNT 1 STREAMS mystream >
 
-            after 50
+            after 100
             r XREADGROUP GROUP group1 consumer1 COUNT 1 STREAMS mystream >
 
-            after 50
+            after 100
             r XREADGROUP GROUP group1 consumer1 COUNT 1 STREAMS mystream >
 
-            after 50
+            after 100
             r XREADGROUP GROUP group1 consumer1 COUNT 1 STREAMS mystream >
 
-            # At this point the idle time of 1-0 will be 250ms and for 2-0 will be 200ms
-            set claim_result [r XREADGROUP GROUP group1 consumer2 CLAIM 180 STREAMS mystream >]
+            # At this point the idle time of 1-0 will be 500ms and for 2-0 will be 400ms
+            set claim_result [r XREADGROUP GROUP group1 consumer2 CLAIM 360 STREAMS mystream >]
             lassign [lindex $claim_result 0] stream_name messages
             assert_equal $stream_name "mystream"
             assert_equal [llength $messages] 2
@@ -2790,8 +2790,8 @@ start_server {
             assert_equal [lindex $messages 1 0] 2-0
             assert_equal [lindex $messages 1 3] 1
 
-            # At this point the idle time of 3-0 will be 150ms and for 4-0 will be 100ms
-            set claim_result [r XREADGROUP GROUP group1 consumer2 CLAIM 80 STREAMS mystream >]
+            # At this point the idle time of 3-0 will be 300ms and for 4-0 will be 200ms
+            set claim_result [r XREADGROUP GROUP group1 consumer2 CLAIM 160 STREAMS mystream >]
             lassign [lindex $claim_result 0] stream_name messages
             assert_equal $stream_name "mystream"
             assert_equal [llength $messages] 2
