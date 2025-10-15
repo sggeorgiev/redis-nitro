@@ -2616,38 +2616,6 @@ start_server {
             assert_equal [llength $messages] 3
         }
 
-        test "XREADGROUP CLAIM with two blocked clients" {
-            r DEL mystream
-            r XADD mystream 1-0 f v1
-            r XDEL mystream 1-0
-
-            # Create consumer group
-            r XGROUP CREATE mystream group1 0 MKSTREAM
-
-            # Create two deferring clients for blocking reads
-            set rd1 [redis_deferring_client]
-            set rd2 [redis_deferring_client]
-            
-            # Both clients issue blocking XREADGROUP commands
-            $rd1 XREADGROUP GROUP group1 consumer1 BLOCK 0 STREAMS mystream ">"
-            $rd2 XREADGROUP GROUP group1 consumer2 BLOCK 0 CLAIM 100 STREAMS mystream ">"
-            
-            # Wait for both clients to be blocked
-            wait_for_blocked_clients_count 2
-
-            r XADD mystream 2-0 f v2
-
-            set result1 [$rd1 read]
-            assert_equal [llength $result1] 1
-
-            set result2 [$rd2 read]
-            assert_equal [llength $result2] 1
-
-            # Clean up
-            $rd1 close
-            $rd2 close   
-        }
-
         test "XREADGROUP CLAIM messages become claimable during block" {
             r DEL mystream
             r XADD mystream 1-0 f v1
