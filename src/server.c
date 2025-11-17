@@ -7440,6 +7440,7 @@ struct redisTest {
     {"ebuckets", ebucketsTest},
     {"bitmap", bitopsTest},
     {"rax", raxTest},
+    {"avl", avlTest},
 };
 redisTestProc *getTestProcByName(const char *name) {
     int numtests = sizeof(redisTests)/sizeof(struct redisTest);
