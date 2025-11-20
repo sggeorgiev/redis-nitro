@@ -45,57 +45,6 @@ void streamUpdateCGroupLastId(stream *s, streamCG *cg, streamID *id);
 void trackStreamClaimTimeouts(client *c, robj **keys, int numkeys, uint64_t expire_time);
 
 /* -----------------------------------------------------------------------
- * IDMP (Idempotent Message Producer) structures
- * ----------------------------------------------------------------------- */
-
-/* Structure to hold UID and stream ID for IDMP deduplication */
-typedef struct idmpEntry {
-    robj *uid;          /* User-provided unique identifier (Redis object) */
-    streamID id;        /* Associated stream ID */
-} idmpEntry;
-
-/* Comparison function for idmpEntry structures in AVL tree.
- * Compares entries by UID only (lexicographically).
- * Returns: negative if a < b, 0 if a == b, positive if a > b */
-static int idmpEntryCompare(const void *a, const void *b) {
-    const idmpEntry *ea = (const idmpEntry *)a;
-    const idmpEntry *eb = (const idmpEntry *)b;
-    
-    /* Get the string data from robj */
-    size_t len_a = sdslen((sds)ea->uid->ptr);
-    size_t len_b = sdslen((sds)eb->uid->ptr);
-    
-    /* Fast path: different lengths - use branchless comparison */
-    if (len_a != len_b) {
-        return (len_a > len_b) - (len_a < len_b);
-    }
-    
-    /* Same length: compare content */
-    return memcmp(ea->uid->ptr, eb->uid->ptr, len_a);
-}
-
-/* Create a new idmpEntry with the given UID and stream ID.
- * The UID robj reference count is incremented.
- * Returns NULL on allocation failure. */
-static idmpEntry *idmpEntryCreate(robj *uid, streamID *id) {
-    idmpEntry *entry = zmalloc(sizeof(idmpEntry));
-    if (entry == NULL) return NULL;
-    
-    entry->uid = uid;
-    incrRefCount(uid);
-    entry->id = *id;
-    
-    return entry;
-}
-
-/* Free an idmpEntry and decrement its UID reference count. */
-static void idmpEntryFree(idmpEntry *entry) {
-    if (entry == NULL) return;
-    decrRefCount(entry->uid);
-    zfree(entry);
-}
-
-/* -----------------------------------------------------------------------
  * Low level stream encoding: a radix tree of listpacks.
  * ----------------------------------------------------------------------- */
 
@@ -118,7 +67,8 @@ stream *streamNew(void) {
     s->min_cgroup_last_id.ms = UINT64_MAX;
     s->min_cgroup_last_id.seq = UINT64_MAX;
     s->min_cgroup_last_id_valid = 0;
-    s->idmp_tring = tringNew(idmpEntryCompare);
+    s->idmp_rax = raxNew();
+    s->idmp_rax_ms = raxNew();
     return s;
 }
 
@@ -128,6 +78,18 @@ static void streamLpFreeGeneric(void *lp, void *strm) {
     lpFree(lp);
 }
 
+/* Callback to free streamID stored in IDMP rax tree */
+static void streamIdmpFreeCallback(void *ptr) {
+    streamID *id = (streamID *)ptr;
+    zfree(id);
+}
+
+/* Callback to free UID string stored in IDMP rax_ms tree */
+static void streamIdmpMsFreeCallback(void *ptr) {
+    sds uid_str = (sds)ptr;
+    sdsfree(uid_str);
+}
+
 /* Free a stream, including the listpacks stored inside the radix tree. */
 void freeStream(stream *s) {
     raxFreeWithCbAndContext(s->rax, streamLpFreeGeneric, s);
@@ -135,10 +97,13 @@ void freeStream(stream *s) {
         raxFreeWithCbAndContext(s->cgroups, streamFreeCGGeneric, s);
     if (s->cgroups_ref)
         raxFreeWithCallback(s->cgroups_ref, listReleaseGeneric);
+    if (s->idmp_rax)
+        raxFreeWithCallback(s->idmp_rax, streamIdmpFreeCallback);
+    if (s->idmp_rax_ms)
+        raxFreeWithCallback(s->idmp_rax_ms, streamIdmpMsFreeCallback);
 #ifdef REDIS_TEST
     serverAssert(s->alloc_size == zmalloc_usable_size(s));
 #endif
-    tringFree(s->idmp_tring);
     zfree(s);
 }
 
@@ -2458,15 +2423,16 @@ void xaddCommand(client *c) {
 
     /* IDMP: Check if UID already exists in the stream */
     if (parsed_args.idmp_uid != NULL) {
-        /* Create a temporary entry for lookup */
-        idmpEntry lookup_entry;
-        lookup_entry.uid = parsed_args.idmp_uid;
+        /* Get the UID string from the robj */
+        sds uid_str = parsed_args.idmp_uid->ptr;
+        size_t uid_len = sdslen(uid_str);
         
-        /* Check if UID exists in the tring tree */
-        idmpEntry *existing = tringFind(s->idmp_tring, &lookup_entry);
-        if (existing != NULL) {
+        /* Check if UID exists in the rax tree */
+        void *existing_id_ptr = NULL;
+        if (raxFind(s->idmp_rax, (unsigned char *)uid_str, uid_len, &existing_id_ptr)) {
             /* UID already exists, return the existing stream ID */
-            sds replyid = createStreamIDString(&existing->id);
+            streamID *existing_id = (streamID *)existing_id_ptr;
+            sds replyid = createStreamIDString(existing_id);
             addReplyBulkCBuffer(c, replyid, sdslen(replyid));
             sdsfree(replyid);
             return;
@@ -2499,14 +2465,35 @@ void xaddCommand(client *c) {
     sds replyid = createStreamIDString(&id);
     addReplyBulkCBuffer(c, replyid, sdslen(replyid));
 
-    /* IDMP: Add entry to tring */
+    /* IDMP: Add entry to rax trees */
     if (parsed_args.idmp_uid != NULL) {
-        idmpEntry *entry = idmpEntryCreate(parsed_args.idmp_uid, &id);
-        if (entry != NULL) {
-            /* Insert into tring (combines AVL tree and ring buffer) */
-            if (!tringInsert(s->idmp_tring, entry)) {
+        /* Allocate a new streamID to store in the rax tree */
+        streamID *stored_id = zmalloc(sizeof(streamID));
+        if (stored_id != NULL) {
+            *stored_id = id;
+            
+            /* Get the UID string from the robj */
+            sds uid_str = parsed_args.idmp_uid->ptr;
+            size_t uid_len = sdslen(uid_str);
+            
+            /* Insert into first rax tree (UID string -> streamID) */
+            if (!raxInsert(s->idmp_rax, (unsigned char *)uid_str, uid_len, stored_id, NULL)) {
                 /* Insert failed (shouldn't happen as we checked earlier), clean up */
-                idmpEntryFree(entry);
+                zfree(stored_id);
+            } else {
+                /* Also insert into second rax tree (streamID -> UID string) */
+                /* Encode full streamID as big-endian bytes for rax key */
+                uint64_t streamid_key[2];
+                streamid_key[0] = htonu64(id.ms);
+                streamid_key[1] = htonu64(id.seq);
+                
+                sds uid_copy = sdsdup(uid_str);
+                if (uid_copy != NULL) {
+                    if (!raxInsert(s->idmp_rax_ms, (unsigned char *)streamid_key, sizeof(streamid_key), uid_copy, NULL)) {
+                        /* Insert failed, clean up the duplicate string */
+                        sdsfree(uid_copy);
+                    }
+                }
             }
         }
     }
