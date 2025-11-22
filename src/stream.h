@@ -3,6 +3,7 @@
 
 #include "rax.h"
 #include "listpack.h"
+#include "adlist.h"
 
 /* Stream item ID: a 128 bit number composed of a milliseconds time and
  * a sequence counter. IDs generated in the same millisecond (or in a past
@@ -12,6 +13,12 @@ typedef struct streamID {
     uint64_t ms;        /* Unix time in milliseconds. */
     uint64_t seq;       /* Sequence number. */
 } streamID;
+
+/* Structure to hold streamID to UID mapping for list-based storage */
+typedef struct streamIdToUid {
+    uint64_t ms;        /* The stream ID milliseconds */
+    robj *uid;          /* The UID robj */
+} streamIdToUid;
 
 typedef struct stream {
     rax *rax;               /* The radix tree holding the stream. */
@@ -26,7 +33,7 @@ typedef struct stream {
     streamID min_cgroup_last_id;  /* The minimum ID of consume group. */
     unsigned int min_cgroup_last_id_valid: 1;
     rax *idmp_rax;          /* Rax tree mapping IDMP UID strings to streamID */
-    rax *idmp_rax_ms;       /* Rax tree mapping streamID to UID string */
+    list *idmp_list_ms;     /* List mapping streamID to UID string */
 } stream;
 
 /* We define an iterator to iterate stream items in an abstract way, without

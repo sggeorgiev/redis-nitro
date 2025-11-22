@@ -38,6 +38,7 @@ void streamFreeNACK(stream *s, streamNACK *na);
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamCG *group, streamConsumer *consumer);
 int streamParseStrictIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq, int *seq_given);
 int streamParseIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq);
+static void streamIdmpMsFreeCallback(void *ptr);
 
 int streamEntryIsReferenced(stream *s, streamID *id);
 void streamCleanupEntryCGroupRefs(stream *s, streamID *id);
@@ -68,7 +69,8 @@ stream *streamNew(void) {
     s->min_cgroup_last_id.seq = UINT64_MAX;
     s->min_cgroup_last_id_valid = 0;
     s->idmp_rax = raxNew();
-    s->idmp_rax_ms = raxNew();
+    s->idmp_list_ms = listCreate();
+    listSetFreeMethod(s->idmp_list_ms, streamIdmpMsFreeCallback);
     return s;
 }
 
@@ -84,10 +86,11 @@ static void streamIdmpFreeCallback(void *ptr) {
     zfree(id);
 }
 
-/* Callback to free UID string stored in IDMP rax_ms tree */
+/* Callback to free UID robj stored in IDMP list_ms */
 static void streamIdmpMsFreeCallback(void *ptr) {
-    sds uid_str = (sds)ptr;
-    sdsfree(uid_str);
+    streamIdToUid *mapping = (streamIdToUid *)ptr;
+    decrRefCount(mapping->uid);
+    zfree(mapping);
 }
 
 /* Free a stream, including the listpacks stored inside the radix tree. */
@@ -99,8 +102,8 @@ void freeStream(stream *s) {
         raxFreeWithCallback(s->cgroups_ref, listReleaseGeneric);
     if (s->idmp_rax)
         raxFreeWithCallback(s->idmp_rax, streamIdmpFreeCallback);
-    if (s->idmp_rax_ms)
-        raxFreeWithCallback(s->idmp_rax_ms, streamIdmpMsFreeCallback);
+    if (s->idmp_list_ms)
+        listRelease(s->idmp_list_ms);
 #ifdef REDIS_TEST
     serverAssert(s->alloc_size == zmalloc_usable_size(s));
 #endif
@@ -2467,6 +2470,28 @@ void xaddCommand(client *c) {
 
     /* IDMP: Add entry to rax trees */
     if (parsed_args.idmp_uid != NULL) {
+        /* Check if idmp_list_ms has more than 100k entries and remove oldest if needed */
+        if (listLength(s->idmp_list_ms) > 1000000) {
+            listNode *head = listFirst(s->idmp_list_ms);
+            if (head != NULL) {
+                streamIdToUid *old_mapping = listNodeValue(head);
+                if (old_mapping != NULL) {
+                    /* Remove corresponding entry from idmp_rax */
+                    sds old_uid_str = old_mapping->uid->ptr;
+                    size_t old_uid_len = sdslen(old_uid_str);
+                    streamID *old_stored_id = NULL;
+                    if (raxRemove(s->idmp_rax, (unsigned char *)old_uid_str, old_uid_len, (void **)&old_stored_id)) {
+                        /* Free the streamID that was stored in idmp_rax */
+                        if (old_stored_id != NULL) {
+                            zfree(old_stored_id);
+                        }
+                    }
+                }
+                /* Remove from list (this will call streamIdmpMsFreeCallback) */
+                listDelNode(s->idmp_list_ms, head);
+            }
+        }
+        
         /* Allocate a new streamID to store in the rax tree */
         streamID *stored_id = zmalloc(sizeof(streamID));
         if (stored_id != NULL) {
@@ -2479,19 +2504,26 @@ void xaddCommand(client *c) {
             /* Insert into first rax tree (UID string -> streamID) */
             if (!raxInsert(s->idmp_rax, (unsigned char *)uid_str, uid_len, stored_id, NULL)) {
                 /* Insert failed (shouldn't happen as we checked earlier), clean up */
-                zfree(stored_id);
+                streamIdmpFreeCallback(stored_id);
             } else {
-                /* Also insert into second rax tree (streamID -> UID string) */
-                /* Encode full streamID as big-endian bytes for rax key */
-                uint64_t streamid_key[2];
-                streamid_key[0] = htonu64(id.ms);
-                streamid_key[1] = htonu64(id.seq);
-                
-                sds uid_copy = sdsdup(uid_str);
-                if (uid_copy != NULL) {
-                    if (!raxInsert(s->idmp_rax_ms, (unsigned char *)streamid_key, sizeof(streamid_key), uid_copy, NULL)) {
-                        /* Insert failed, clean up the duplicate string */
-                        sdsfree(uid_copy);
+                /* Also insert into list (streamID -> UID robj) */
+                streamIdToUid *mapping = zmalloc(sizeof(streamIdToUid));
+                if (mapping != NULL) {
+                    mapping->ms = id.ms;
+                    mapping->uid = parsed_args.idmp_uid;
+                    incrRefCount(parsed_args.idmp_uid);
+                    if (listAddNodeTail(s->idmp_list_ms, mapping) == NULL) {
+                        /* Insert failed, clean up */
+                        decrRefCount(mapping->uid);
+                        zfree(mapping);
+                    }
+                } else {
+                    /* Allocation failed, remove the entry we just added to idmp_rax */
+                    streamID *removed_id = NULL;
+                    if (raxRemove(s->idmp_rax, (unsigned char *)uid_str, uid_len, (void **)&removed_id)) {
+                        if (removed_id != NULL) {
+                            zfree(removed_id);
+                        }
                     }
                 }
             }
