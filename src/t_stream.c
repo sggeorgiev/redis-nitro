@@ -2471,7 +2471,7 @@ void xaddCommand(client *c) {
     /* IDMP: Add entry to rax trees */
     if (parsed_args.idmp_uid != NULL) {
         /* Check if idmp_list_ms has more than 100k entries and remove oldest if needed */
-        if (listLength(s->idmp_list_ms) > 1000000) {
+        if (listLength(s->idmp_list_ms) > 100000) {
             listNode *head = listFirst(s->idmp_list_ms);
             if (head != NULL) {
                 streamIdToUid *old_mapping = listNodeValue(head);
