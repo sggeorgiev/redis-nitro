@@ -315,17 +315,20 @@ int idmpEntryCompare(const void *a, const void *b) {
     
     size_t len_a = ea->iid_len;
     size_t len_b = eb->iid_len;
-    size_t min_len = len_a < len_b ? len_a : len_b;
     
+    /* Fast path: compare lengths first */
+    if (len_a != len_b) {
+        return (len_a > len_b) - (len_a < len_b);
+    }
+    
+    /* Lengths are equal, compare content */
+    size_t len = len_a;  /* or len_b, they're equal */
     const char *str_a = ea->iid;
     const char *str_b = eb->iid;
     
     /* Fast path for very short strings (<= 16 bytes) */
-    if (min_len <= 16) {
-        int cmp = compareShortStrings(str_a, str_b, min_len);
-        if (cmp != 0) return cmp;
-        /* All common bytes equal, return length comparison */
-        return (len_a > len_b) - (len_a < len_b);
+    if (len <= 16) {
+        return compareShortStrings(str_a, str_b, len);
     }
     
     size_t i = 0;
@@ -333,25 +336,25 @@ int idmpEntryCompare(const void *a, const void *b) {
     /* Use SIMD for longer strings */
 #ifdef HAVE_AVX512
     if (BITOP_USE_AVX512) {
-        i = compareStringsAVX512(str_a, str_b, min_len);
+        i = compareStringsAVX512(str_a, str_b, len);
     } else
 #endif
 #ifdef HAVE_AVX2
     if (BITOP_USE_AVX2) {
-        i = compareStringsAVX2(str_a, str_b, min_len);
+        i = compareStringsAVX2(str_a, str_b, len);
     }
 #endif
     
     /* Handle any remaining bytes with scalar comparison */
-    while (i < min_len) {
+    while (i < len) {
         if (str_a[i] != str_b[i]) {
             return (unsigned char)str_a[i] - (unsigned char)str_b[i];
         }
         i++;
     }
     
-    /* All common bytes equal, compare lengths */
-    return (len_a > len_b) - (len_a < len_b);
+    /* All bytes equal */
+    return 0;
 }
 
 /* Create a new idmpEntry with the given IID and stream ID.
