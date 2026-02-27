@@ -925,6 +925,363 @@ int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old)
     return raxGenericInsert(rax,s,len,data,old,0);
 }
 
+/* Initialize a raxAppendHint structure. */
+void raxAppendHintInit(raxAppendHint *hint) {
+    hint->node = NULL;
+    hint->parentlink = NULL;
+    hint->key_offset = 0;
+    hint->expected_numele = 0;
+    hint->valid = 0;
+}
+
+/* Optimized raxAddChild for the case where the new child is known to be
+ * lexicographically greater than all existing children (inserted at the
+ * end, pos = n->size). Skips the linear scan for position and avoids
+ * memmoves for trailing children that raxAddChild does. */
+static raxNode *raxAddChildAtEnd(rax *rax, raxNode *n, unsigned char c, raxNode **childptr, raxNode ***parentlink) {
+    assert(n->iscompr == 0);
+
+    size_t curlen = raxNodeCurrentLength(n);
+    n->size++;
+    size_t newlen = raxNodeCurrentLength(n);
+    n->size--;
+
+    raxNode *child = raxNewNode(rax,0,0);
+    if (child == NULL) return NULL;
+
+    raxNode *newn = raxNodeRealloc(rax,n,newlen);
+    if (newn == NULL) {
+        raxFreeNode(rax,child);
+        return NULL;
+    }
+    n = newn;
+
+    unsigned char *src, *dst;
+    if (n->iskey && !n->isnull) {
+        src = ((unsigned char*)n+curlen-sizeof(void*));
+        dst = ((unsigned char*)n+newlen-sizeof(void*));
+        memmove(dst,src,sizeof(void*));
+    }
+
+    size_t shift = newlen - curlen - sizeof(void*);
+
+    /* Shift existing child pointers for new alignment. No trailing
+     * pointers to move since we are inserting at the end. */
+    if (shift) {
+        src = (unsigned char*) raxNodeFirstChildPtr(n);
+        memmove(src+shift,src,sizeof(raxNode*)*n->size);
+    }
+
+    n->data[n->size] = c;
+    n->size++;
+    src = (unsigned char*) raxNodeFirstChildPtr(n);
+    raxNode **childfield = (raxNode**)(src+sizeof(raxNode*)*(n->size-1));
+    memcpy(childfield,&child,sizeof(child));
+    *childptr = child;
+    *parentlink = childfield;
+    return n;
+}
+
+/* Specialized insert for keys known to be greater than all existing keys
+ * in the radix tree (append-only pattern). Uses a caller-provided hint
+ * to skip redundant prefix traversal on consecutive inserts.
+ *
+ * Returns 1 if the key was inserted, 0 if it already exists or on OOM.
+ * On OOM errno is set to ENOMEM, otherwise errno is 0.
+ *
+ * The hint is optional (may be NULL). When provided, it is read to
+ * determine a starting point for the tree walk, and updated after a
+ * successful insert to accelerate the next call. The hint is validated
+ * via rax->numele and automatically invalidated when stale.
+ *
+ * If the key turns out not to be greater than existing keys (detected
+ * during the walk), the function falls back to raxGenericInsert. */
+int raxAppend(rax *rax, unsigned char *s, size_t len, void *data, raxAppendHint *hint) {
+    raxNode *h, **parentlink;
+    size_t i = 0;
+    int j = 0;
+    size_t usable;
+    size_t dummy, *alloc_size = &dummy;
+
+    if (rax->alloc_size) alloc_size = rax->alloc_size;
+    debugf("### raxAppend %.*s with value %p\n", (int)len, s, data);
+
+    /* Determine starting point: use hint or start from root. */
+    if (hint && hint->valid && rax->numele == hint->expected_numele) {
+        h = hint->node;
+        parentlink = hint->parentlink;
+        i = hint->key_offset;
+        debugf("raxAppend: using hint at offset %zu\n", i);
+    } else {
+        h = rax->head;
+        parentlink = &rax->head;
+        if (hint) hint->valid = 0;
+    }
+
+    /* Walk the tree from the starting point. */
+    while(h->size && i < len) {
+        debugnode("raxAppend walk",h);
+        if (h->iscompr) {
+            unsigned char *v = h->data;
+            for (j = 0; j < (int)h->size && i < len; j++, i++) {
+                if (v[j] != s[i]) break;
+            }
+            if (j != (int)h->size) {
+                if (i >= len) {
+                    /* Key exhausted mid-compressed-node (ALGO 2).
+                     * Should not happen for fixed-length append keys.
+                     * Fallback to generic insert. */
+                    if (hint) hint->valid = 0;
+                    return raxGenericInsert(rax,s,len,data,NULL,0);
+                }
+                goto algo1;
+            }
+            /* Fully matched compressed node, follow its single child. */
+            raxNode **children = raxNodeFirstChildPtr(h);
+            parentlink = children;
+            memcpy(&h,children,sizeof(h));
+            j = 0;
+        } else {
+            /* Uncompressed node: check last child first (O(1)). */
+            unsigned char c = s[i];
+            if (h->size > 0) {
+                unsigned char lastc = h->data[h->size-1];
+                if (lastc == c) {
+                    raxNode **children = raxNodeFirstChildPtr(h);
+                    parentlink = children+(h->size-1);
+                    memcpy(&h,parentlink,sizeof(h));
+                    i++;
+                    j = 0;
+                    continue;
+                } else if (c > lastc) {
+                    goto add_child_at_end;
+                } else {
+                    /* Key byte < last child: not an append.
+                     * Invalidate hint and fall back. */
+                    debugf("raxAppend: fallback, byte %u < last child %u\n",
+                        c, lastc);
+                    if (hint) hint->valid = 0;
+                    return raxGenericInsert(rax,s,len,data,NULL,0);
+                }
+            }
+            /* Empty uncompressed node, fall through to append. */
+            break;
+        }
+    }
+
+    /* If the entire key was consumed, the node already represents this
+     * key path. Set it as a key if it isn't already. */
+    if (i == len && (!h->iscompr || j == 0)) {
+        if (!h->iskey || (h->isnull)) {
+            h = raxReallocForData(rax,h,data);
+            if (h) memcpy(parentlink,&h,sizeof(h));
+        }
+        if (h == NULL) {
+            errno = ENOMEM;
+            return 0;
+        }
+        if (h->iskey) {
+            errno = 0;
+            return 0; /* Key already exists. */
+        }
+        raxSetData(h,data);
+        rax->numele++;
+        if (hint) hint->expected_numele = rax->numele;
+        return 1;
+    }
+
+    goto append_remaining;
+
+add_child_at_end:
+    {
+        raxNode *child;
+        raxNode **new_parentlink;
+        raxNode *newh = raxAddChildAtEnd(rax,h,s[i],&child,&new_parentlink);
+        if (newh == NULL) goto oom;
+        h = newh;
+        memcpy(parentlink,&h,sizeof(h));
+
+        /* Cache this uncompressed branching node for the next call. */
+        if (hint) {
+            hint->node = h;
+            hint->parentlink = parentlink;
+            hint->key_offset = i;
+            hint->valid = 1;
+        }
+
+        parentlink = new_parentlink;
+        i++;
+        rax->numnodes++;
+        h = child;
+        goto append_remaining;
+    }
+
+algo1:
+    {
+        /* ----- ALGO 1: Split compressed node at mismatch j ----- */
+        debugf("raxAppend ALGO 1: split at j=%d, i=%zu\n", j, i);
+
+        raxNode **childfield = raxNodeLastChildPtr(h);
+        raxNode *next;
+        memcpy(&next,childfield,sizeof(next));
+
+        size_t trimmedlen = j;
+        size_t postfixlen = h->size - j - 1;
+        int split_node_is_key = !trimmedlen && h->iskey && !h->isnull;
+        size_t nodesize;
+
+        raxNode *splitnode = raxNewNode(rax,1,split_node_is_key);
+        raxNode *trimmed = NULL;
+        raxNode *postfix = NULL;
+
+        if (trimmedlen) {
+            nodesize = sizeof(raxNode)+trimmedlen+raxPadding(trimmedlen)+
+                       sizeof(raxNode*);
+            if (h->iskey && !h->isnull) nodesize += sizeof(void*);
+            trimmed = rax_malloc_usable(nodesize,&usable);
+            *alloc_size += usable;
+        }
+
+        if (postfixlen) {
+            nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
+                       sizeof(raxNode*);
+            postfix = rax_malloc_usable(nodesize,&usable);
+            *alloc_size += usable;
+        }
+
+        if (splitnode == NULL ||
+            (trimmedlen && trimmed == NULL) ||
+            (postfixlen && postfix == NULL))
+        {
+            raxFreeNode(rax,splitnode);
+            raxFreeNode(rax,trimmed);
+            raxFreeNode(rax,postfix);
+            if (hint) hint->valid = 0;
+            errno = ENOMEM;
+            return 0;
+        }
+        splitnode->data[0] = h->data[j];
+
+        if (j == 0) {
+            if (h->iskey) {
+                void *ndata = raxGetData(h);
+                raxSetData(splitnode,ndata);
+            }
+            memcpy(parentlink,&splitnode,sizeof(splitnode));
+        } else {
+            trimmed->size = j;
+            memcpy(trimmed->data,h->data,j);
+            trimmed->iscompr = j > 1 ? 1 : 0;
+            trimmed->iskey = h->iskey;
+            trimmed->isnull = h->isnull;
+            if (h->iskey && !h->isnull) {
+                void *ndata = raxGetData(h);
+                raxSetData(trimmed,ndata);
+            }
+            raxNode **cp = raxNodeLastChildPtr(trimmed);
+            memcpy(cp,&splitnode,sizeof(splitnode));
+            memcpy(parentlink,&trimmed,sizeof(trimmed));
+            parentlink = cp;
+            rax->numnodes++;
+        }
+
+        if (postfixlen) {
+            postfix->iskey = 0;
+            postfix->isnull = 0;
+            postfix->size = postfixlen;
+            postfix->iscompr = postfixlen > 1;
+            memcpy(postfix->data,h->data+j+1,postfixlen);
+            raxNode **cp = raxNodeLastChildPtr(postfix);
+            memcpy(cp,&next,sizeof(next));
+            rax->numnodes++;
+        } else {
+            postfix = next;
+        }
+
+        raxNode **splitchild = raxNodeLastChildPtr(splitnode);
+        memcpy(splitchild,&postfix,sizeof(postfix));
+
+        raxFreeNode(rax,h);
+        h = splitnode;
+
+        /* Add the new key byte to the split node. Since this is an
+         * append (s[i] > splitnode->data[0]), it goes at the end. */
+        {
+            raxNode *child;
+            raxNode **new_parentlink;
+            raxNode *newh = raxAddChildAtEnd(rax,h,s[i],&child,&new_parentlink);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+
+            if (hint) {
+                hint->node = h;
+                hint->parentlink = parentlink;
+                hint->key_offset = i;
+                hint->valid = 1;
+            }
+
+            parentlink = new_parentlink;
+            i++;
+            rax->numnodes++;
+            h = child;
+        }
+        goto append_remaining;
+    }
+
+append_remaining:
+    while(i < len) {
+        raxNode *child;
+        if (h->size == 0 && len-i > 1) {
+            debugf("raxAppend: inserting compressed node\n");
+            size_t comprsize = len-i;
+            if (comprsize > RAX_NODE_MAX_SIZE)
+                comprsize = RAX_NODE_MAX_SIZE;
+            raxNode *newh = raxCompressNode(rax,h,s+i,comprsize,&child);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+            parentlink = raxNodeLastChildPtr(h);
+            i += comprsize;
+        } else {
+            debugf("raxAppend: inserting normal node\n");
+            raxNode **new_parentlink;
+            raxNode *newh = raxAddChild(rax,h,s[i],&child,&new_parentlink);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+            parentlink = new_parentlink;
+            i++;
+        }
+        rax->numnodes++;
+        h = child;
+    }
+    {
+        raxNode *newh = raxReallocForData(rax,h,data);
+        if (newh == NULL) goto oom;
+        h = newh;
+        if (!h->iskey) rax->numele++;
+        raxSetData(h,data);
+        memcpy(parentlink,&h,sizeof(h));
+    }
+
+    if (hint) hint->expected_numele = rax->numele;
+    return 1;
+
+oom:
+    /* Same OOM cleanup as raxGenericInsert: if partial insertion
+     * left a terminal node, mark it as key and remove it. */
+    if (h->size == 0) {
+        h->isnull = 1;
+        h->iskey = 1;
+        rax->numele++;
+        assert(raxRemove(rax,s,i,NULL) != 0);
+    }
+    if (hint) hint->valid = 0;
+    errno = ENOMEM;
+    return 0;
+}
+
 /* Find a key in the rax: return 1 if the item is found, 0 otherwise.
  * If there is an item and 'value' is passed in a non-NULL pointer,
  * the value associated with the item is set at that address. */

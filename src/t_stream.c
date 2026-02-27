@@ -250,7 +250,7 @@ robj *streamDup(robj *o) {
             streamNACK *new_nack = streamCreateNACK(new_s, NULL, &nack_id);
             new_nack->delivery_time = nack->delivery_time;
             new_nack->delivery_count = nack->delivery_count;
-            new_nack->cgroup_ref_node = streamLinkCGroupToEntry(new_s, new_cg, ri_cg_pel.key);
+            new_nack->cgroup_ref_node = streamLinkCGroupToEntry(new_s, new_cg, ri_cg_pel.key, NULL);
             raxInsert(new_cg->pel, ri_cg_pel.key, sizeof(streamID), new_nack, NULL);
 
             /* Insert in sorted order to preserve ordering */
@@ -2079,6 +2079,12 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
 
     if (!(flags & STREAM_RWR_RAWENTRIES) && !arraylen_ptr)
         arraylen_ptr = addReplyDeferredLen(c);
+
+    raxAppendHint group_pel_hint, consumer_pel_hint, cgroups_ref_hint;
+    raxAppendHintInit(&group_pel_hint);
+    raxAppendHintInit(&consumer_pel_hint);
+    raxAppendHintInit(&cgroups_ref_hint);
+
     streamIteratorStart(&si,s,start,end,rev);
     while (streamIteratorGetID(&si,&id,&numfields)) {
         /* Update the group last_id if needed. */
@@ -2149,7 +2155,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
              * if we find that there is already an entry for this ID. */
             streamNACK *nack = streamCreateNACK(s, consumer, &id);
             int group_inserted =
-                raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+                raxAppend(group->pel,buf,sizeof(buf),nack,&group_pel_hint);
 
             /* Now we can check if the entry was already busy, and
              * in that case reassign the entry to the new consumer,
@@ -2171,8 +2177,8 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
                 pelListUpdate(group, nack, cmd_time_snapshot);
             } else {
                 /* New NACK - insert into consumer's PEL and time list */
-                raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
-                nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
+                raxAppend(consumer->pel,buf,sizeof(buf),nack,&consumer_pel_hint);
+                nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf, &cgroups_ref_hint);
                 pelListInsertAtTail(group, nack);
             }
 
@@ -3031,20 +3037,31 @@ void streamUpdateCGroupLastId(stream *s, streamCG *cg, streamID *id) {
 }
 
 /* Link a consumer group to a stream entry in the cgroups_ref index.
- * Returns a pointer to the list node, so that it can be used for future deletion. */
-listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key) {
+ * Returns a pointer to the list node, so that it can be used for future deletion.
+ * When hint is non-NULL, raxAppend is used instead of raxFind+raxInsert for
+ * the common case where keys are inserted in ascending order (XREADGROUP). */
+listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key, raxAppendHint *hint) {
     list *cglist;
 
     if (!s->cgroups_ref)
         s->cgroups_ref = raxNewWithMetadata(0, &s->alloc_size);
-    
-    /* Try to find the list for this stream ID, create it if it doesn't exist */
-    if (!raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
+
+    if (hint) {
+        /* Fast path: try append (key likely doesn't exist yet). */
         cglist = listCreate();
-        serverAssert(raxInsert(s->cgroups_ref, key, sizeof(streamID), cglist, NULL));
+        if (!raxAppend(s->cgroups_ref, key, sizeof(streamID), cglist, hint)) {
+            /* Key already existed (rare: another group tracks this entry). */
+            listRelease(cglist);
+            int found = raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist);
+            serverAssert(found);
+        }
+    } else {
+        if (!raxFind(s->cgroups_ref, key, sizeof(streamID), (void**)&cglist)) {
+            cglist = listCreate();
+            serverAssert(raxInsert(s->cgroups_ref, key, sizeof(streamID), cglist, NULL));
+        }
     }
-    
-    /* Add the consumer group to the list and return the list node */
+
     listAddNodeTail(cglist, cg);
     return listLast(cglist);
 }
@@ -4261,7 +4278,7 @@ void xclaimCommand(client *c) {
             nack = streamCreateNACK(s, NULL, &id);
             raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
             pelListInsertAtTail(group, nack);
-            nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
+            nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf, NULL);
         }
 
         if (nack != NULL) {

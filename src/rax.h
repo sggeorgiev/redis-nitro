@@ -131,6 +131,17 @@ typedef struct raxStack {
     int oom; /* True if pushing into this stack failed for OOM at some point. */
 } raxStack;
 
+/* Hint for raxAppend() to skip redundant tree walks when keys are
+ * inserted in ascending order. Caches the walk state from the previous
+ * insert so the next insert can resume from a deeper point. */
+typedef struct raxAppendHint {
+    raxNode *node;            /* Cached branching node */
+    raxNode **parentlink;     /* Parent's pointer to cached node */
+    size_t key_offset;        /* Key bytes consumed to reach cached node */
+    uint64_t expected_numele; /* rax->numele when hint was set (validation) */
+    int valid;                /* Whether the hint is populated */
+} raxAppendHint;
+
 /* Optional callback used for iterators and be notified on each rax node,
  * including nodes not representing keys. If the callback returns true
  * the callback changed the node pointer in the iterator structure, and the
@@ -173,6 +184,8 @@ rax *raxNew(void);
 rax *raxNewWithMetadata(int metaSize, size_t *alloc_size);
 int raxInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
 int raxTryInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old);
+void raxAppendHintInit(raxAppendHint *hint);
+int raxAppend(rax *rax, unsigned char *s, size_t len, void *data, raxAppendHint *hint);
 int raxRemove(rax *rax, unsigned char *s, size_t len, void **old);
 int raxFind(rax *rax, unsigned char *s, size_t len, void **value);
 void raxFree(rax *rax);

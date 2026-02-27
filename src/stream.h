@@ -194,7 +194,7 @@ int64_t streamTrimByLength(stream *s, long long maxlen, int approx);
 int64_t streamTrimByID(stream *s, streamID minid, int approx);
 int streamEntryExists(stream *s, streamID *id);
 
-listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key);
+listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key, raxAppendHint *hint);
 
 /* PEL time list management (used by RDB loading) */
 void pelListInsertSorted(streamCG *cg, streamNACK *nack);
