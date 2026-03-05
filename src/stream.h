@@ -123,13 +123,9 @@ typedef struct streamConsumer {
     sds name;                   /* Consumer name. This is how the consumer
                                    will be identified in the consumer group
                                    protocol. Case sensitive. */
-    rax *pel;                   /* Consumer specific pending entries list: all
-                                   the pending messages delivered to this
-                                   consumer not yet acknowledged. Keys are
-                                   big endian message IDs, while values are
-                                   the same streamNACK structure referenced
-                                   in the "pel" of the consumer group structure
-                                   itself, so the value is shared. */
+    streamNACK *pel_head;       /* Head of consumer PEL (unsorted linked list). */
+    streamNACK *pel_tail;       /* Tail of consumer PEL (unsorted linked list). */
+    size_t pel_count;           /* Number of entries in this consumer's PEL. */
 } streamConsumer;
 
 /* Pending (yet not acknowledged) message in a consumer group. */
@@ -142,6 +138,8 @@ struct streamNACK {
     streamID id;                /* Stream ID for this pending entry. */
     struct streamNACK *pel_prev; /* Previous NACK in time-ordered doubly-linked list. */
     struct streamNACK *pel_next; /* Next NACK in time-ordered doubly-linked list. */
+    struct streamNACK *cpel_prev; /* Previous NACK in consumer's PEL linked list. */
+    struct streamNACK *cpel_next; /* Next NACK in consumer's PEL linked list. */
 };
 
 /* Stream propagation information, passed to functions in order to propagate
@@ -175,6 +173,7 @@ streamConsumer *streamLookupConsumer(streamCG *cg, sds name);
 streamConsumer *streamCreateConsumer(stream *s, streamCG *cg, sds name, robj *key, int dbid, int flags);
 streamCG *streamCreateCG(stream *s, char *name, size_t namelen, streamID *id, long long entries_read);
 streamNACK *streamCreateNACK(stream *s, streamConsumer *consumer, streamID *id);
+void streamEncodeID(void *buf, streamID *id);
 void streamDecodeID(void *buf, streamID *id);
 int streamCompareID(streamID *a, streamID *b);
 void streamFreeNACK(stream *s, streamNACK *na);
@@ -198,6 +197,10 @@ listNode *streamLinkCGroupToEntry(stream *s, streamCG *cg, unsigned char *key);
 
 /* PEL time list management (used by RDB loading) */
 void pelListInsertSorted(streamCG *cg, streamNACK *nack);
+
+/* Consumer PEL linked list management */
+void cpelInsertAtTail(streamConsumer *consumer, streamNACK *nack);
+void cpelUnlink(streamConsumer *consumer, streamNACK *nack);
 
 /* IDMP functions */
 idmpEntry *idmpEntryCreate(const char *iid, size_t iid_len, size_t *alloc_size);

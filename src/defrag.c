@@ -872,20 +872,28 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
         raxInsert(ctx->cg->pel, ri->key, ri->key_len, newnack, &prev);
         serverAssert(prev==nack);
         
-        /* Update the doubly-linked list pointers in adjacent nacks.
-         * When we move a nack to a new address, we need to update the
-         * pel_prev->pel_next and pel_next->pel_prev pointers. */
+        /* Update time-ordered doubly-linked list pointers. */
         if (newnack->pel_prev) {
             newnack->pel_prev->pel_next = newnack;
         } else {
-            /* This is the head of the list */
             ctx->cg->pel_time_head = newnack;
         }
         if (newnack->pel_next) {
             newnack->pel_next->pel_prev = newnack;
         } else {
-            /* This is the tail of the list */
             ctx->cg->pel_time_tail = newnack;
+        }
+
+        /* Update consumer PEL linked list pointers. */
+        if (newnack->cpel_prev) {
+            newnack->cpel_prev->cpel_next = newnack;
+        } else {
+            newnack->consumer->pel_head = newnack;
+        }
+        if (newnack->cpel_next) {
+            newnack->cpel_next->cpel_prev = newnack;
+        } else {
+            newnack->consumer->pel_tail = newnack;
         }
     }
     return newnack;
@@ -897,9 +905,7 @@ typedef struct {
 } StreamConsumerContext;
 
 void* defragStreamConsumer(raxIterator *ri, void *privdata) {
-    StreamConsumerContext *ctx = privdata;
-    stream *s = ctx->s;
-    streamCG *cg = ctx->cg;
+    UNUSED(privdata);
     streamConsumer *c = ri->data;
     void *newc = activeDefragAlloc(c);
     if (newc) {
@@ -908,13 +914,7 @@ void* defragStreamConsumer(raxIterator *ri, void *privdata) {
     sds newsds = activeDefragSds(c->name);
     if (newsds)
         c->name = newsds;
-    if (c->pel) {
-        /* Update pel back-pointer to new stream */
-        c->pel->alloc_size = &s->alloc_size;
-        PendingEntryContext pel_ctx = {cg, c};
-        defragRadixTree(&c->pel, 0, defragStreamConsumerPendingEntry, &pel_ctx);
-    }
-    return newc; /* returns NULL if c was not defragged */
+    return newc;
 }
 
 void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {

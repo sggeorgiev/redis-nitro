@@ -977,15 +977,23 @@ size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
         }
         nwritten += n;
 
-        /* Consumer PEL, without the ACKs (see last parameter of the function
-         * passed with value of 0), at loading time we'll lookup the ID
-         * in the consumer group global PEL and will put a reference in the
-         * consumer local PEL. */
-        if ((n = rdbSaveStreamPEL(rdb,consumer->pel,0)) == -1) {
+        /* Consumer PEL: save count + raw IDs from the linked list.
+         * At loading time we'll lookup the ID in the consumer group global
+         * PEL and put a reference in the consumer local PEL. */
+        if ((n = rdbSaveLen(rdb,consumer->pel_count)) == -1) {
             raxStop(&ri);
             return -1;
         }
         nwritten += n;
+        for (streamNACK *nack = consumer->pel_head; nack; nack = nack->cpel_next) {
+            unsigned char buf[sizeof(streamID)];
+            streamEncodeID(buf, &nack->id);
+            if ((n = rdbWriteRaw(rdb,buf,sizeof(streamID))) == -1) {
+                raxStop(&ri);
+                return -1;
+            }
+            nwritten += n;
+        }
     }
     raxStop(&ri);
     return nwritten;
@@ -3330,15 +3338,15 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     /* Set the NACK consumer, that was left to NULL when
                      * loading the global PEL. Then set the same shared
                      * NACK structure also in the consumer-specific PEL. */
-                    nack->consumer = consumer;
-                    if (!raxTryInsert(consumer->pel,rawid,sizeof(rawid),nack,NULL)) {
+                    if (nack->consumer != NULL) {
                         rdbReportCorruptRDB("Duplicated consumer PEL entry "
                                                 " loading a stream consumer "
                                                 "group");
-                        streamFreeNACK(s, nack);
                         decrRefCount(o);
                         return NULL;
                     }
+                    nack->consumer = consumer;
+                    cpelInsertAtTail(consumer, nack);
                 }
             }
 
