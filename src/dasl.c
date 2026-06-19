@@ -115,8 +115,11 @@ static int dasl_represented(const daslNode *cover, const daslKey *leader, sds lm
     return 0;
 }
 
-/* Sum of a node's per-slot weights = number of level-0 elements it covers. */
+/* Sum of a node's per-slot weights = number of level-0 elements it covers. A
+ * leaf carries no weights[]; each of its slots weighs exactly 1, so its node
+ * weight is simply n_key. */
 static unsigned long dasl_nodeweight(const daslNode *n) {
+    if (n->is_leaf) return (unsigned long)n->n_key;
     unsigned long w = 0;
     for (int i = 0; i < n->n_key; i++) w += n->weights[i];
     return w;
@@ -145,31 +148,40 @@ static unsigned long dasl_index_slot_weight(const daslNode *parent, int i) {
 
 /* Allocate a node holding the single key `key` with member `mem` (a real
  * data/index node). The caller owns `mem`: at level 0 it must be an owned sds
- * copy; at express-lane levels it is a borrowed pointer to the level-0 owner. */
-static daslNode *daslNewNode(dasl *sl, const daslKey *key, sds mem) {
+ * copy; at express-lane levels it is a borrowed pointer to the level-0 owner.
+ * `is_leaf` selects a level-0 data node, allocated `DASL_LEAF_SIZE` without the
+ * index-only weights[]/next[] arrays (which a leaf never uses). */
+static daslNode *daslNewNode(dasl *sl, const daslKey *key, sds mem, int is_leaf) {
     size_t usable;
-    daslNode *n = zmalloc_usable(sizeof(*n), &usable);
+    daslNode *n = zmalloc_usable(is_leaf ? DASL_LEAF_SIZE : sizeof(*n), &usable);
     n->forward = NULL;
     n->prev = NULL;
     n->n_key = 1;
+    n->is_leaf = is_leaf;
     n->keys[0] = *key;
     n->members[0] = mem;
     for (int i = 1; i < DASL_ARR_SIZE; i++) { n->keys[i] = DASL_EMPTY_KEY; n->members[i] = NULL; }
-    for (int i = 0; i < DASL_ARR_SIZE; i++) n->next[i] = NULL;
-    /* weights are set by daslRecomputePath after the mutation completes; start
-     * from a clean slate so an unrecomputed read (there are none) is defined. */
-    for (int i = 0; i < DASL_ARR_SIZE; i++) n->weights[i] = 0;
+    if (!is_leaf) {
+        for (int i = 0; i < DASL_ARR_SIZE; i++) n->next[i] = NULL;
+        /* weights are set by daslRecomputePath after the mutation completes;
+         * start from a clean slate so an unrecomputed read (there are none) is
+         * defined. (Leaf slot weights are the implicit constant 1.) */
+        for (int i = 0; i < DASL_ARR_SIZE; i++) n->weights[i] = 0;
+    }
     sl->alloc_size += usable;
     return n;
 }
 
-/* Allocate an empty per-level sentinel head (n_key == 0). */
+/* Allocate an empty per-level sentinel head (n_key == 0). Heads are full-size
+ * (never trimmed): head[h>=1] uses next[]/weights[] like an index node, and
+ * head[h]->weights[0] always carries the level's prefix weight. */
 static daslNode *daslNewHead(dasl *sl) {
     size_t usable;
     daslNode *n = zmalloc_usable(sizeof(*n), &usable);
     n->forward = NULL;
     n->prev = NULL;
     n->n_key = 0;
+    n->is_leaf = 0;
     for (int i = 0; i < DASL_ARR_SIZE; i++) { n->keys[i] = DASL_EMPTY_KEY; n->members[i] = NULL; }
     for (int i = 0; i < DASL_ARR_SIZE; i++) n->next[i] = NULL;
     /* On a head only weights[0] is meaningful (the prefix weight); start at 0. */
@@ -278,11 +290,8 @@ static void daslRecomputePath(dasl *sl, const daslKey *key, sds mem, daslNode **
         daslDescend(sl, key, mem, path);
     }
 
-    /* Level 0: the covering node and any split sibling have all-1 slot weights. */
-    daslNode *l0[2] = { path[0], added[0] };
-    for (int k = 0; k < 2; k++)
-        if (l0[k] != NULL && l0[k] != sl->head[0])
-            for (int i = 0; i < l0[k]->n_key; i++) l0[k]->weights[i] = 1;
+    /* Level 0 carries no stored weights (every leaf slot is the implicit
+     * constant 1), so nothing to recompute there. */
 
     /* Index levels bottom-up: covering node on the path + any split sibling. */
     for (int h = 1; h < sl->max_height; h++) {
@@ -410,7 +419,7 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
         if (at_head && p->forward == NULL) {
             /* Case 1: empty level - create the first node. */
             if (level == 0) {
-                daslNode *nn = daslNewNode(sl, &key, owned);
+                daslNode *nn = daslNewNode(sl, &key, owned, 1);
                 nn->prev = p;
                 p->forward = nn;
                 sl->tail = nn;
@@ -419,7 +428,7 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
                 ins_slot = 0;
                 path[level] = nn;
             } else {
-                daslNode *nn = daslNewNode(sl, &up_key, up_mem);
+                daslNode *nn = daslNewNode(sl, &up_key, up_mem, 0);
                 nn->next[0] = down;
                 nn->prev = p;
                 p->forward = nn;
@@ -447,13 +456,15 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
                     (target->n_key - pos) * sizeof(daslKey));
             memmove(&target->members[pos + 1], &target->members[pos],
                     (target->n_key - pos) * sizeof(sds));
-            memmove(&target->next[pos + 1], &target->next[pos],
-                    (target->n_key - pos) * sizeof(daslNode *));
-            memmove(&target->weights[pos + 1], &target->weights[pos],
-                    (target->n_key - pos) * sizeof(unsigned long));
+            if (level != 0) { /* leaves carry no next[]/weights[] */
+                memmove(&target->next[pos + 1], &target->next[pos],
+                        (target->n_key - pos) * sizeof(daslNode *));
+                memmove(&target->weights[pos + 1], &target->weights[pos],
+                        (target->n_key - pos) * sizeof(unsigned long));
+                target->next[pos] = ins_down;
+            }
             target->keys[pos] = ins_key;
             target->members[pos] = ins_mem;
-            target->next[pos] = ins_down;
             target->n_key++;
             if (idx == -1) /* leader changed */
                 daslPropagateLeader(sl, prev, level, &old_leader, old_leader_mem, &ins_key, ins_mem);
@@ -479,11 +490,13 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
             break;
         } else {
             /* Full: even split. Upper half moves to a new right node `add`. */
-            daslNode *add = daslNewNode(sl, &target->keys[DASL_SPLIT], target->members[DASL_SPLIT]);
+            daslNode *add = daslNewNode(sl, &target->keys[DASL_SPLIT], target->members[DASL_SPLIT], level == 0);
             memcpy(add->keys, &target->keys[DASL_SPLIT], DASL_SPLIT * sizeof(daslKey));
             memcpy(add->members, &target->members[DASL_SPLIT], DASL_SPLIT * sizeof(sds));
-            memcpy(add->next, &target->next[DASL_SPLIT], DASL_SPLIT * sizeof(daslNode *));
-            memcpy(add->weights, &target->weights[DASL_SPLIT], DASL_SPLIT * sizeof(unsigned long));
+            if (level != 0) { /* leaves carry no next[]/weights[] */
+                memcpy(add->next, &target->next[DASL_SPLIT], DASL_SPLIT * sizeof(daslNode *));
+                memcpy(add->weights, &target->weights[DASL_SPLIT], DASL_SPLIT * sizeof(unsigned long));
+            }
             add->n_key = DASL_SPLIT;
             add->forward = target->forward;
             add->prev = target;
@@ -498,8 +511,7 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
             for (int i = DASL_SPLIT; i < DASL_ARR_SIZE; i++) {
                 target->keys[i] = DASL_EMPTY_KEY;
                 target->members[i] = NULL;
-                target->next[i] = NULL;
-                target->weights[i] = 0;
+                if (level != 0) { target->next[i] = NULL; target->weights[i] = 0; }
             }
             target->n_key = DASL_SPLIT;
 
@@ -515,13 +527,15 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
                     (into->n_key - pos) * sizeof(daslKey));
             memmove(&into->members[pos + 1], &into->members[pos],
                     (into->n_key - pos) * sizeof(sds));
-            memmove(&into->next[pos + 1], &into->next[pos],
-                    (into->n_key - pos) * sizeof(daslNode *));
-            memmove(&into->weights[pos + 1], &into->weights[pos],
-                    (into->n_key - pos) * sizeof(unsigned long));
+            if (level != 0) { /* leaves carry no next[]/weights[] */
+                memmove(&into->next[pos + 1], &into->next[pos],
+                        (into->n_key - pos) * sizeof(daslNode *));
+                memmove(&into->weights[pos + 1], &into->weights[pos],
+                        (into->n_key - pos) * sizeof(unsigned long));
+                into->next[pos] = ins_down;
+            }
             into->keys[pos] = ins_key;
             into->members[pos] = ins_mem;
-            into->next[pos] = ins_down;
             into->n_key++;
             if (into == target && half_idx == -1)
                 daslPropagateLeader(sl, prev, level, &old_leader, old_leader_mem, &ins_key, ins_mem);
@@ -631,10 +645,8 @@ static int daslDeleteEx(dasl *sl, double score, sds ele, sds *kept) {
          * leaders are mirrored on express lanes). */
         memmove(&n0->keys[idx], &n0->keys[idx + 1], (n0->n_key - idx - 1) * sizeof(daslKey));
         memmove(&n0->members[idx], &n0->members[idx + 1], (n0->n_key - idx - 1) * sizeof(sds));
-        memmove(&n0->weights[idx], &n0->weights[idx + 1], (n0->n_key - idx - 1) * sizeof(unsigned long));
         n0->keys[n0->n_key - 1] = DASL_EMPTY_KEY;
         n0->members[n0->n_key - 1] = NULL;
-        n0->weights[n0->n_key - 1] = 0;
         n0->n_key--;
     } else if (n0->n_key > 1) {
         /* Leader delete, node survives: new leader is the old slot 1. */
@@ -642,10 +654,8 @@ static int daslDeleteEx(dasl *sl, double score, sds ele, sds *kept) {
         sds news_mem = n0->members[1];
         memmove(&n0->keys[0], &n0->keys[1], (n0->n_key - 1) * sizeof(daslKey));
         memmove(&n0->members[0], &n0->members[1], (n0->n_key - 1) * sizeof(sds));
-        memmove(&n0->weights[0], &n0->weights[1], (n0->n_key - 1) * sizeof(unsigned long));
         n0->keys[n0->n_key - 1] = DASL_EMPTY_KEY;
         n0->members[n0->n_key - 1] = NULL;
-        n0->weights[n0->n_key - 1] = 0;
         n0->n_key--;
         daslPropagateLeader(sl, prev, 0, &key, dead_mem, &news, news_mem);
         rkey = news;
@@ -775,13 +785,17 @@ unsigned long daslGetRank(const dasl *sl, double score, sds ele) {
             x = x->forward;
         }
         int j = dasl_find_le(x, &key, ele);
+        if (h == 0) {
+            /* Level 0: each slot before the landing slot weighs 1 (no weights[]). */
+            if (j >= 0) {
+                rank += (unsigned long)j;
+                if (dasl_cmp(&x->keys[j], x->members[j], &key, ele) == 0)
+                    return rank + 1; /* 1-based */
+            }
+            return 0;                /* not present */
+        }
         /* Add the weights of the slots strictly before the landing slot. */
         for (int t = 0; t < j; t++) rank += x->weights[t];
-        if (h == 0) {
-            if (j >= 0 && dasl_cmp(&x->keys[j], x->members[j], &key, ele) == 0)
-                return rank + 1; /* 1-based */
-            return 0;            /* not present */
-        }
         x = (j < 0) ? sl->head[h - 1] : x->next[j];
         h--;
     }
@@ -808,8 +822,12 @@ daslCursor daslGetElementByRank(const dasl *sl, unsigned long rank) {
             continue;
         }
         int j = 0;
+        if (h == 0) {
+            /* Level 0: each slot weighs 1 (no weights[]); land on rank-trav. */
+            while (j < x->n_key && trav + 1 < rank) { trav++; j++; }
+            c.node = x; c.slot = j; return c;
+        }
         while (j < x->n_key && trav + x->weights[j] < rank) { trav += x->weights[j]; j++; }
-        if (h == 0) { c.node = x; c.slot = j; return c; }
         x = x->next[j];
         h--;
     }
@@ -956,11 +974,12 @@ static unsigned long daslCountByScore(const dasl *sl, double edge, int orEqual) 
             int q = orEqual ? (s <= edge) : (s < edge);
             if (q) j = i; else break;
         }
-        for (int t = 0; t < j; t++) cnt += x->weights[t];
         if (h == 0) {
-            if (j >= 0) cnt += x->weights[j]; /* level-0 slot weights are 1 */
+            /* Level 0: slots 0..j each weigh 1 (no weights[]). */
+            if (j >= 0) cnt += (unsigned long)(j + 1);
             return cnt;
         }
+        for (int t = 0; t < j; t++) cnt += x->weights[t];
         /* Descend through the last qualifying slot (its subtree holds the
          * boundary); its weight is accounted at the level below. */
         x = (j < 0) ? sl->head[h - 1] : x->next[j];
@@ -1041,11 +1060,12 @@ static unsigned long daslCountLexPrefix(const dasl *sl, zlexrangespec *range,
         for (int i = 0; i < x->n_key; i++) {
             if (inprefix(x->members[i], range)) j = i; else break;
         }
-        for (int t = 0; t < j; t++) cnt += x->weights[t];
         if (h == 0) {
-            if (j >= 0) cnt += x->weights[j];
+            /* Level 0: slots 0..j each weigh 1 (no weights[]). */
+            if (j >= 0) cnt += (unsigned long)(j + 1);
             return cnt;
         }
+        for (int t = 0; t < j; t++) cnt += x->weights[t];
         x = (j < 0) ? sl->head[h - 1] : x->next[j];
         h--;
     }

@@ -56,22 +56,38 @@ typedef struct daslKey {
     unsigned char b[DASL_CK_SIZE];
 } daslKey;
 
+/* Node layout note (memory): a level-0 data node (`is_leaf == 1`) holds every
+ * element, so it dominates the structure's footprint, yet its `next[]` is always
+ * NULL (descent pointers exist only on index levels) and every `weights[]` slot
+ * is always 1. Those two arrays are therefore kept LAST and are NOT allocated on
+ * leaves: leaves are sized `DASL_LEAF_SIZE` (the struct truncated before
+ * `weights`), saving 2*DASL_ARR_SIZE pointers/longs (~38% of a node) per
+ * element. Index nodes and the per-level heads are allocated full size. Code
+ * must never read/write `weights[]`/`next[]` on a node with `is_leaf == 1`;
+ * a leaf slot's order-statistics weight is the constant 1. */
 typedef struct daslNode {
     daslKey keys[DASL_ARR_SIZE]; /* keys[0] is the node's leader key; ascending */
     sds members[DASL_ARR_SIZE];  /* full member per slot; owned at level 0, borrowed above */
-    struct daslNode *next[DASL_ARR_SIZE]; /* per-key descent pointers (upper levels) */
-    unsigned long weights[DASL_ARR_SIZE]; /* order-statistics weight per slot: at
-                                  * level 0 every occupied slot is 1; at index
-                                  * levels weights[i] counts the level-0 elements
-                                  * under next[i]'s subtree. On a head node only
-                                  * weights[0] is used: the count of level-0 keys
-                                  * preceding head->forward (the prefix weight). */
     struct daslNode *forward;    /* next node at the same level */
     struct daslNode *prev;       /* previous node at the same level (head for the
                                   * first real node, NULL for a head); lets delete
                                   * find a predecessor in O(1) instead of scanning */
     int n_key;                   /* number of occupied key slots */
+    int is_leaf;                 /* 1 for level-0 data nodes (no weights[]/next[]
+                                  * allocated); 0 for index nodes and heads */
+    /* The two arrays below are omitted on leaves (see DASL_LEAF_SIZE). */
+    unsigned long weights[DASL_ARR_SIZE]; /* order-statistics weight per slot: at
+                                  * index levels weights[i] counts the level-0
+                                  * elements under next[i]'s subtree. On a head
+                                  * node only weights[0] is used: the count of
+                                  * level-0 keys preceding head->forward (the
+                                  * prefix weight). (Leaf slots are implicitly 1.) */
+    struct daslNode *next[DASL_ARR_SIZE]; /* per-key descent pointers (index levels) */
 } daslNode;
+
+/* Allocation size of a level-0 data leaf: the struct truncated just before the
+ * index-only weights[]/next[] arrays. */
+#define DASL_LEAF_SIZE offsetof(daslNode, weights)
 
 typedef struct dasl {
     daslNode *head[DASL_MAXHEIGHT]; /* sentinel head node per level */
