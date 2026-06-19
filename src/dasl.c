@@ -268,20 +268,33 @@ static daslNode *daslDescend(const dasl *sl, const daslKey *key, sds mem, daslNo
     }
 }
 
-/* Recompute the order-statistics weights affected by mutating (key, mem). The
- * post-mutation descent for (key, mem) visits exactly the covering node at each
- * level - the ancestor chain whose subtree counts changed - so recomputing
- * those bottom-up (plus any split siblings in `added`, indexed by the level the
- * sibling lives on) restores all weights in O(height * fanout) = O(log N).
+/* Recompute the order-statistics weights affected by mutating (key, mem) by
+ * `delta` (+1 for an insert, -1 for a delete).
+ *
+ * A single-element mutation changes the level-0 element count under each
+ * ancestor region by exactly `delta`, and (key, mem) lies under exactly one
+ * covering region per level (a real node's slot, or the level's head prefix
+ * when it precedes every key there). So for a level whose slot layout did NOT
+ * change, adjusting that one region by `delta` is sufficient - O(1) per level.
+ *
+ * Levels [1, top] are the ones the mutation structurally rearranged (a split, a
+ * newly inserted index entry, or a freed node): their slot boundaries moved, so
+ * the covering node on the path - plus any split sibling in `added[h]` - is
+ * rebuilt in full from its children, and the head prefix is rederived from the
+ * level below. Levels above `top` keep their layout, so they take the O(1)
+ * `delta` adjustment instead of an O(fanout) re-sum. This turns the common
+ * no-split insert/delete from O(height * fanout) into O(height). Passing
+ * `top >= max_height` forces the full recompute at every level (used by the
+ * structurally-complex single-key-node delete).
+ *
  * `added[h]` may be NULL when no node was split at level h (e.g. all deletes).
  *
  * When `path_in` is non-NULL it is the post-mutation covering path the caller
- * already computed (the mutation's own descent, with the receiving node patched
- * in at each touched level), so the redundant internal descent is skipped. When
- * it is NULL the path is rediscovered here (used by the structurally-complex
- * single-key-node delete, where the caller's prev[] has freed/NULL entries). */
+ * already holds (valid only when no structural change and no leader propagation
+ * shifted the covers); otherwise the path is rediscovered here, which also
+ * yields the correct post-mutation covers after a leader propagation. */
 static void daslRecomputePath(dasl *sl, const daslKey *key, sds mem, daslNode **added,
-                              daslNode **path_in) {
+                              daslNode **path_in, int top, int delta) {
     daslNode *path[DASL_MAXHEIGHT];
     if (path_in != NULL) {
         memcpy(path, path_in, sizeof(path));
@@ -293,27 +306,44 @@ static void daslRecomputePath(dasl *sl, const daslKey *key, sds mem, daslNode **
     /* Level 0 carries no stored weights (every leaf slot is the implicit
      * constant 1), so nothing to recompute there. */
 
-    /* Index levels bottom-up: covering node on the path + any split sibling. */
+    /* Index levels bottom-up. */
     for (int h = 1; h < sl->max_height; h++) {
-        daslNode *cand[2] = { path[h], added[h] };
-        for (int k = 0; k < 2; k++) {
-            daslNode *x = cand[k];
-            if (x == NULL || x == sl->head[h]) continue;
-            for (int i = 0; i < x->n_key; i++) x->weights[i] = dasl_index_slot_weight(x, i);
+        if (h <= top) {
+            /* Structurally modified: covering node on the path + any split
+             * sibling, rebuilt in full from their children. */
+            daslNode *cand[2] = { path[h], added[h] };
+            for (int k = 0; k < 2; k++) {
+                daslNode *x = cand[k];
+                if (x == NULL || x == sl->head[h]) continue;
+                for (int i = 0; i < x->n_key; i++) x->weights[i] = dasl_index_slot_weight(x, i);
+            }
+        } else {
+            /* Layout unchanged: the element sits under exactly one covering
+             * region at this level. A real covering node's slot is adjusted
+             * here; the head-prefix case (path[h] == head[h]) is owned solely
+             * by the head-prefix loop below, so it is skipped here to avoid a
+             * double count. */
+            daslNode *x = path[h];
+            if (x != sl->head[h]) x->weights[dasl_find_le(x, key, mem)] += delta;
         }
     }
 
-    /* Per-level head prefixes: keys before head[h]->forward. Built from the
-     * level below: the lower head's prefix plus the level-(h-1) nodes between
-     * the two heads' forwards. */
+    /* Per-level head prefixes: keys before head[h]->forward. */
     sl->head[0]->weights[0] = 0;
     for (int h = 1; h < sl->max_height; h++) {
-        daslNode *f = sl->head[h]->forward;
-        daslNode *stop = f ? f->next[0] : NULL;
-        unsigned long pref = sl->head[h - 1]->weights[0];
-        for (daslNode *m = sl->head[h - 1]->forward; m != NULL && m != stop; m = m->forward)
-            pref += dasl_nodeweight(m);
-        sl->head[h]->weights[0] = pref;
+        if (h <= top) {
+            /* Built from the level below: the lower head's prefix plus the
+             * level-(h-1) nodes between the two heads' forwards. */
+            daslNode *f = sl->head[h]->forward;
+            daslNode *stop = f ? f->next[0] : NULL;
+            unsigned long pref = sl->head[h - 1]->weights[0];
+            for (daslNode *m = sl->head[h - 1]->forward; m != NULL && m != stop; m = m->forward)
+                pref += dasl_nodeweight(m);
+            sl->head[h]->weights[0] = pref;
+        } else if (path[h] == sl->head[h]) {
+            /* head[h]->forward is unchanged; the element falls in its prefix. */
+            sl->head[h]->weights[0] += delta;
+        }
     }
 }
 
@@ -381,6 +411,15 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
     daslKey up_key = key;   /* leader key to insert at the level above */
     sds up_mem = owned;     /* borrowed member that travels with up_key */
     daslNode *down = NULL;  /* node the new index entry should point at */
+
+    /* Set when an inserted element becomes a node's new leader, so the change
+     * is mirrored up the express lanes by daslPropagateLeader. A leader change
+     * shifts the leftmost-descendant boundary all the way up that chain, which
+     * moves order-statistics weight between head prefixes and slot-0 entries at
+     * levels ABOVE the highest structurally rebuilt level - so the cheap
+     * "+1 per covering region" weight update is not valid there. When this is
+     * set the post-insert weights are rebuilt in full. */
+    int leader_changed = 0;
 
     /* Level-0 node + slot that ends up holding the inserted element. Recorded
      * by the level-0 branch below so we can return the cursor directly instead
@@ -466,8 +505,10 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
             target->keys[pos] = ins_key;
             target->members[pos] = ins_mem;
             target->n_key++;
-            if (idx == -1) /* leader changed */
+            if (idx == -1) { /* leader changed */
+                leader_changed = 1;
                 daslPropagateLeader(sl, prev, level, &old_leader, old_leader_mem, &ins_key, ins_mem);
+            }
             down = target;
             path[level] = target;
             if (level == 0) { ins_node = target; ins_slot = pos; }
@@ -537,8 +578,10 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
             into->keys[pos] = ins_key;
             into->members[pos] = ins_mem;
             into->n_key++;
-            if (into == target && half_idx == -1)
+            if (into == target && half_idx == -1) {
+                leader_changed = 1;
                 daslPropagateLeader(sl, prev, level, &old_leader, old_leader_mem, &ins_key, ins_mem);
+            }
             path[level] = into;
             if (level == 0) { ins_node = into; ins_slot = pos; }
 
@@ -554,7 +597,19 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
 
     sl->length++;
     sl->alloc_size += sdsAllocSize(owned);
-    daslRecomputePath(sl, &key, ele, added, can_reuse ? path : NULL);
+    /* `level` is the highest level the insert touched (where the loop broke).
+     * The fast path (a plain in-node level-0 insert: no split, no promotion, no
+     * leader change) leaves every index level's layout intact, so reuse the
+     * descent's covering path and just bump one region per level (top == 0).
+     * Otherwise descend afresh - a split/promotion or a propagated leader can
+     * move the covers - and fully rebuild only the structurally touched levels
+     * [1, level], incrementing the untouched levels above. */
+    if (can_reuse) {
+        daslRecomputePath(sl, &key, ele, added, path, 0, +1);
+    } else {
+        int ins_top = leader_changed ? sl->max_height : level;
+        daslRecomputePath(sl, &key, ele, added, NULL, ins_top, +1);
+    }
 
     /* The level-0 branch recorded the node/slot that received the element, so
      * the cursor is returned directly (mirrors zslInsert returning the new
@@ -689,12 +744,16 @@ static int daslDeleteEx(dasl *sl, double score, sds ele, sds *kept) {
     if (sl->length > 0) {
         daslNode *added[DASL_MAXHEIGHT];
         for (int i = 0; i < DASL_MAXHEIGHT; i++) added[i] = NULL;
-        /* Reuse the descent's prev[] as the recompute path only for a plain
-         * non-leader delete (idx > 0): no leader changed and no node was freed,
-         * so prev[] is still the valid post-delete covering chain. The leader
-         * delete (propagates a new leader up, shifting higher covers) and the
-         * single-key unlink (frees nodes, NULLs prev[]) descend afresh. */
-        daslRecomputePath(sl, &rkey, rmem, added, (idx > 0) ? prev : NULL);
+        /* Only a plain non-leader delete (idx > 0) keeps every index level's
+         * layout AND its covering boundaries: no leader changed and no node was
+         * freed, so prev[] is still the valid post-delete covering chain and one
+         * region per level is simply decremented (top == 0). The leader delete
+         * relabels mirrored entries up the express lanes, shifting the
+         * leftmost-descendant boundary (same hazard as an insert leader change),
+         * and the single-key unlink frees nodes; both need the full rebuild and
+         * descend afresh. */
+        int del_top = (idx > 0) ? 0 : sl->max_height;
+        daslRecomputePath(sl, &rkey, rmem, added, (idx > 0) ? prev : NULL, del_top, -1);
     }
 
     /* Every borrowed reference to the owned member has now been rewritten or
