@@ -108,9 +108,12 @@ dasl *daslCreate(void);
 void daslFree(dasl *sl);
 
 /* Insert (score, ele). The member is copied (the caller keeps ownership of
- * `ele`). No-op if an equal (score, member) is already present. Returns a
- * cursor to the inserted element, or a null cursor (node==NULL) on duplicate.
- * Mirrors zslInsert(), which returns the inserted zskiplistNode*. */
+ * `ele`). Returns a cursor to the inserted element. Mirrors zslInsert(), which
+ * returns the inserted zskiplistNode*.
+ *
+ * The caller MUST guarantee (score, member) is not already present; the zset
+ * dict (keyed by member) enforces uniqueness, so no DASL-side duplicate check
+ * is performed. Inserting a duplicate corrupts the structure. */
 daslCursor daslInsert(dasl *sl, double score, sds ele);
 
 /* Returns 1 if (score, ele) is present, 0 otherwise. */

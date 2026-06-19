@@ -380,10 +380,14 @@ int daslContains(const dasl *sl, double score, sds ele) {
     return j >= 0 && dasl_cmp(&x->keys[j], x->members[j], &key, ele) == 0;
 }
 
-/* Insert taking ownership of `ele` (no copy is made). On a duplicate the
- * passed sds is freed and a null cursor is returned. daslInsert() wraps this
+/* Insert taking ownership of `ele` (no copy is made). daslInsert() wraps this
  * with an sdsdup so the public contract (caller keeps ownership) is preserved;
- * the score-reposition path uses it directly to keep the exact same buffer. */
+ * the score-reposition path uses it directly to keep the exact same buffer.
+ *
+ * The caller MUST guarantee the (score, member) is not already present. Every
+ * caller does: the zset dict (keyed by member) is the source of truth for
+ * uniqueness and is checked before we get here, so an explicit DASL-side
+ * duplicate check would be redundant work on the hot insert path. */
 static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
     daslKey key;
     daslMakeKey(&key, score, ele);
@@ -391,17 +395,6 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
     daslNode *prev[DASL_MAXHEIGHT];
     for (int i = 0; i < DASL_MAXHEIGHT; i++) prev[i] = sl->head[i];
     daslDescend(sl, &key, ele, prev);
-
-    /* Reject duplicates (checked at level 0). */
-    {
-        daslNode *x = prev[0];
-        int j = dasl_find_le(x, &key, ele);
-        if (j >= 0 && dasl_cmp(&x->keys[j], x->members[j], &key, ele) == 0) {
-            sdsfree(ele);
-            daslCursor dup = { NULL, 0 };
-            return dup;
-        }
-    }
 
     /* The member is now owned by the structure. It lives in exactly one
      * level-0 slot; express-lane entries only ever borrow a pointer to it. */
