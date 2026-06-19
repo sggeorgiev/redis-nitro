@@ -1203,30 +1203,26 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             nwritten += n;
         } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = o->ptr;
-            zskiplist *zsl = zs->zsl;
+            dasl *sl = zs->dasl;
 
-            if ((n = rdbSaveLen(rdb,zsl->length)) == -1) return -1;
+            if ((n = rdbSaveLen(rdb,daslLength(sl))) == -1) return -1;
             nwritten += n;
 
-            /* We save the skiplist elements from the greatest to the smallest
-             * (that's trivial since the elements are already ordered in the
-             * skiplist): this improves the load process, since the next loaded
-             * element will always be the smaller, so adding to the skiplist
-             * will always immediately stop at the head, making the insertion
-             * O(1) instead of O(log(N)). */
-            zskiplistNode *zn = zsl->tail;
-            while (zn != NULL) {
-                sds ele = zslGetNodeElement(zn);
+            /* We save the elements from the greatest to the smallest (that's
+             * trivial since the DASL is already ordered): this improves the
+             * load process, since the next loaded element will always be the
+             * smaller, so adding will always immediately stop at the head. */
+            for (daslCursor zn = daslLast(sl); !daslCursorIsNull(&zn); zn = daslPrev(zn)) {
+                sds ele = daslCursorMember(&zn);
                 if ((n = rdbSaveRawString(rdb,
                     (unsigned char*)ele,sdslen(ele))) == -1)
                 {
                     return -1;
                 }
                 nwritten += n;
-                if ((n = rdbSaveBinaryDoubleValue(rdb,zn->score)) == -1)
+                if ((n = rdbSaveBinaryDoubleValue(rdb,daslCursorScore(&zn))) == -1)
                     return -1;
                 nwritten += n;
-                zn = zn->backward;
             }
         } else {
             serverPanic("Unknown sorted set encoding");
@@ -2570,7 +2566,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         while(zsetlen--) {
             sds sdsele;
             double score;
-            zskiplistNode *znode;
 
             if ((sdsele = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL)) == NULL) {
                 decrRefCount(o);
@@ -2602,14 +2597,23 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
             totelelen += sdslen(sdsele);
 
-            znode = zslInsert(zs->zsl,score,sdsele);
-            if (dictAdd(zs->dict, znode, NULL) != DICT_OK) {
+            /* The dict is keyed by member, so a duplicate member (regardless of
+             * score) is detected here before touching the DASL. */
+            if (dictFind(zs->dict, sdsele) != NULL) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
                 decrRefCount(o);
-                sdsfree(sdsele); /* zslInsert copies the sds, so we need to free the original */
+                sdsfree(sdsele);
                 return NULL;
             }
-            sdsfree(sdsele); /* zslInsert copies the sds into the node, so free the original */
+
+            /* The DASL copies and owns the member; the dict key is that shared
+             * buffer, with the score stored as the value. */
+            daslCursor znode = daslInsert(zs->dasl,score,sdsele);
+            sds owned = daslCursorMember(&znode);
+            dictEntry *de = dictAddRaw(zs->dict, owned, NULL);
+            serverAssert(de != NULL);
+            dictSetDoubleVal(de, score);
+            sdsfree(sdsele); /* the DASL copied it, so free the original */
         }
 
         /* Convert *after* loading, since sorted sets are not stored ordered. */

@@ -297,27 +297,28 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
+        dasl *sl = zs->dasl;
+        daslCursor ln;
 
-        if ((ln = zslNthInRange(zsl, &range, 0, NULL)) == NULL) {
+        if ((ln = daslNthInRange(sl, &range, 0, NULL)).node == NULL) {
             /* Nothing exists starting at our min.  No results. */
             return 0;
         }
 
-        while (ln) {
+        while (!daslCursorIsNull(&ln)) {
             double xy[2];
             double distance = 0;
+            double score = daslCursorScore(&ln);
             /* Abort when the node is no longer in range. */
-            if (!zslValueLteMax(ln->score, &range))
+            if (!zslValueLteMax(score, &range))
                 break;
-            if (geoWithinShape(shape, ln->score, xy, &distance) == C_OK) {
+            if (geoWithinShape(shape, score, xy, &distance) == C_OK) {
                 /* Append the new element. */
-                sds ele = zslGetNodeElement(ln);
-                geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ele));
+                sds ele = daslCursorMember(&ln);
+                geoArrayAppend(ga, xy, distance, score, sdsdup(ele));
             }
             if (ga->used && limit && ga->used >= limit) break;
-            ln = ln->level[0].forward;
+            ln = daslNext(ln);
         }
     }
     return ga->used - origincount;
@@ -814,7 +815,6 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         }
 
         for (i = 0; i < returned_items; i++) {
-            zskiplistNode *znode;
             geoPoint *gp = ga->array+i;
             gp->dist /= shape.conversion; /* Fix according to unit. */
             double score = storedist ? gp->dist : gp->score;
@@ -822,9 +822,14 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
 
             if (maxelelen < elelen) maxelelen = elelen;
             totelelen += elelen;
-            znode = zslInsert(zs->zsl,score,gp->member);
-            serverAssert(dictAdd(zs->dict, znode, NULL) == DICT_OK);
-            sdsfree(gp->member); /* zslInsert copies the sds, so free the original */
+            /* The DASL copies and owns the member; the dict key is that shared
+             * buffer, with the score as the value. Geo members are unique. */
+            daslCursor znode = daslInsert(zs->dasl,score,gp->member);
+            sds owned = daslCursorMember(&znode);
+            dictEntry *de = dictAddRaw(zs->dict, owned, NULL);
+            serverAssert(de != NULL);
+            dictSetDoubleVal(de, score);
+            sdsfree(gp->member); /* the DASL copied it, so free the original */
             gp->member = NULL;
         }
 

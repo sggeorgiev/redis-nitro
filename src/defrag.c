@@ -382,57 +382,27 @@ dict *dictDefragTables(dict *d) {
     return ret;
 }
 
-/* Internal function used by activeDefragZsetNode */
-void zslUpdateNode(zskiplist *zsl, zskiplistNode *oldnode, zskiplistNode *newnode, zskiplistNode **update) {
-    int i;
-    for (i = 0; i < zsl->level; i++) {
-        if (update[i]->level[i].forward == oldnode)
-            update[i]->level[i].forward = newnode;
-    }
-    serverAssert(zsl->header!=oldnode);
-    if (newnode->level[0].forward) {
-        serverAssert(newnode->level[0].forward->backward==oldnode);
-        newnode->level[0].forward->backward = newnode;
-    } else {
-        serverAssert(zsl->tail==oldnode);
-        zsl->tail = newnode;
-    }
-}
+/* Defrag a single zset dict entry: relocate the member sds buffer (shared
+ * between the dict key and the dasl level-0 slot) and repoint every reference
+ * to it. The old buffer is kept alive until all references are rewritten, then
+ * freed, so the (score, member) descent inside daslDefragMember never touches
+ * freed memory. */
+void activeDefragZsetEntry(zset *zs, dictEntry *de, dictEntryLink plink) {
+    sds oldele = dictGetKey(de);
+    double score = dictGetDoubleVal(de);
 
-/* Defrag a single zset node, update dictEntry and skiplist struct */
-void activeDefragZsetNode(zset *zs, dictEntry *de, dictEntryLink plink) {
-    zskiplistNode *znode = dictGetKey(de);
+    /* Relocate the sds without freeing it yet. */
+    void *oldptr = sdsAllocPtr(oldele);
+    void *newptr = activeDefragAllocWithoutFree(oldptr);
+    if (!newptr) return; /* No defrag needed */
 
-    /* Try to defrag the skiplist node first */
-    zskiplistNode *newnode = activeDefragAllocWithoutFree(znode);
-    if (!newnode) return; /* No defrag needed */
+    sds newele = (char*)newptr + (oldele - (char*)oldptr);
 
-    /* Node was defragged, now we need to update all skiplist pointers */
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *iter;
-    int i;
-    double score = newnode->score;
-    sds ele = zslGetNodeElement(newnode);
-
-    /* Find all pointers that need to be updated */
-    iter = zs->zsl->header;
-    for (i = zs->zsl->level-1; i >= 0; i--) {
-        while (iter->level[i].forward &&
-            iter->level[i].forward != znode &&
-            zslCompareWithNode(score, ele, iter->level[i].forward) > 0)
-            iter = iter->level[i].forward;
-        update[i] = iter;
-    }
-
-    /* Verify we found the right node */
-    iter = iter->level[0].forward;
-    serverAssert(iter && iter == znode);
-
-    /* Update all skiplist pointers and dict key */
-    zslUpdateNode(zs->zsl, znode, newnode, update);
-    dictSetKeyAtLink(zs->dict, newnode, &plink, 0);
-
-    /* Free the old node now that all pointers have been updated */
-    activeDefragFree(znode);
+    /* Repoint the dasl (level-0 owner + express-lane borrowers) and the dict
+     * key to the new buffer, then release the old allocation. */
+    daslDefragMember(zs->dasl, score, oldele, newele);
+    dictSetKeyAtLink(zs->dict, newele, &plink, 0);
+    activeDefragFree(oldptr);
 }
 
 #define DEFRAG_SDS_DICT_NO_VAL 0
@@ -610,7 +580,7 @@ typedef struct {
 void scanZsetCallback(void *privdata, const dictEntry *_de, dictEntryLink plink) {
     dictEntry *de = (dictEntry*)_de;
     scanLaterZsetData *data = privdata;
-    activeDefragZsetNode(data->zs, de, plink);
+    activeDefragZsetEntry(data->zs, de, plink);
     server.stat_active_defrag_scanned++;
 }
 
@@ -700,22 +670,24 @@ void defragQuicklist(defragKeysCtx *ctx, kvobj *kv) {
 void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
     zset *zs = (zset*)ob->ptr;
     zset *newzs;
-    zskiplist *newzsl;
+    dasl *newdasl;
     dict *newdict;
-    struct zskiplistNode *newheader;
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
     if ((newzs = activeDefragAlloc(zs)))
         ob->ptr = zs = newzs;
-    if ((newzsl = activeDefragAlloc(zs->zsl)))
-        zs->zsl = newzsl;
-    if ((newheader = activeDefragAlloc(zs->zsl->header)))
-        zs->zsl->header = newheader;
+    if ((newdasl = activeDefragAlloc(zs->dasl)))
+        zs->dasl = newdasl;
+    /* Relocate the dasl nodes (heads included) in one pass, fixing all
+     * structural links. Member sds buffers are left in place and moved per
+     * dict entry below. */
+    daslDefragNodes(zs->dasl, activeDefragAlloc);
     if (dictSize(zs->dict) > server.active_defrag_max_scan_fields)
         defragLater(ctx, ob);
     else {
-        /* Use dictScanDefrag to iterate and defrag both dictEntry structures and skiplist nodes.
-         * dictScanDefrag handles defragging dictEntry/dictEntryNoValue structures via defragfns,
-         * and calls our callback with plink for each entry so we can defrag skiplist nodes. */
+        /* Use dictScanDefrag to iterate and defrag both dictEntry structures and
+         * the shared member sds. dictScanDefrag handles defragging the
+         * dictEntry structures via defragfns and calls our callback with plink
+         * for each entry so we can move the member and keep the dasl in sync. */
         scanLaterZsetData data = {zs};
         dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
         unsigned long cursor = 0;

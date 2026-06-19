@@ -635,10 +635,6 @@ typedef enum {
 /* Anti-warning macro... */
 #define UNUSED(V) ((void) V)
 
-#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^64 elements */
-#define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
-#define ZSKIPLIST_MAX_SEARCH 10
-
 /* Append only defines */
 #define AOF_FSYNC_NO 0
 #define AOF_FSYNC_ALWAYS 1
@@ -1753,35 +1749,14 @@ struct sharedObjectsStruct {
 
 /* ZSETs use a specialized version of Skiplists */
 
-/* Node info placed in level[0].span since it's unused at level 0 (static assert verified) */
-typedef struct zskiplistNodeInfo {
-    uint16_t sdsoffset;  /* Offset from node start to sds data (after sds header) */
-    uint8_t levels;      /* Number of levels in this node (1-32) */
-    uint8_t reserved;
-} zskiplistNodeInfo;
-
-typedef struct zskiplistNode {
-    double score;
-    struct zskiplistNode *backward;
-    struct zskiplistLevel {
-        struct zskiplistNode *forward;
-        /* Span is the number of elements between this node and the next node at this level.
-         * At level 0, span is repurposed to store zskiplistNodeInfo for regular nodes, */
-        unsigned long span;
-    } level[];
-    /* sds ele is embedded after level[] array (assist zslGetNodeElement(node) to access it) */
-} zskiplistNode;
-
-typedef struct zskiplist {
-    struct zskiplistNode *header, *tail;
-    unsigned long length;
-    int level;
-    size_t alloc_size;
-} zskiplist;
-
+/* The sorted set is backed by a DASL (array-packed skip list, see dasl.h) for
+ * ordered access, plus a dict mapping each member sds to its score for O(1)
+ * point lookups. The member sds is shared: the dict key is the very same buffer
+ * the DASL owns in its level-0 slot, so it is freed exactly once - by the DASL,
+ * after the dict entry has been unlinked. */
 typedef struct zset {
     dict *dict;
-    zskiplist *zsl;
+    struct dasl *dasl;
 } zset;
 
 typedef struct clientBufferLimitsConfig {
@@ -3638,18 +3613,15 @@ typedef struct {
     int minex, maxex; /* are min or max exclusive? */
 } zlexrangespec;
 
+/* The DASL skip list backs the sorted set; included here (after the range-spec
+ * types it depends on, and with __REDIS_H defined) so its range API is visible. */
+#include "dasl.h"
+
 /* flags for incrCommandFailedCalls */
 #define ERROR_COMMAND_REJECTED (1<<0) /* Indicate to update the command rejected stats */
 #define ERROR_COMMAND_FAILED (1<<1) /* Indicate to update the command failed stats */
 
-zskiplist *zslCreate(void);
-void zslFree(zskiplist *zsl);
-size_t zslAllocSize(const zskiplist *zsl);
-sds zslGetNodeElement(const zskiplistNode *node);
-int zslCompareWithNode(double score, sds ele, const zskiplistNode *n);
-zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele);
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score);
-zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n, unsigned long *out_rank);
 double zzlGetScore(unsigned char *sptr);
 void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
 void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
@@ -3660,7 +3632,6 @@ size_t zsetAllocSize(const robj *o);
 void zsetConvert(robj *zobj, int encoding);
 void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen);
 int zsetScore(robj *zobj, sds member, double *score);
-unsigned long zslGetRank(zskiplist *zsl, double score, sds o);
 int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore);
 long zsetRank(robj *zobj, sds ele, int reverse, double *score);
 int zsetDel(robj *zobj, sds ele);
@@ -3673,7 +3644,6 @@ void zslFreeLexRange(zlexrangespec *spec);
 int zslParseLexRange(robj *min, robj *max, zlexrangespec *spec);
 unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range);
 unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range);
-zskiplistNode *zslNthInLexRange(zskiplist *zsl, zlexrangespec *range, long n, unsigned long *out_rank);
 int zzlLexValueGteMin(unsigned char *p, zlexrangespec *spec);
 int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec);
 int zslLexValueGteMin(sds value, zlexrangespec *spec);

@@ -494,7 +494,7 @@ robj *createZsetObject(void) {
     robj *o;
 
     zs->dict = dictCreate(&zsetDictType);
-    zs->zsl = zslCreate();
+    zs->dasl = daslCreate();
     o = createObject(OBJ_ZSET,zs);
     o->encoding = OBJ_ENCODING_SKIPLIST;
     return o;
@@ -587,7 +587,7 @@ void freeZsetObject(robj *o) {
     case OBJ_ENCODING_SKIPLIST:
         zs = o->ptr;
         dictRelease(zs->dict);
-        zslFree(zs->zsl);
+        daslFree(zs->dasl);
         zfree(zs);
         break;
     case OBJ_ENCODING_LISTPACK:
@@ -757,17 +757,12 @@ void dismissSetObject(robj *o, size_t size_hint) {
 void dismissZsetObject(robj *o, size_t size_hint) {
     if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = o->ptr;
-        zskiplist *zsl = zs->zsl;
-        serverAssert(zsl->length != 0);
+        dasl *sl = zs->dasl;
+        serverAssert(daslLength(sl) != 0);
         /* We iterate all nodes only when average member size is bigger than a
          * page size, and there's a high chance we'll actually dismiss something. */
-        if (size_hint / zsl->length >= server.page_size) {
-            zskiplistNode *zn = zsl->header->level[0].forward;
-            while (zn != NULL) {
-                zskiplistNode *next = zn->level[0].forward;
-                dismissMemory(zn, 0);
-                zn = next;
-            }
+        if (size_hint / daslLength(sl) >= server.page_size) {
+            daslDismiss(sl);
         }
 
         /* Dismiss hash table memory. */

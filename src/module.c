@@ -197,7 +197,12 @@ struct RedisModuleKey {
             zlexrangespec lrs;     /* Lex range. */
             uint32_t start;        /* Start pos for positional ranges. */
             uint32_t end;          /* End pos for positional ranges. */
-            void *current;         /* Zset iterator current node. */
+            void *current;         /* Zset iterator current node. For the
+                                      listpack encoding this is the raw listpack
+                                      element pointer; for the skiplist (dasl)
+                                      encoding it is either NULL or &scursor
+                                      (a sentinel into the inline cursor below). */
+            daslCursor scursor;    /* Inline cursor for the skiplist encoding. */
             int er;                /* Zset iterator end reached flag
                                        (true if end was reached). */
         } zset;
@@ -5362,9 +5367,14 @@ int zsetInitScoreRange(RedisModuleKey *key, double min, double max, int minex, i
                                       zzlLastInRange(key->kv->ptr,zrs);
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = key->kv->ptr;
-        zskiplist *zsl = zs->zsl;
-        key->u.zset.current = first ? zslNthInRange(zsl, zrs, 0, NULL) :
-                                      zslNthInRange(zsl, zrs, -1, NULL);
+        daslCursor c = first ? daslNthInRange(zs->dasl, zrs, 0, NULL) :
+                               daslNthInRange(zs->dasl, zrs, -1, NULL);
+        if (daslCursorIsNull(&c)) {
+            key->u.zset.current = NULL;
+        } else {
+            key->u.zset.scursor = c;
+            key->u.zset.current = &key->u.zset.scursor;
+        }
     } else {
         serverPanic("Unsupported zset encoding");
     }
@@ -5426,9 +5436,14 @@ int zsetInitLexRange(RedisModuleKey *key, RedisModuleString *min, RedisModuleStr
                                       zzlLastInLexRange(key->kv->ptr,zlrs);
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = key->kv->ptr;
-        zskiplist *zsl = zs->zsl;
-        key->u.zset.current = first ? zslNthInLexRange(zsl,zlrs,0,NULL) :
-                                      zslNthInLexRange(zsl,zlrs,-1,NULL);
+        daslCursor c = first ? daslNthInLexRange(zs->dasl,zlrs,0,NULL) :
+                               daslNthInLexRange(zs->dasl,zlrs,-1,NULL);
+        if (daslCursorIsNull(&c)) {
+            key->u.zset.current = NULL;
+        } else {
+            key->u.zset.scursor = c;
+            key->u.zset.current = &key->u.zset.scursor;
+        }
     } else {
         serverPanic("Unsupported zset encoding");
     }
@@ -5477,9 +5492,9 @@ RedisModuleString *RM_ZsetRangeCurrentElement(RedisModuleKey *key, double *score
         }
         str = createObject(OBJ_STRING,ele);
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
-        zskiplistNode *ln = key->u.zset.current;
-        if (score) *score = ln->score;
-        sds ele = zslGetNodeElement(ln);
+        daslCursor *ln = key->u.zset.current;
+        if (score) *score = daslCursorScore(ln);
+        sds ele = daslCursorMember(ln);
         str = createStringObject(ele,sdslen(ele));
     } else {
         serverPanic("Unsupported zset encoding");
@@ -5527,24 +5542,26 @@ int RM_ZsetRangeNext(RedisModuleKey *key) {
             return 1;
         }
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
-        zskiplistNode *ln = key->u.zset.current, *next = ln->level[0].forward;
-        if (next == NULL) {
+        daslCursor *ln = key->u.zset.current;
+        daslCursor next = daslNext(*ln);
+        if (daslCursorIsNull(&next)) {
             key->u.zset.er = 1;
             return 0;
         } else {
             /* Are we still within the range? */
             if (key->u.zset.type == REDISMODULE_ZSET_RANGE_SCORE &&
-                !zslValueLteMax(next->score,&key->u.zset.rs))
+                !zslValueLteMax(daslCursorScore(&next),&key->u.zset.rs))
             {
                 key->u.zset.er = 1;
                 return 0;
             } else if (key->u.zset.type == REDISMODULE_ZSET_RANGE_LEX) {
-                if (!zslLexValueLteMax(zslGetNodeElement(next),&key->u.zset.lrs)) {
+                if (!zslLexValueLteMax(daslCursorMember(&next),&key->u.zset.lrs)) {
                     key->u.zset.er = 1;
                     return 0;
                 }
             }
-            key->u.zset.current = next;
+            key->u.zset.scursor = next;
+            key->u.zset.current = &key->u.zset.scursor;
             return 1;
         }
     } else {
@@ -5591,24 +5608,26 @@ int RM_ZsetRangePrev(RedisModuleKey *key) {
             return 1;
         }
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
-        zskiplistNode *ln = key->u.zset.current, *prev = ln->backward;
-        if (prev == NULL) {
+        daslCursor *ln = key->u.zset.current;
+        daslCursor prev = daslPrev(*ln);
+        if (daslCursorIsNull(&prev)) {
             key->u.zset.er = 1;
             return 0;
         } else {
             /* Are we still within the range? */
             if (key->u.zset.type == REDISMODULE_ZSET_RANGE_SCORE &&
-                !zslValueGteMin(prev->score,&key->u.zset.rs))
+                !zslValueGteMin(daslCursorScore(&prev),&key->u.zset.rs))
             {
                 key->u.zset.er = 1;
                 return 0;
             } else if (key->u.zset.type == REDISMODULE_ZSET_RANGE_LEX) {
-                if (!zslLexValueGteMin(zslGetNodeElement(prev),&key->u.zset.lrs)) {
+                if (!zslLexValueGteMin(daslCursorMember(&prev),&key->u.zset.lrs)) {
                     key->u.zset.er = 1;
                     return 0;
                 }
             }
-            key->u.zset.current = prev;
+            key->u.zset.scursor = prev;
+            key->u.zset.current = &key->u.zset.scursor;
             return 1;
         }
     } else {
@@ -12070,10 +12089,9 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
         field = createStringObject(fieldStr, sdslen(fieldStr));
         value = createStringObject(val, sdslen(val));
     } else if (kv->type == OBJ_ZSET) {
-        zskiplistNode *znode = (zskiplistNode *) key;
-        sds fieldStr = zslGetNodeElement(znode);
-        field = createStringObject(fieldStr, sdslen(fieldStr));
-        value = createStringObjectFromLongDouble(znode->score, 0);
+        /* The zset dict key is the member sds; the score is the entry value. */
+        field = createStringObject(key, sdslen(key));
+        value = createStringObjectFromLongDouble(dictGetDoubleVal(de), 0);
     }
     
     serverAssert(field != NULL);

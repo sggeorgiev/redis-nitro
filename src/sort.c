@@ -14,8 +14,6 @@
 #include <math.h> /* isnan() */
 #include "cluster.h"
 
-zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank);
-
 redisSortOperation *createSortOperation(int type, robj *pattern) {
     redisSortOperation *so = zmalloc(sizeof(*so));
     so->type = type;
@@ -447,8 +445,8 @@ void sortCommandGeneric(client *c, int readonly) {
          * way, just getting the required range, as an optimization. */
 
         zset *zs = sortval->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
+        dasl *sl = zs->dasl;
+        daslCursor ln;
         sds sdsele;
         int rangelen = vectorlen;
 
@@ -456,23 +454,23 @@ void sortCommandGeneric(client *c, int readonly) {
         if (desc) {
             long zsetlen = dictSize(((zset*)sortval->ptr)->dict);
 
-            ln = zsl->tail;
+            ln = daslLast(sl);
             if (start > 0)
-                ln = zslGetElementByRank(zsl,zsetlen-start);
+                ln = daslGetElementByRank(sl,zsetlen-start);
         } else {
-            ln = zsl->header->level[0].forward;
+            ln = daslFirst(sl);
             if (start > 0)
-                ln = zslGetElementByRank(zsl,start+1);
+                ln = daslGetElementByRank(sl,start+1);
         }
 
         while(rangelen--) {
-            serverAssertWithInfo(c,sortval,ln != NULL);
-            sdsele = zslGetNodeElement(ln);
+            serverAssertWithInfo(c,sortval,!daslCursorIsNull(&ln));
+            sdsele = daslCursorMember(&ln);
             vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
-            ln = desc ? ln->backward : ln->level[0].forward;
+            ln = desc ? daslPrev(ln) : daslNext(ln);
         }
         /* Fix start/end: output code is not aware of this optimization. */
         end -= start;
@@ -487,7 +485,7 @@ void sortCommandGeneric(client *c, int readonly) {
             oldsize = kvobjAllocSize(sortval);
         dictInitIterator(&di, set);
         while((setele = dictNext(&di)) != NULL) {
-            sdsele = zslGetNodeElement(dictGetKey(setele));
+            sdsele = dictGetKey(setele);
             vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
