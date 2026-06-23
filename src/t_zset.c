@@ -939,9 +939,17 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
      * converted the key to skiplist. */
     if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        dictEntry *de = dictFind(zs->dict, ele);
 
-        if (de != NULL) {
+        /* Use dictFindLink to find the element and get the bucket for potential
+         * insertion. This avoids a second hash + bucket walk in dictAddRaw() when
+         * the element doesn't exist. The returned bucket/link must be consumed by
+         * dictSetKeyAtLink() below with no intervening dict mutation; daslInsert()
+         * only touches the DASL, so the bucket stays valid. */
+        dictEntryLink bucket, link;
+        link = dictFindLink(zs->dict, ele, &bucket);
+
+        if (link != NULL) {
+            dictEntry *de = *link;
             /* NX? Return, same element already exists. */
             if (nx) {
                 *out_flags |= ZADD_OUT_NOP;
@@ -982,12 +990,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
         } else if (!xx) {
             /* Element doesn't exist - insert into the DASL (which copies and
              * owns the member sds) and store that shared buffer + score in the
-             * dict. */
+             * dict, reusing the bucket already located by dictFindLink() above. */
             daslCursor c = daslInsert(zs->dasl, score, ele);
             sds owned = daslCursorMember(&c);
-            dictEntry *nde = dictAddRaw(zs->dict, owned, NULL);
-            serverAssert(nde != NULL);
-            dictSetDoubleVal(nde, score);
+            dictSetKeyAtLink(zs->dict, owned, &bucket, 1);
+            dictSetDoubleVal(*bucket, score);
 
             *out_flags |= ZADD_OUT_ADDED;
             if (newscore) *newscore = score;

@@ -7,12 +7,18 @@
  *
  * Differences vs. the C++ reference:
  *   - The key is the zset composite (double score, sds member). It is packed
- *     into a fixed-width 16-byte `daslKey`: bytes [0,8) hold the score in an
- *     order-preserving "sortable" encoding (so byte-wise memcmp matches numeric
- *     order) and bytes [8,16) hold the first 8 bytes of the member (zero
- *     padded). A parallel `members[]` array holds the full sds. Ordering is a
- *     single 16-byte memcmp; ties on the composite fall back to sdscmp of the
- *     full member. See dasl.c for the encoding/comparison details.
+ *     into a fixed-width `daslKey`: bytes [0,8) hold the score in an
+ *     order-preserving "sortable" encoding (so unsigned word comparison matches
+ *     numeric order) and, when DASL_MEMBER_PREFIX is 8 (the default), bytes
+ *     [8,16) hold the first 8 bytes of the member (zero padded). A parallel
+ *     `members[]` array always holds the full sds. Ordering compares the score
+ *     word, then the member-prefix word (if present), then sdscmp of the full
+ *     member on a tie. Setting DASL_MEMBER_PREFIX to 0 drops the inline prefix
+ *     (8 fewer bytes per slot, ~28% smaller leaves) at the cost of an sdscmp on
+ *     every equal-score comparison; with distinct scores the score word decides
+ *     and the prefix is never read, so the prefix only earns its memory on
+ *     equal-score / lexicographic workloads whose members differ within their
+ *     first 8 bytes. See dasl.c for the encoding/comparison details.
  *   - Empty array slots use an all-0xFF composite (the maximum key) plus a NULL
  *     member as a sentinel; intra-node search is bounded by n_key and never
  *     inspects empties, so the sentinel is belt-and-suspenders for debugging.
@@ -48,8 +54,13 @@
 #define DASL_MAXHEIGHT 32  /* enough for 2^64 elements */
 
 #define DASL_SCORE_SIZE 8                                   /* order-preserving score bytes */
-#define DASL_MEMBER_PREFIX 8                                /* leading member bytes packed inline */
-#define DASL_CK_SIZE (DASL_SCORE_SIZE + DASL_MEMBER_PREFIX) /* composite key width: 16 */
+#ifndef DASL_MEMBER_PREFIX
+#define DASL_MEMBER_PREFIX 8   /* leading member bytes packed inline (must be 0 or 8); overridable */
+#endif
+#if DASL_MEMBER_PREFIX != 0 && DASL_MEMBER_PREFIX != 8
+#error "DASL_MEMBER_PREFIX must be 0 or 8 (the inline-prefix comparison uses one 64-bit word)"
+#endif
+#define DASL_CK_SIZE (DASL_SCORE_SIZE + DASL_MEMBER_PREFIX) /* composite key width: 16 (prefix 8) or 8 (prefix 0) */
 
 /* Fixed-width composite key: [0,8) sortable score, [8,16) member prefix. */
 typedef struct daslKey {

@@ -54,14 +54,14 @@
 /* Empty array slots hold the maximum composite key (all 0xFF) and a NULL
  * member; intra-node search is bounded by n_key and never inspects empties, so
  * the sentinel is belt-and-suspenders for debugging. */
-static const daslKey DASL_EMPTY_KEY = { { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                                          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } };
+static const daslKey DASL_EMPTY_KEY = { { [0 ... DASL_CK_SIZE - 1] = 0xFF } };
 
 /* Pack (score, ele) into a fixed-width composite key: bytes [0,8) hold the
  * score in an order-preserving "sortable" encoding (sign-bit/all-bits flip then
- * big-endian, so memcmp matches numeric order) and bytes [8,16) hold the first
- * 8 bytes of the member, zero padded. memcmp of the 16 bytes therefore orders
- * by score first, then by member prefix; ties are resolved by the full sds. */
+ * big-endian, so an unsigned word compare matches numeric order) and, when
+ * DASL_MEMBER_PREFIX is 8, bytes [8,16) hold the first 8 bytes of the member,
+ * zero padded. dasl_cmp therefore orders by score word first, then by member-
+ * prefix word (if present); ties are resolved by sdscmp of the full member. */
 static void daslMakeKey(daslKey *k, double score, sds ele) {
     uint64_t bits;
     if (score == 0) score = 0; /* canonicalize -0.0 to +0.0 (zset treats them equal) */
@@ -69,28 +69,64 @@ static void daslMakeKey(daslKey *k, double score, sds ele) {
     bits = (bits & (1ULL << 63)) ? ~bits : (bits ^ (1ULL << 63));
     bits = htonu64(bits); /* big-endian: byte 0 is most significant */
     memcpy(k->b, &bits, DASL_SCORE_SIZE);
+#if DASL_MEMBER_PREFIX > 0
     size_t n = sdslen(ele);
     if (n > DASL_MEMBER_PREFIX) n = DASL_MEMBER_PREFIX;
     memset(k->b + DASL_SCORE_SIZE, 0, DASL_MEMBER_PREFIX);
     memcpy(k->b + DASL_SCORE_SIZE, ele, n);
+#else
+    (void)ele; /* no inline prefix: the full member is compared via sdscmp */
+#endif
 }
 
-/* Compare composite key + full member of two entries. memcmp the 16-byte
- * composite first; on a tie compare the full members with sdscmp. Members are
- * present at every level (owned at level 0, borrowed above), so the tie-break
- * is always available. */
+/* Load 8 composite-key bytes at `p` as a host-order word whose unsigned
+ * comparison reproduces the byte-wise (memcmp) order of those bytes. The
+ * composite is stored big-endian (score via htonu64, member prefix as raw
+ * bytes with byte 8 most significant), so ntohu64 maps each 8-byte field to a
+ * value where `<` matches the original memcmp ordering on both endiannesses. */
+static inline uint64_t dasl_word(const unsigned char *p) {
+    uint64_t w;
+    memcpy(&w, p, sizeof(w));
+    return ntohu64(w);
+}
+
+/* Compare composite key + full member of two entries. The 16-byte composite is
+ * compared as two 64-bit words - score first, then member prefix - instead of a
+ * libc memcmp call: scores almost always differ, so this resolves in a single
+ * register compare on the hot path. Only a full composite tie falls through to
+ * sdscmp on the members (present at every level: owned at level 0, borrowed
+ * above), preserving the exact (score, member) total order memcmp produced. */
 static inline int dasl_cmp(const daslKey *a, sds ma, const daslKey *b, sds mb) {
-    int c = memcmp(a->b, b->b, DASL_CK_SIZE);
-    if (c) return c < 0 ? -1 : 1;
+    uint64_t sa = dasl_word(a->b), sb = dasl_word(b->b);
+    if (sa != sb) return sa < sb ? -1 : 1;
+#if DASL_MEMBER_PREFIX > 0
+    uint64_t pa = dasl_word(a->b + DASL_SCORE_SIZE), pb = dasl_word(b->b + DASL_SCORE_SIZE);
+    if (pa != pb) return pa < pb ? -1 : 1;
+#endif
     return sdscmp(ma, mb);
 }
 
 /* Greatest slot index i in [0, n_key) with (keys[i], members[i]) <=
- * (target, mem), or -1 if none (including an empty head whose n_key == 0). */
+ * (target, mem), or -1 if none (including an empty head whose n_key == 0).
+ * Slots are sorted ascending, so this binary-searches the packed node
+ * (~log2(DASL_ARR_SIZE) compares) rather than scanning all n_key keys.
+ *
+ * Written as a branchless upper-bound: `lo` converges on the count of slots
+ * <= target (which, since slots are sorted, form the prefix [0, lo)), so the
+ * answer is lo - 1. The per-iteration loop-control decision is expressed as
+ * conditional-move-friendly ternaries instead of a data-dependent branch,
+ * which the predictor cannot learn for random search keys (dasl_cmp's own
+ * early-outs, by contrast, are well predicted: scores almost always differ). */
 static int dasl_find_le(const daslNode *n, const daslKey *target, sds mem) {
-    for (int i = 0; i < n->n_key; i++)
-        if (dasl_cmp(&n->keys[i], n->members[i], target, mem) > 0) return i - 1;
-    return n->n_key - 1;
+    int lo = 0, len = n->n_key;
+    while (len > 0) {
+        int half = len >> 1;
+        int mid = lo + half;
+        int le = dasl_cmp(&n->keys[mid], n->members[mid], target, mem) <= 0;
+        lo  = le ? mid + 1 : lo;
+        len = le ? len - half - 1 : half;
+    }
+    return lo - 1;
 }
 
 /* Does the node whose leader key is `leader` already own an express-lane index
@@ -263,7 +299,11 @@ static daslNode *daslDescend(const dasl *sl, const daslKey *key, sds mem, daslNo
         if (prev) prev[h] = x;
         if (h == 0) return x;
         int j = dasl_find_le(x, key, mem);
-        x = (j < 0) ? sl->head[h - 1] : x->next[j];
+        daslNode *nx = (j < 0) ? sl->head[h - 1] : x->next[j];
+        /* Descent is a chain of dependent loads across levels; pull the chosen
+         * child in while the level below's binary search overlaps the miss. */
+        __builtin_prefetch(nx);
+        x = nx;
         h--;
     }
 }
@@ -294,7 +334,7 @@ static daslNode *daslDescend(const dasl *sl, const daslKey *key, sds mem, daslNo
  * shifted the covers); otherwise the path is rediscovered here, which also
  * yields the correct post-mutation covers after a leader propagation. */
 static void daslRecomputePath(dasl *sl, const daslKey *key, sds mem, daslNode **added,
-                              daslNode **path_in, int top, int delta) {
+                              daslNode **kept, daslNode **path_in, int top, int delta) {
     daslNode *path[DASL_MAXHEIGHT];
     if (path_in != NULL) {
         memcpy(path, path_in, sizeof(path));
@@ -309,10 +349,12 @@ static void daslRecomputePath(dasl *sl, const daslKey *key, sds mem, daslNode **
     /* Index levels bottom-up. */
     for (int h = 1; h < sl->max_height; h++) {
         if (h <= top) {
-            /* Structurally modified: covering node on the path + any split
-             * sibling, rebuilt in full from their children. */
-            daslNode *cand[2] = { path[h], added[h] };
-            for (int k = 0; k < 2; k++) {
+            /* Structurally modified: covering node on the path, any split
+             * sibling, and any append-split "kept full" node (whose own slots
+             * can go stale when a child shrank but the descent path diverted to
+             * the freshly promoted singleton), rebuilt in full from children. */
+            daslNode *cand[3] = { path[h], added[h], kept ? kept[h] : NULL };
+            for (int k = 0; k < 3; k++) {
                 daslNode *x = cand[k];
                 if (x == NULL || x == sl->head[h]) continue;
                 for (int i = 0; i < x->n_key; i++) x->weights[i] = dasl_index_slot_weight(x, i);
@@ -426,6 +468,16 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
     daslNode *added[DASL_MAXHEIGHT];
     for (int i = 0; i < DASL_MAXHEIGHT; i++) added[i] = NULL;
 
+    /* Index nodes kept full by the append-aware split fast-path, indexed by
+     * level. Unlike a split (whose sibling is captured in added[]), an append
+     * leaves `target` untouched and diverts the descent to the new singleton,
+     * so target's own slots - one of which may cover a child that shrank lower
+     * down - are off the recompute path. Recorded here so daslRecomputePath
+     * rebuilds them. Only index levels carry weights, so leaves are never
+     * recorded. */
+    daslNode *kept[DASL_MAXHEIGHT];
+    for (int i = 0; i < DASL_MAXHEIGHT; i++) kept[i] = NULL;
+
     /* Post-mutation covering path for the weight recompute, seeded from the
      * descent's covering chain and patched with the receiving node at the one
      * level a simple insert touches. This is reused (skipping the recompute's
@@ -522,6 +574,36 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
              * insert that did not change the node's leader. */
             can_reuse = (level == 0 && idx != -1);
             break;
+        } else if (idx == target->n_key - 1) {
+            /* Full node, new key appends at the tail. Rather than an even
+             * 50/50 split - which strands the left half at half capacity under
+             * an ascending / append-only workload (timestamps, autoincrement
+             * scores: every insert lands here, so the left halves never refill
+             * and the structure sits at ~50% fill forever) - keep `target`
+             * full and spill the single new key into a fresh right node. Fill
+             * then trends toward ~100% for that workload and the half-array
+             * memmove is skipped. `target` keeps every key (its leader is
+             * unchanged, so no leader propagation); the new node is promoted
+             * exactly like a split's right sibling. */
+            if (level != 0) kept[level] = target; /* leaves carry no weights */
+            daslNode *add = daslNewNode(sl, &ins_key, ins_mem, level == 0);
+            if (level != 0) add->next[0] = ins_down;
+            add->forward = target->forward;
+            add->prev = target;
+            if (add->forward != NULL) add->forward->prev = add;
+            target->forward = add;
+            added[level] = add;
+            if (level == 0) {
+                if (add->forward == NULL) sl->tail = add;
+                ins_node = add; ins_slot = 0;
+            }
+            path[level] = add;
+            down = add;
+            up_key = add->keys[0];
+            up_mem = add->members[0];
+            level++;
+            daslEnsureHeight(sl, level);
+            continue;
         } else {
             /* Full: even split. Upper half moves to a new right node `add`. */
             daslNode *add = daslNewNode(sl, &target->keys[DASL_SPLIT], target->members[DASL_SPLIT], level == 0);
@@ -598,10 +680,10 @@ static daslCursor daslInsertOwned(dasl *sl, double score, sds ele) {
      * move the covers - and fully rebuild only the structurally touched levels
      * [1, level], incrementing the untouched levels above. */
     if (can_reuse) {
-        daslRecomputePath(sl, &key, ele, added, path, 0, +1);
+        daslRecomputePath(sl, &key, ele, added, NULL, path, 0, +1);
     } else {
         int ins_top = leader_changed ? sl->max_height : level;
-        daslRecomputePath(sl, &key, ele, added, NULL, ins_top, +1);
+        daslRecomputePath(sl, &key, ele, added, kept, NULL, ins_top, +1);
     }
 
     /* The level-0 branch recorded the node/slot that received the element, so
@@ -746,7 +828,7 @@ static int daslDeleteEx(dasl *sl, double score, sds ele, sds *kept) {
          * and the single-key unlink frees nodes; both need the full rebuild and
          * descend afresh. */
         int del_top = (idx > 0) ? 0 : sl->max_height;
-        daslRecomputePath(sl, &rkey, rmem, added, (idx > 0) ? prev : NULL, del_top, -1);
+        daslRecomputePath(sl, &rkey, rmem, added, NULL, (idx > 0) ? prev : NULL, del_top, -1);
     }
 
     /* Every borrowed reference to the owned member has now been rewritten or
