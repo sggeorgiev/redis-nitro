@@ -5,23 +5,22 @@
  * ISOLATED prototype (Phase 0): it is NOT wired into the Redis server
  * build yet and is exercised only by a standalone harness.
  *
+ * Two node types. Level-0 data lives in `daslLeaf`, and the express-lane index
+ * levels (>= 1) and their per-level heads are `daslNode`. Both store the zset
+ * composite the same way: a raw double `scores[]` slot plus a parallel
+ * `members[]` sds slot (16 bytes/slot). Routing and leaf lookup share one total
+ * order - compare the raw double, then sdscmp the full member on a tie.
+ *
  * Differences vs. the C++ reference:
- *   - The key is the zset composite (double score, sds member). It is packed
- *     into a fixed-width `daslKey`: bytes [0,8) hold the score in an
- *     order-preserving "sortable" encoding (so unsigned word comparison matches
- *     numeric order) and, when DASL_MEMBER_PREFIX is 8 (the default), bytes
- *     [8,16) hold the first 8 bytes of the member (zero padded). A parallel
- *     `members[]` array always holds the full sds. Ordering compares the score
- *     word, then the member-prefix word (if present), then sdscmp of the full
- *     member on a tie. Setting DASL_MEMBER_PREFIX to 0 drops the inline prefix
- *     (8 fewer bytes per slot, ~28% smaller leaves) at the cost of an sdscmp on
- *     every equal-score comparison; with distinct scores the score word decides
- *     and the prefix is never read, so the prefix only earns its memory on
- *     equal-score / lexicographic workloads whose members differ within their
- *     first 8 bytes. See dasl.c for the encoding/comparison details.
- *   - Empty array slots use an all-0xFF composite (the maximum key) plus a NULL
- *     member as a sentinel; intra-node search is bounded by n_key and never
- *     inspects empties, so the sentinel is belt-and-suspenders for debugging.
+ *   - The index key is the zset composite (double score, sds member), stored
+ *     verbatim: index nodes carry the score as a raw double in `scores[]` and
+ *     the full member sds in `members[]`, exactly like the leaves. Doubles
+ *     compare in numeric order, so ordering is the raw double then sdscmp of the
+ *     full member on a tie - the same total order at every level. (Earlier
+ *     revisions packed the composite into a fixed-width sortable byte key for
+ *     branch-free routing; that is gone now that index slots hold raw scores.)
+ *   - Empty index slots hold score 0 plus a NULL member; intra-node search is
+ *     bounded by n_key and never inspects empties.
  *   - C++ new/delete -> zmalloc/zfree, with allocation-size tracking.
  *   - Only the canonical operations are ported: Insert, Contains, Delete,
  *     Scan. Benchmark-only variants are dropped.
@@ -31,14 +30,14 @@
  *     express-lane leaders). Splits are even (DASL_ARR_SIZE/2).
  *
  * The structural design is unchanged: each node packs up to DASL_ARR_SIZE
- * keys; the bottom level (head[0] forward chain) holds all elements, and
+ * elements; the bottom level (leaf head forward chain) holds all elements, and
  * upper levels are express lanes whose `next[i]` pointers descend one level.
  *
- * Member ownership: at the bottom level (head[0] chain) each slot's
- * `members[i]` is an owned sds copy of the inserted member; at express-lane
- * levels `members[i]` is a *borrowed* pointer to the bottom-level owner's sds,
- * used only for tie-break comparison. Borrowed pointers are never freed and
- * always move/propagate in lock-step with their composite key.
+ * Member ownership: at the bottom level (leaf chain) each slot's `members[i]`
+ * is an owned sds copy of the inserted member; at express-lane levels
+ * `members[i]` is a *borrowed* pointer to the leaf-level owner's sds, used only
+ * for tie-break comparison. Borrowed pointers are never freed and always
+ * move/propagate in lock-step with their score slot.
  */
 
 #ifndef DASL_H
@@ -49,69 +48,71 @@
 #include "sds.h"
 
 #ifndef DASL_ARR_SIZE
-#define DASL_ARR_SIZE 64   /* keys packed per node (must be a power of two); overridable for tests */
+#define DASL_ARR_SIZE 64   /* elements packed per node (must be a power of two); overridable for tests */
 #endif
 #define DASL_MAXHEIGHT 32  /* enough for 2^64 elements */
 
-#define DASL_SCORE_SIZE 8                                   /* order-preserving score bytes */
-#ifndef DASL_MEMBER_PREFIX
-#define DASL_MEMBER_PREFIX 8   /* leading member bytes packed inline (must be 0 or 8); overridable */
-#endif
-#if DASL_MEMBER_PREFIX != 0 && DASL_MEMBER_PREFIX != 8
-#error "DASL_MEMBER_PREFIX must be 0 or 8 (the inline-prefix comparison uses one 64-bit word)"
-#endif
-#define DASL_CK_SIZE (DASL_SCORE_SIZE + DASL_MEMBER_PREFIX) /* composite key width: 16 (prefix 8) or 8 (prefix 0) */
-
-/* Fixed-width composite key: [0,8) sortable score, [8,16) member prefix. */
-typedef struct daslKey {
-    unsigned char b[DASL_CK_SIZE];
-} daslKey;
-
-/* Node layout note (memory): a level-0 data node (`is_leaf == 1`) holds every
- * element, so it dominates the structure's footprint, yet its `next[]` is always
- * NULL (descent pointers exist only on index levels) and every `weights[]` slot
- * is always 1. Those two arrays are therefore kept LAST and are NOT allocated on
- * leaves: leaves are sized `DASL_LEAF_SIZE` (the struct truncated before
- * `weights`), saving 2*DASL_ARR_SIZE pointers/longs (~38% of a node) per
- * element. Index nodes and the per-level heads are allocated full size. Code
- * must never read/write `weights[]`/`next[]` on a node with `is_leaf == 1`;
- * a leaf slot's order-statistics weight is the constant 1. */
+/* Index node: an express-lane node at level >= 1, and the per-level sentinel
+ * head for those levels. Packs up to DASL_ARR_SIZE composite entries (raw
+ * double score + member sds, exactly like a leaf), the order-statistics
+ * weights[], and the descent pointers next[]. Level-0 data lives in the
+ * separate, slimmer daslLeaf below; accordingly next[i] points at a daslLeaf
+ * when this node is at level 1, and at a daslNode when it is at level >= 2
+ * (hence the void* element type - the descender knows the level and casts). On
+ * a head only weights[0] is used (the prefix weight: level-0 elements preceding
+ * head->forward). */
 typedef struct daslNode {
-    daslKey keys[DASL_ARR_SIZE]; /* keys[0] is the node's leader key; ascending */
-    sds members[DASL_ARR_SIZE];  /* full member per slot; owned at level 0, borrowed above */
+    double scores[DASL_ARR_SIZE]; /* scores[0] is the node's leader score; ascending */
+    sds members[DASL_ARR_SIZE];  /* borrowed pointer to the level-0 owner sds */
     struct daslNode *forward;    /* next node at the same level */
     struct daslNode *prev;       /* previous node at the same level (head for the
                                   * first real node, NULL for a head); lets delete
                                   * find a predecessor in O(1) instead of scanning */
-    int n_key;                   /* number of occupied key slots */
-    int is_leaf;                 /* 1 for level-0 data nodes (no weights[]/next[]
-                                  * allocated); 0 for index nodes and heads */
-    /* The two arrays below are omitted on leaves (see DASL_LEAF_SIZE). */
-    unsigned long weights[DASL_ARR_SIZE]; /* order-statistics weight per slot: at
-                                  * index levels weights[i] counts the level-0
-                                  * elements under next[i]'s subtree. On a head
-                                  * node only weights[0] is used: the count of
-                                  * level-0 keys preceding head->forward (the
-                                  * prefix weight). (Leaf slots are implicitly 1.) */
-    struct daslNode *next[DASL_ARR_SIZE]; /* per-key descent pointers (index levels) */
+    int n_key;                   /* number of occupied slots */
+    void *next[DASL_ARR_SIZE];   /* per-slot descent pointers: level-1 children are
+                                  * daslLeaf*, level>=2 children are daslNode* */
+    /* Order-statistics weight per slot, stored as a trailing flexible array so a
+     * node only pays for the width its level needs (see dasl_weight_width in
+     * dasl.c): a level-h slot covers one child node, so its weight is capped at
+     * DASL_ARR_SIZE^h, and the width is uint8 at level 1, uint16 at level 2,
+     * uint32 at levels 3-5, uint64 above. The raw bytes are never read directly -
+     * all access goes through dasl_wget/dasl_wset (and DASL_WSUM), which cast to
+     * the level's type. The buffer starts 8-byte aligned (the last fixed member
+     * is a pointer array), so wider casts are aligned. On a head only weights[0]
+     * is used (the level-0 prefix weight). */
+    unsigned char weights[];
 } daslNode;
 
-/* Allocation size of a level-0 data leaf: the struct truncated just before the
- * index-only weights[]/next[] arrays. */
-#define DASL_LEAF_SIZE offsetof(daslNode, weights)
+/* Level-0 data node and the level-0 sentinel head. Holds the score as a raw
+ * double plus the owned full member sds - the same composite layout as an index
+ * node. A leaf carries neither weights[] (every leaf slot weighs the implicit
+ * constant 1) nor next[] (descent pointers live only on index levels), so a
+ * leaf slot costs 16 bytes (double + sds pointer) instead of the wider index
+ * slot (which also carries a weight and a descent pointer). Leaves form a
+ * doubly-linked chain (forward/prev) anchored at the structure's leaf head. */
+typedef struct daslLeaf {
+    double scores[DASL_ARR_SIZE]; /* scores[0] is the leader; ascending */
+    sds members[DASL_ARR_SIZE];   /* full owned member per slot */
+    struct daslLeaf *forward;     /* next leaf on the level-0 chain */
+    struct daslLeaf *prev;        /* previous leaf (the leaf head for the first
+                                   * real leaf, NULL for the head itself) */
+    int n_key;                    /* number of occupied slots */
+} daslLeaf;
 
 typedef struct dasl {
-    daslNode *head[DASL_MAXHEIGHT]; /* sentinel head node per level */
-    daslNode *tail;                 /* last node on the level-0 chain (NULL if empty) */
+    daslLeaf *lhead;                /* level-0 (data) sentinel head */
+    daslNode *head[DASL_MAXHEIGHT]; /* index sentinel head per level; [0] unused */
+    daslLeaf *tail;                 /* last node on the level-0 chain (NULL if empty) */
     int max_height;                 /* number of levels currently in use (>=1) */
     unsigned long length;           /* number of distinct elements */
     size_t alloc_size;              /* tracked heap usage, like zslAllocSize() */
 } dasl;
 
-/* Cursor referencing a single element (node + slot), as returned by
- * daslGetElementByRank. node==NULL means "no such element". */
+/* Cursor referencing a single element (leaf + slot), as returned by
+ * daslGetElementByRank. node==NULL means "no such element". Cursors only ever
+ * reference level-0 data, so node is a daslLeaf*. */
 typedef struct daslCursor {
-    daslNode *node;
+    daslLeaf *node;
     int slot;
 } daslCursor;
 
