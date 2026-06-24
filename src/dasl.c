@@ -65,8 +65,8 @@
  * port promotes every split-off / append-spill node immediately and propagates
  * (never drops) the express-lane entry of a surviving leader, every non-leftmost
  * node is represented exactly one level up. A level-h slot therefore covers a
- * single child node, so its weight is bounded by DASL_ARR_SIZE^h: <= 64 at
- * level 1, <= 64^2 at level 2, and so on. The per-level width below tracks that
+ * single child node, so its weight is bounded by DASL_ARR_SIZE^h: <= 128 at
+ * level 1, <= 128^2 at level 2, and so on. The per-level width below tracks that
  * bound exactly, and dasl_wset asserts the value fits in debug builds, so any
  * future change that breaks the promotion invariant (letting un-promoted
  * siblings accumulate under one slot) trips loudly rather than truncating. The
@@ -75,12 +75,12 @@
  *----------------------------------------------------------------------------*/
 
 /* Width (bytes) of one weight slot at index `level` (>= 1), sized to the
- * DASL_ARR_SIZE^level cap (DASL_ARR_SIZE == 64). */
+ * DASL_ARR_SIZE^level cap (DASL_ARR_SIZE == 128). */
 static inline size_t dasl_weight_width(int level) {
-    if (level <= 1) return sizeof(uint8_t);  /* 1: <= 64 */
-    if (level <= 2) return sizeof(uint16_t); /* 2: <= 64^2 = 4096 */
-    if (level <= 5) return sizeof(uint32_t); /* 4: <= 64^5 = 2^30 */
-    return sizeof(uint64_t);                 /* 8: anything larger */
+    if (level <= 1) return sizeof(uint8_t);  /* 1: <= 128 */
+    if (level <= 2) return sizeof(uint16_t); /* 2: <= 128^2 = 16384 */
+    if (level <= 4) return sizeof(uint32_t); /* 4: <= 128^4 = 2^28 */
+    return sizeof(uint64_t);                 /* 8: 128^5 and larger */
 }
 
 /* The per-level widths above assume the DASL_ARR_SIZE^level slot-weight cap fits
@@ -91,8 +91,8 @@ _Static_assert((unsigned long long)DASL_ARR_SIZE <= 255ULL,
 _Static_assert((unsigned long long)DASL_ARR_SIZE * DASL_ARR_SIZE <= 65535ULL,
                "dasl_weight_width: level-2 uint16 needs DASL_ARR_SIZE^2 <= 65535");
 _Static_assert((unsigned long long)DASL_ARR_SIZE * DASL_ARR_SIZE * DASL_ARR_SIZE *
-                   DASL_ARR_SIZE * DASL_ARR_SIZE <= 4294967295ULL,
-               "dasl_weight_width: levels 3-5 uint32 need DASL_ARR_SIZE^5 <= 2^32-1");
+                   DASL_ARR_SIZE <= 4294967295ULL,
+               "dasl_weight_width: levels 3-4 uint32 need DASL_ARR_SIZE^4 <= 2^32-1");
 
 /* Total allocation size of an index node at `level`, including weights[]. */
 static inline size_t daslNodeSize(int level) {

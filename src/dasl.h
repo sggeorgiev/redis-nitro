@@ -48,7 +48,7 @@
 #include "sds.h"
 
 #ifndef DASL_ARR_SIZE
-#define DASL_ARR_SIZE 64   /* elements packed per node (must be a power of two); overridable for tests */
+#define DASL_ARR_SIZE 128  /* elements packed per node (must be a power of two); overridable for tests */
 #endif
 #define DASL_MAXHEIGHT 32  /* enough for 2^64 elements */
 
