@@ -22,6 +22,9 @@ extern const char *SDS_NOINIT;
 #include <stdint.h>
 
 typedef char *sds;
+/* 'const_sds' is a pointer to const content (const char *), used by the
+ * fbtree ordered index and its sorted-set adapter. */
+typedef const char *const_sds;
 
 /* Note: sdshdr5 is never used, we just access the flags byte directly.
  * However is here to document the layout of type 5 SDS strings. */
@@ -65,7 +68,7 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 #define SDS_HDR(T,s) ((struct sdshdr##T *)((s)-(sizeof(struct sdshdr##T))))
 #define SDS_TYPE_5_LEN(s) (((unsigned char)(s[-1])) >> SDS_TYPE_BITS)
 
-static inline unsigned char sdsType(sds s) {
+static inline unsigned char sdsType(const_sds s) {
     unsigned char flags = s[-1];
     return flags & SDS_TYPE_MASK;
 }
@@ -95,7 +98,7 @@ static inline void sdsSetAuxBit(sds s, int bit, int value) {
     s[-1] = (char)flags;
 }
 
-static inline size_t sdslen(const sds s) {
+static inline size_t sdslen(const_sds s) {
     switch (sdsType(s)) {
         case SDS_TYPE_5: return SDS_TYPE_5_LEN(s);
         case SDS_TYPE_8:
@@ -288,7 +291,7 @@ void sdssubstr(sds s, size_t start, size_t len);
 void sdsrange(sds s, ssize_t start, ssize_t end);
 void sdsupdatelen(sds s);
 void sdsclear(sds s);
-int sdscmp(const sds s1, const sds s2);
+int sdscmp(const_sds s1, const_sds s2);
 sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *count);
 void sdsfreesplitres(sds *tokens, int count);
 void sdstolower(sds s);

@@ -67,6 +67,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "connection.h" /* Connection abstraction */
 #include "eventnotifier.h" /* Event notification */
 #include "memory_prefetch.h"
+#include "ordered_index.h" /* Pluggable ordered index (fbtree) for sorted sets */
 
 /* Forward declarations needed by redismodule.h and keymeta.h */
 struct redisObject;
@@ -635,10 +636,6 @@ typedef enum {
 
 /* Anti-warning macro... */
 #define UNUSED(V) ((void) V)
-
-#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^64 elements */
-#define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
-#define ZSKIPLIST_MAX_SEARCH 10
 
 /* Append only defines */
 #define AOF_FSYNC_NO 0
@@ -1752,38 +1749,25 @@ struct sharedObjectsStruct {
     sds minstring, maxstring;
 };
 
-/* ZSETs use a specialized version of Skiplists */
-
-/* Node info placed in level[0].span since it's unused at level 0 (static assert verified) */
-typedef struct zskiplistNodeInfo {
-    uint16_t sdsoffset;  /* Offset from node start to sds data (after sds header) */
-    uint8_t levels;      /* Number of levels in this node (1-32) */
-    uint8_t reserved;
-} zskiplistNodeInfo;
-
-typedef struct zskiplistNode {
+/* A sorted-set member together with its score. Stored as the key of zset->dict
+ * (via dictType.keyFromStoredKey extracting ->ele) and providing O(1) score
+ * lookup. The element bytes are duplicated in the ordered index (fbtree); the
+ * dict owns this copy. */
+typedef struct zsetEntry {
     double score;
-    struct zskiplistNode *backward;
-    struct zskiplistLevel {
-        struct zskiplistNode *forward;
-        /* Span is the number of elements between this node and the next node at this level.
-         * At level 0, span is repurposed to store zskiplistNodeInfo for regular nodes, */
-        unsigned long span;
-    } level[];
-    /* sds ele is embedded after level[] array (assist zslGetNodeElement(node) to access it) */
-} zskiplistNode;
-
-typedef struct zskiplist {
-    struct zskiplistNode *header, *tail;
-    unsigned long length;
-    int level;
-    size_t alloc_size;
-} zskiplist;
+    sds ele;
+} zsetEntry;
 
 typedef struct zset {
-    dict *dict;
-    zskiplist *zsl;
+    dict *dict;        /* member (zsetEntry, keyed by ->ele) -> O(1) score lookup */
+    OrderedIndex *idx; /* ordered index (fbtree) over packed [score][element] */
 } zset;
+
+/* The single ordered-index implementation used by sorted sets. */
+#define zsetIndexOps (&fbtreeOrderedIndexOps)
+
+zsetEntry *zsetEntryNew(double score, sds ele);
+void zsetEntryRelease(zsetEntry *e);
 
 typedef struct clientBufferLimitsConfig {
     unsigned long long hard_limit_bytes;
@@ -3658,14 +3642,7 @@ typedef struct {
 #define ERROR_COMMAND_REJECTED (1<<0) /* Indicate to update the command rejected stats */
 #define ERROR_COMMAND_FAILED (1<<1) /* Indicate to update the command failed stats */
 
-zskiplist *zslCreate(void);
-void zslFree(zskiplist *zsl);
-size_t zslAllocSize(const zskiplist *zsl);
-sds zslGetNodeElement(const zskiplistNode *node);
-int zslCompareWithNode(double score, sds ele, const zskiplistNode *n);
-zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele);
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score);
-zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n, unsigned long *out_rank);
 double zzlGetScore(unsigned char *sptr);
 void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
 void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
@@ -3676,7 +3653,6 @@ size_t zsetAllocSize(const robj *o);
 void zsetConvert(robj *zobj, int encoding);
 void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen);
 int zsetScore(robj *zobj, sds member, double *score);
-unsigned long zslGetRank(zskiplist *zsl, double score, sds o);
 int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore);
 long zsetRank(robj *zobj, sds ele, int reverse, double *score);
 int zsetDel(robj *zobj, sds ele);
@@ -3689,11 +3665,18 @@ void zslFreeLexRange(zlexrangespec *spec);
 int zslParseLexRange(robj *min, robj *max, zlexrangespec *spec);
 unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range);
 unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range);
-zskiplistNode *zslNthInLexRange(zskiplist *zsl, zlexrangespec *range, long n, unsigned long *out_rank);
 int zzlLexValueGteMin(unsigned char *p, zlexrangespec *spec);
 int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec);
 int zslLexValueGteMin(sds value, zlexrangespec *spec);
 int zslLexValueLteMax(sds value, zlexrangespec *spec);
+/* fbtree-backed ordered-index helpers for sorted sets */
+void zsetInsertRaw(zset *zs, double score, sds ele);
+int zsetIdxItemGteLexMin(const OrderedIndexItem *item, zlexrangespec *spec);
+int zsetIdxItemLteLexMax(const OrderedIndexItem *item, zlexrangespec *spec);
+unsigned long zsetIdxFirstInLexRange(zset *zs, zlexrangespec *range, unsigned long llen);
+long zsetIdxLastInLexRange(zset *zs, zlexrangespec *range, unsigned long llen);
+long zsetIdxFirstInScoreRange(zset *zs, zrangespec *range, unsigned long llen);
+long zsetIdxLastInScoreRange(zset *zs, zrangespec *range, unsigned long llen);
 
 /* gcra related */
 robj *gcraDup(robj *o);

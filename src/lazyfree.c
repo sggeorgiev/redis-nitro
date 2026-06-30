@@ -174,7 +174,7 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
         return dictSize(ht);
     } else if (obj->type == OBJ_ZSET && obj->encoding == OBJ_ENCODING_SKIPLIST){
         zset *zs = obj->ptr;
-        return zs->zsl->length;
+        return orderedIndexLength(zsetIndexOps, zs->idx);
     } else if (obj->type == OBJ_HASH && obj->encoding == OBJ_ENCODING_HT) {
         dict *ht = obj->ptr;
         return dictSize(ht);

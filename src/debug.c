@@ -209,9 +209,9 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
 
             dictInitIterator(&di, zs->dict);
             while((de = dictNext(&di)) != NULL) {
-                zskiplistNode *znode = dictGetKey(de);
-                sds sdsele = zslGetNodeElement(znode);
-                const int len = fpconv_dtoa(znode->score, buf);
+                zsetEntry *zentry = dictGetKey(de);
+                sds sdsele = zentry->ele;
+                const int len = fpconv_dtoa(zentry->score, buf);
                 buf[len] = '\0';
                 memset(eledigest,0,20);
                 mixDigest(eledigest,sdsele,sdslen(sdsele));
@@ -1339,7 +1339,8 @@ void serverLogObjectDebugInfo(const robj *o) {
     } else if (o->type == OBJ_ZSET) {
         serverLog(LL_WARNING,"Sorted set size: %d", (int) zsetLength(o));
         if (o->encoding == OBJ_ENCODING_SKIPLIST)
-            serverLog(LL_WARNING,"Skiplist level: %d", (int) ((const zset*)o->ptr)->zsl->level);
+            serverLog(LL_WARNING,"Ordered index memory: %zu",
+                orderedIndexMemUsage(zsetIndexOps, ((const zset*)o->ptr)->idx));
     } else if (o->type == OBJ_STREAM) {
         serverLog(LL_WARNING,"Stream size: %d", (int) streamLength(o));
 #ifdef ENABLE_GCRA

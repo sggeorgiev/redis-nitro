@@ -382,57 +382,30 @@ dict *dictDefragTables(dict *d) {
     return ret;
 }
 
-/* Internal function used by activeDefragZsetNode */
-void zslUpdateNode(zskiplist *zsl, zskiplistNode *oldnode, zskiplistNode *newnode, zskiplistNode **update) {
-    int i;
-    for (i = 0; i < zsl->level; i++) {
-        if (update[i]->level[i].forward == oldnode)
-            update[i]->level[i].forward = newnode;
-    }
-    serverAssert(zsl->header!=oldnode);
-    if (newnode->level[0].forward) {
-        serverAssert(newnode->level[0].forward->backward==oldnode);
-        newnode->level[0].forward->backward = newnode;
-    } else {
-        serverAssert(zsl->tail==oldnode);
-        zsl->tail = newnode;
-    }
-}
+/* Incremental defrag of a large sorted set's ordered index is spread across
+ * many scanLater steps. This carries the per-key state between steps; only one
+ * deferred key is processed at a time. 'ob' is the zset currently in progress
+ * (NULL if none), and 'idx_ctx' is the ordered-index defrag context while the
+ * index phase is running (NULL once it completes and the dict phase begins). */
+static struct {
+    robj *ob;
+    void *idx_ctx;
+} zset_defrag_state;
 
-/* Defrag a single zset node, update dictEntry and skiplist struct */
+/* Defrag a single zset membership entry (the zsetEntry that owns the member
+ * sds and its score), updating the dict link to point at the relocated entry.
+ * The ordered index that provides the ordered view is relocated separately. */
 void activeDefragZsetNode(zset *zs, dictEntry *de, dictEntryLink plink) {
-    zskiplistNode *znode = dictGetKey(de);
+    zsetEntry *entry = dictGetKey(de);
 
-    /* Try to defrag the skiplist node first */
-    zskiplistNode *newnode = activeDefragAllocWithoutFree(znode);
-    if (!newnode) return; /* No defrag needed */
-
-    /* Node was defragged, now we need to update all skiplist pointers */
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *iter;
-    int i;
-    double score = newnode->score;
-    sds ele = zslGetNodeElement(newnode);
-
-    /* Find all pointers that need to be updated */
-    iter = zs->zsl->header;
-    for (i = zs->zsl->level-1; i >= 0; i--) {
-        while (iter->level[i].forward &&
-            iter->level[i].forward != znode &&
-            zslCompareWithNode(score, ele, iter->level[i].forward) > 0)
-            iter = iter->level[i].forward;
-        update[i] = iter;
+    zsetEntry *newentry;
+    if ((newentry = activeDefragAlloc(entry))) {
+        entry = newentry;
+        dictSetKeyAtLink(zs->dict, newentry, &plink, 0);
     }
 
-    /* Verify we found the right node */
-    iter = iter->level[0].forward;
-    serverAssert(iter && iter == znode);
-
-    /* Update all skiplist pointers and dict key */
-    zslUpdateNode(zs->zsl, znode, newnode, update);
-    dictSetKeyAtLink(zs->dict, newnode, &plink, 0);
-
-    /* Free the old node now that all pointers have been updated */
-    activeDefragFree(znode);
+    sds newele;
+    if ((newele = activeDefragSds(entry->ele))) entry->ele = newele;
 }
 
 #define DEFRAG_SDS_DICT_NO_VAL 0
@@ -614,13 +587,45 @@ void scanZsetCallback(void *privdata, const dictEntry *_de, dictEntryLink plink)
     server.stat_active_defrag_scanned++;
 }
 
+/* Nonzero sentinel kept in the defrag-later cursor while the ordered-index
+ * phase is in progress; it is never passed to dictScanDefrag. */
+#define ZSET_DEFRAG_INDEX_CURSOR 1UL
+
 void scanLaterZset(robj *ob, unsigned long *cursor) {
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
     zset *zs = (zset*)ob->ptr;
+
+    /* First step for this key: begin the incremental ordered-index relocation
+     * (this also relocates the index header). */
+    if (zset_defrag_state.ob != ob) {
+        zset_defrag_state.ob = ob;
+        OrderedIndex *newidx = zs->idx;
+        zset_defrag_state.idx_ctx =
+            orderedIndexDefragStart(zsetIndexOps, zs->idx, &newidx, activeDefragAlloc, activeDefragSds);
+        zs->idx = newidx;
+        *cursor = 0;
+    }
+
+    /* Phase 1: relocate the ordered index one bounded chunk at a time. */
+    if (zset_defrag_state.idx_ctx) {
+        size_t scanned = 0;
+        int more = orderedIndexDefragStep(zsetIndexOps, zs->idx, zset_defrag_state.idx_ctx, &scanned);
+        server.stat_active_defrag_scanned += scanned;
+        if (more) {
+            *cursor = ZSET_DEFRAG_INDEX_CURSOR;
+            return;
+        }
+        orderedIndexDefragEnd(zsetIndexOps, zset_defrag_state.idx_ctx);
+        zset_defrag_state.idx_ctx = NULL;
+        *cursor = 0; /* fall through to start the dict phase */
+    }
+
+    /* Phase 2: relocate the membership dict entries incrementally. */
     dict *d = zs->dict;
     scanLaterZsetData data = {zs};
     dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
     *cursor = dictScanDefrag(d, *cursor, scanZsetCallback, &defragfns, &data);
+    if (*cursor == 0) zset_defrag_state.ob = NULL; /* key fully defragged */
 }
 
 /* Used as scan callback when all the work is done in the dictDefragFunctions. */
@@ -700,22 +705,20 @@ void defragQuicklist(defragKeysCtx *ctx, kvobj *kv) {
 void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
     zset *zs = (zset*)ob->ptr;
     zset *newzs;
-    zskiplist *newzsl;
     dict *newdict;
-    struct zskiplistNode *newheader;
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
     if ((newzs = activeDefragAlloc(zs)))
         ob->ptr = zs = newzs;
-    if ((newzsl = activeDefragAlloc(zs->zsl)))
-        zs->zsl = newzsl;
-    if ((newheader = activeDefragAlloc(zs->zsl->header)))
-        zs->zsl->header = newheader;
-    if (dictSize(zs->dict) > server.active_defrag_max_scan_fields)
+    if (dictSize(zs->dict) > server.active_defrag_max_scan_fields) {
+        /* Large set: relocating the ordered index (which can hold hundreds of
+         * thousands of item sds) in one pass would blow the defrag-cycle
+         * latency budget, so defer both the ordered index and the dict entries
+         * to the incremental scanLater path. */
         defragLater(ctx, ob);
-    else {
-        /* Use dictScanDefrag to iterate and defrag both dictEntry structures and skiplist nodes.
-         * dictScanDefrag handles defragging dictEntry/dictEntryNoValue structures via defragfns,
-         * and calls our callback with plink for each entry so we can defrag skiplist nodes. */
+    } else {
+        /* Small set: relocate the ordered index and the dict entries in a
+         * single pass; the work is bounded by active_defrag_max_scan_fields. */
+        zs->idx = orderedIndexDefrag(zsetIndexOps, zs->idx, activeDefragAlloc, activeDefragSds);
         scanLaterZsetData data = {zs};
         dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
         unsigned long cursor = 0;
@@ -1738,6 +1741,14 @@ static void endDefragCycle(int normal_termination) {
         }
     }
     defrag.timeproc_id = AE_DELETED_EVENT_ID;
+
+    /* Release any in-progress incremental ordered-index defrag state. The
+     * partially relocated index is internally consistent and safe to leave. */
+    if (zset_defrag_state.idx_ctx) {
+        orderedIndexDefragEnd(zsetIndexOps, zset_defrag_state.idx_ctx);
+        zset_defrag_state.idx_ctx = NULL;
+    }
+    zset_defrag_state.ob = NULL;
 
     listRelease(defrag.remaining_stages);
     defrag.remaining_stages = NULL;

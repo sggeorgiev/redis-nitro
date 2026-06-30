@@ -14,8 +14,6 @@
 #include <math.h> /* isnan() */
 #include "cluster.h"
 
-zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank);
-
 redisSortOperation *createSortOperation(int type, robj *pattern) {
     redisSortOperation *so = zmalloc(sizeof(*so));
     so->type = type;
@@ -447,33 +445,36 @@ void sortCommandGeneric(client *c, int readonly) {
          * way, just getting the required range, as an optimization. */
 
         zset *zs = sortval->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
-        sds sdsele;
+        OrderedIndexItem *item;
         int rangelen = vectorlen;
 
-        /* Check if starting point is trivial, before doing log(N) lookup. */
-        if (desc) {
-            long zsetlen = dictSize(((zset*)sortval->ptr)->dict);
+        /* Use the ordered-index iterator for traversal. */
+        OrderedIndexIterator iter;
+        orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
 
-            ln = zsl->tail;
-            if (start > 0)
-                ln = zslGetElementByRank(zsl,zsetlen-start);
+        long zsetlen = dictSize(zs->dict);
+        if (desc) {
+            /* Position so prev() yields the element at top-offset 'start' first. */
+            unsigned long rank = (start > 0) ? (unsigned long)(zsetlen - start) : (unsigned long)zsetlen;
+            orderedIndexSeekToRank(zsetIndexOps, &iter, rank);
         } else {
-            ln = zsl->header->level[0].forward;
-            if (start > 0)
-                ln = zslGetElementByRank(zsl,start+1);
+            unsigned long rank = (start > 0) ? (unsigned long)start : 0;
+            orderedIndexSeekToRank(zsetIndexOps, &iter, rank);
         }
 
         while(rangelen--) {
-            serverAssertWithInfo(c,sortval,ln != NULL);
-            sdsele = zslGetNodeElement(ln);
-            vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
+            const char *p;
+            size_t l;
+            bool hasNext = desc ? orderedIndexPrev(zsetIndexOps, &iter, &item)
+                                : orderedIndexNext(zsetIndexOps, &iter, &item);
+            serverAssertWithInfo(c,sortval,hasNext);
+            orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+            vector[j].obj = createStringObject(p,l);
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
-            ln = desc ? ln->backward : ln->level[0].forward;
         }
+        orderedIndexResetIterator(zsetIndexOps, &iter);
         /* Fix start/end: output code is not aware of this optimization. */
         end -= start;
         start = 0;
@@ -487,7 +488,7 @@ void sortCommandGeneric(client *c, int readonly) {
             oldsize = kvobjAllocSize(sortval);
         dictInitIterator(&di, set);
         while((setele = dictNext(&di)) != NULL) {
-            sdsele = zslGetNodeElement(dictGetKey(setele));
+            sdsele = ((zsetEntry*)dictGetKey(setele))->ele;
             vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;

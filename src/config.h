@@ -384,4 +384,26 @@ void setcpuaffinity(const char *cpulist);
 #endif
 #endif
 
+/* Compatibility SIMD gates for the fbtree ordered index.
+ * The fbtree sources test HAVE_X86_SIMD / HAVE_ARM_NEON and use
+ * ATTRIBUTE_TARGET_SSE2 / ATTRIBUTE_TARGET_AVX2. Map them onto the macros
+ * already established above; fall back to scalar paths when unavailable. */
+#if defined(__x86_64__) && ((defined(__GNUC__) && __GNUC__ >= 5) || (defined(__clang__) && __clang_major__ >= 4)) && defined(__has_attribute) && __has_attribute(target)
+#define HAVE_X86_SIMD 1
+#ifndef ATTRIBUTE_TARGET_SSE2
+#define ATTRIBUTE_TARGET_SSE2 __attribute__((target("sse2")))
+#endif
+#ifndef ATTRIBUTE_TARGET_AVX2
+#define ATTRIBUTE_TARGET_AVX2 __attribute__((target("avx2")))
+#endif
+#else
+#define HAVE_X86_SIMD 0
+#endif
+
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#define HAVE_ARM_NEON 1
+#else
+#define HAVE_ARM_NEON 0
+#endif
+
 #endif

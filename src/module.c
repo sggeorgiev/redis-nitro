@@ -197,7 +197,9 @@ struct RedisModuleKey {
             zlexrangespec lrs;     /* Lex range. */
             uint32_t start;        /* Start pos for positional ranges. */
             uint32_t end;          /* End pos for positional ranges. */
-            void *current;         /* Zset iterator current node. */
+            void *current;             /* Listpack entry ptr, or current OrderedIndexItem* for skiplist. */
+            OrderedIndexIterator iter; /* Ordered index iterator (skiplist encoding). */
+            OrderedIndexItem *item;    /* Current item from the ordered index iterator. */
             int er;                /* Zset iterator end reached flag
                                        (true if end was reached). */
         } zset;
@@ -5381,15 +5383,30 @@ int zsetInitScoreRange(RedisModuleKey *key, double min, double max, int minex, i
     if (key->kv->encoding == OBJ_ENCODING_LISTPACK) {
         key->u.zset.current = first ? zzlFirstInRange(key->kv->ptr,zrs) :
                                       zzlLastInRange(key->kv->ptr,zrs);
+        if (key->u.zset.current == NULL) key->u.zset.er = 1;
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = key->kv->ptr;
-        zskiplist *zsl = zs->zsl;
-        key->u.zset.current = first ? zslNthInRange(zsl, zrs, 0, NULL) :
-                                      zslNthInRange(zsl, zrs, -1, NULL);
+        unsigned long llen = orderedIndexLength(zsetIndexOps, zs->idx);
+        long first_r = zsetIdxFirstInScoreRange(zs, zrs, llen);
+        long last_r = zsetIdxLastInScoreRange(zs, zrs, llen);
+        orderedIndexInitIterator(zsetIndexOps, &key->u.zset.iter, zs->idx);
+        if (last_r >= 0 && first_r <= last_r) {
+            /* Position so iteration proceeds in a single direction, avoiding the
+             * re-yield that happens when switching between next()/prev(). */
+            if (first) {
+                orderedIndexSeekToRank(zsetIndexOps, &key->u.zset.iter, (unsigned long)first_r);
+                key->u.zset.er = !orderedIndexNext(zsetIndexOps, &key->u.zset.iter, &key->u.zset.item);
+            } else {
+                orderedIndexSeekToRank(zsetIndexOps, &key->u.zset.iter, (unsigned long)last_r + 1);
+                key->u.zset.er = !orderedIndexPrev(zsetIndexOps, &key->u.zset.iter, &key->u.zset.item);
+            }
+        } else {
+            key->u.zset.er = 1;
+        }
+        key->u.zset.current = key->u.zset.er ? NULL : key->u.zset.item;
     } else {
         serverPanic("Unsupported zset encoding");
     }
-    if (key->u.zset.current == NULL) key->u.zset.er = 1;
     return REDISMODULE_OK;
 }
 
@@ -5445,15 +5462,30 @@ int zsetInitLexRange(RedisModuleKey *key, RedisModuleString *min, RedisModuleStr
     if (key->kv->encoding == OBJ_ENCODING_LISTPACK) {
         key->u.zset.current = first ? zzlFirstInLexRange(key->kv->ptr,zlrs) :
                                       zzlLastInLexRange(key->kv->ptr,zlrs);
+        if (key->u.zset.current == NULL) key->u.zset.er = 1;
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = key->kv->ptr;
-        zskiplist *zsl = zs->zsl;
-        key->u.zset.current = first ? zslNthInLexRange(zsl,zlrs,0,NULL) :
-                                      zslNthInLexRange(zsl,zlrs,-1,NULL);
+        unsigned long llen = orderedIndexLength(zsetIndexOps, zs->idx);
+        long first_r = (long)zsetIdxFirstInLexRange(zs, zlrs, llen);
+        long last_r = zsetIdxLastInLexRange(zs, zlrs, llen);
+        orderedIndexInitIterator(zsetIndexOps, &key->u.zset.iter, zs->idx);
+        if (last_r >= 0 && first_r <= last_r) {
+            /* Position so iteration proceeds in a single direction, avoiding the
+             * re-yield that happens when switching between next()/prev(). */
+            if (first) {
+                orderedIndexSeekToRank(zsetIndexOps, &key->u.zset.iter, (unsigned long)first_r);
+                key->u.zset.er = !orderedIndexNext(zsetIndexOps, &key->u.zset.iter, &key->u.zset.item);
+            } else {
+                orderedIndexSeekToRank(zsetIndexOps, &key->u.zset.iter, (unsigned long)last_r + 1);
+                key->u.zset.er = !orderedIndexPrev(zsetIndexOps, &key->u.zset.iter, &key->u.zset.item);
+            }
+        } else {
+            key->u.zset.er = 1;
+        }
+        key->u.zset.current = key->u.zset.er ? NULL : key->u.zset.item;
     } else {
         serverPanic("Unsupported zset encoding");
     }
-    if (key->u.zset.current == NULL) key->u.zset.er = 1;
 
     return REDISMODULE_OK;
 }
@@ -5498,10 +5530,12 @@ RedisModuleString *RM_ZsetRangeCurrentElement(RedisModuleKey *key, double *score
         }
         str = createObject(OBJ_STRING,ele);
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
-        zskiplistNode *ln = key->u.zset.current;
-        if (score) *score = ln->score;
-        sds ele = zslGetNodeElement(ln);
-        str = createStringObject(ele,sdslen(ele));
+        OrderedIndexItem *item = key->u.zset.item;
+        if (score) *score = orderedIndexGetScore(zsetIndexOps, item);
+        const char *p;
+        size_t l;
+        orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+        str = createStringObject(p,l);
     } else {
         serverPanic("Unsupported zset encoding");
     }
@@ -5548,26 +5582,28 @@ int RM_ZsetRangeNext(RedisModuleKey *key) {
             return 1;
         }
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
-        zskiplistNode *ln = key->u.zset.current, *next = ln->level[0].forward;
-        if (next == NULL) {
+        if (!orderedIndexNext(zsetIndexOps, &key->u.zset.iter, &key->u.zset.item)) {
             key->u.zset.er = 1;
+            key->u.zset.current = NULL;
             return 0;
-        } else {
-            /* Are we still within the range? */
-            if (key->u.zset.type == REDISMODULE_ZSET_RANGE_SCORE &&
-                !zslValueLteMax(next->score,&key->u.zset.rs))
-            {
-                key->u.zset.er = 1;
-                return 0;
-            } else if (key->u.zset.type == REDISMODULE_ZSET_RANGE_LEX) {
-                if (!zslLexValueLteMax(zslGetNodeElement(next),&key->u.zset.lrs)) {
-                    key->u.zset.er = 1;
-                    return 0;
-                }
-            }
-            key->u.zset.current = next;
-            return 1;
         }
+        double score = orderedIndexGetScore(zsetIndexOps, key->u.zset.item);
+        /* Check if still within range */
+        if (key->u.zset.type == REDISMODULE_ZSET_RANGE_SCORE &&
+            !zslValueLteMax(score,&key->u.zset.rs))
+        {
+            key->u.zset.er = 1;
+            key->u.zset.current = NULL;
+            return 0;
+        } else if (key->u.zset.type == REDISMODULE_ZSET_RANGE_LEX) {
+            if (!zsetIdxItemLteLexMax(key->u.zset.item,&key->u.zset.lrs)) {
+                key->u.zset.er = 1;
+                key->u.zset.current = NULL;
+                return 0;
+            }
+        }
+        key->u.zset.current = key->u.zset.item;
+        return 1;
     } else {
         serverPanic("Unsupported zset encoding");
     }
@@ -5612,26 +5648,28 @@ int RM_ZsetRangePrev(RedisModuleKey *key) {
             return 1;
         }
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
-        zskiplistNode *ln = key->u.zset.current, *prev = ln->backward;
-        if (prev == NULL) {
+        if (!orderedIndexPrev(zsetIndexOps, &key->u.zset.iter, &key->u.zset.item)) {
             key->u.zset.er = 1;
+            key->u.zset.current = NULL;
             return 0;
-        } else {
-            /* Are we still within the range? */
-            if (key->u.zset.type == REDISMODULE_ZSET_RANGE_SCORE &&
-                !zslValueGteMin(prev->score,&key->u.zset.rs))
-            {
-                key->u.zset.er = 1;
-                return 0;
-            } else if (key->u.zset.type == REDISMODULE_ZSET_RANGE_LEX) {
-                if (!zslLexValueGteMin(zslGetNodeElement(prev),&key->u.zset.lrs)) {
-                    key->u.zset.er = 1;
-                    return 0;
-                }
-            }
-            key->u.zset.current = prev;
-            return 1;
         }
+        double score = orderedIndexGetScore(zsetIndexOps, key->u.zset.item);
+        /* Check if still within range */
+        if (key->u.zset.type == REDISMODULE_ZSET_RANGE_SCORE &&
+            !zslValueGteMin(score,&key->u.zset.rs))
+        {
+            key->u.zset.er = 1;
+            key->u.zset.current = NULL;
+            return 0;
+        } else if (key->u.zset.type == REDISMODULE_ZSET_RANGE_LEX) {
+            if (!zsetIdxItemGteLexMin(key->u.zset.item,&key->u.zset.lrs)) {
+                key->u.zset.er = 1;
+                key->u.zset.current = NULL;
+                return 0;
+            }
+        }
+        key->u.zset.current = key->u.zset.item;
+        return 1;
     } else {
         serverPanic("Unsupported zset encoding");
     }
@@ -12291,10 +12329,10 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
         field = createStringObject(fieldStr, sdslen(fieldStr));
         value = createStringObject(val, sdslen(val));
     } else if (kv->type == OBJ_ZSET) {
-        zskiplistNode *znode = (zskiplistNode *) key;
-        sds fieldStr = zslGetNodeElement(znode);
+        zsetEntry *zentry = (zsetEntry *) key;
+        sds fieldStr = zentry->ele;
         field = createStringObject(fieldStr, sdslen(fieldStr));
-        value = createStringObjectFromLongDouble(znode->score, 0);
+        value = createStringObjectFromLongDouble(zentry->score, 0);
     }
     
     serverAssert(field != NULL);

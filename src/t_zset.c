@@ -21,25 +21,11 @@
  * in order to get O(log(N)) INSERT and REMOVE operations into a sorted
  * data structure.
  *
- * The elements are added to a hash table mapping Redis objects to scores.
- * At the same time the elements are added to a skip list mapping scores
- * to Redis objects (so objects are sorted by scores in this "view").
- *
- * Note that the SDS string representing the element is the same in both
- * the hash table and skiplist in order to save memory. What we do in order
- * to manage the shared SDS string more easily is to free the SDS string
- * only in zslFreeNode(). The dictionary has no value free method set.
- * So we should always remove an element from the dictionary, and later from
- * the skiplist.
- *
- * This skiplist implementation is almost a C translation of the original
- * algorithm described by William Pugh in "Skip Lists: A Probabilistic
- * Alternative to Balanced Trees", modified in three ways:
- * a) this implementation allows for repeated scores.
- * b) the comparison is not just by key (our 'score') but by satellite data.
- * c) there is a back pointer, so it's a doubly linked list with the back
- * pointers being only at "level 1". This allows to traverse the list
- * from tail to head, useful for ZREVRANGE. */
+ * The elements are added to a hash table (dict) mapping the member to its
+ * zsetEntry (member + score) for O(1) membership and score lookups. At the
+ * same time the elements are added to an ordered index (fbtree) over the
+ * packed [score][element] bytes, which provides the order-dependent view
+ * (rank, range, iteration) sorted by score then lexicographically. */
 #include "fast_float_strtod.h"
 #include "server.h"
 #include "intset.h"  /* Compact integer set structure */
@@ -48,19 +34,50 @@
 #define ZSL_OFFSET_MAX_ELE  UINT16_MAX
 #define ZSL_OFFSET_NO_ELE   UINT16_MAX
 
-const void *zslGetNodeElementForDict(const void *node);
+/* ===== zsetEntry: membership record stored in zset->dict =====
+ *
+ * A skiplist-encoded ("OBJ_ENCODING_SKIPLIST") sorted set keeps two structures:
+ *  - zs->dict: maps member -> zsetEntry (element + score) for O(1) membership
+ *              and score lookups. The dict owns the zsetEntry (and its ele sds).
+ *  - zs->idx:  an ordered index (fbtree) over packed [score][element], used for
+ *              all order-dependent operations (rank, range, iteration, pop).
+ * The element bytes are duplicated between the two structures because fbtree
+ * items are relocatable and have no stable address. */
 
-/* dictType for zset's dict (maps sds to zskiplistNode*) */
+zsetEntry *zsetEntryNew(double score, sds ele) {
+    zsetEntry *e = zmalloc(sizeof(*e));
+    e->score = score;
+    e->ele = sdsdup(ele);
+    return e;
+}
+
+void zsetEntryRelease(zsetEntry *e) {
+    sdsfree(e->ele);
+    zfree(e);
+}
+
+/* Extract the embedded element sds from a stored zsetEntry (dict stored-key). */
+static const void *zsetEntryGetEle(const void *entry) {
+    return ((const zsetEntry *)entry)->ele;
+}
+
+/* Free a zsetEntry held as a dict key. */
+static void zsetEntryDictDestructor(dict *d, void *entry) {
+    UNUSED(d);
+    zsetEntryRelease(entry);
+}
+
+/* dictType for zset's dict (maps sds -> zsetEntry*, keyed by entry->ele) */
 dictType zsetDictType = {
-    dictSdsHash,        /* hash function */
+    dictSdsHash,        /* hash function (of the lookup sds key) */
     NULL,               /* key dup */
     NULL,               /* val dup */
-    dictSdsKeyCompare,  /* compares embedded sds by keyFromStoredKey */
-    NULL,               /* key destructor - skiplist owns the node memory */
+    dictSdsKeyCompare,  /* compares lookup sds vs stored entry's ele */
+    zsetEntryDictDestructor, /* key destructor - dict owns the zsetEntry */
     NULL,               /* val destructor */
     NULL,               /* allow to expand */
-    .no_value = 1,      /* no values stored (only nodes) */
-    .keyFromStoredKey = zslGetNodeElementForDict,  /* extract embedded sds from node */
+    .no_value = 1,      /* no values stored (only zsetEntry keys) */
+    .keyFromStoredKey = zsetEntryGetEle,  /* extract embedded sds from entry */
 };
 
 /*-----------------------------------------------------------------------------
@@ -70,364 +87,6 @@ dictType zsetDictType = {
 int zslLexValueGteMin(sds value, zlexrangespec *spec);
 int zslLexValueLteMax(sds value, zlexrangespec *spec);
 void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap);
-static zskiplistNode *zslGetElementByRankFromNode(zskiplistNode *start_node, int start_level, unsigned long rank);
-
-static inline unsigned long zslGetNodeSpanAtLevel(zskiplistNode *x, int level) {
-    /* At level 0, span stores node level instead of distance, so return the actual span value:
-     * 1 for all nodes except the last node (which has span 0). */
-    if (level > 0) return x->level[level].span;
-    /* For level 0, if regular node, span is 1. If tail node, span is 0. */
-    return x->level[0].forward ? 1 : 0;
-}
-
-static inline void zslSetNodeSpanAtLevel(zskiplistNode *x, int level, unsigned long span) {
-    /* Skip level 0 since it stores node level, not span. */
-    if (level > 0)
-        x->level[level].span = span;
-}
-
-static inline void zslIncrNodeSpanAtLevel(zskiplistNode *x, int level, unsigned long incr) {
-    /* Skip level 0 since it stores node level, not span. */
-    if (level > 0)
-        x->level[level].span += incr;
-}
-
-static inline void zslDecrNodeSpanAtLevel(zskiplistNode *x, int level, unsigned long decr) {
-    /* Skip level 0 since it stores node level, not span. */
-    if (level > 0)
-        x->level[level].span -= decr;
-}
-
-/* Get zskiplistNodeInfo from node (stored in level[0].span). */
-static_assert(sizeof(zskiplistNodeInfo) <= sizeof(((zskiplistNode *)0)->level[0].span), "Must fit in level[0].span");
-static inline zskiplistNodeInfo *zslGetNodeInfo(const zskiplistNode *node) {
-    return (zskiplistNodeInfo *)&node->level[0].span;
-}
-
-/* Set zskiplistNodeInfo in node (stored in level[0].span) */
-static inline void zslSetNodeInfo(zskiplistNode *node, uint8_t levels, uint16_t sdsoffset) {
-    union {
-        zskiplistNodeInfo info;
-        unsigned long span;
-    } u = { .info = { .levels = levels, .sdsoffset = sdsoffset } };
-    node->level[0].span = u.span;
-}
-
-/* Compare {score, ele} with node. Returns: 1=bigger 0=equal -1=smaller
- *
- * Ordering is by score first, then lexicographically by element.
- * NULL is treated as +infinity (comes after any real node). */
-int zslCompareWithNode(double score, sds ele, const zskiplistNode *n) {
-    if (/*score < */ n == NULL) return -1; /* NULL is +infinity, comes after any real node */
-    if (score < n->score) return -1;
-    if (score > n->score) return 1;
-    /* Scores are equal, compare elements lexicographically */
-    return sdscmp(ele, zslGetNodeElement(n));
-}
-
-/* Get embedded sds from node. Uses the stored offset to directly access the sds data */
-sds zslGetNodeElement(const zskiplistNode *node) {
-    zskiplistNodeInfo *info = zslGetNodeInfo(node);
-    debugServerAssert(info->sdsoffset != ZSL_OFFSET_NO_ELE);
-    return (char*)node + info->sdsoffset;
-}
-
-/* Wrapper for dict getKeyId callback - extracts sds from node pointer.
- * This allows the dict to store zskiplistNode* but look them up using sds. */
-const void *zslGetNodeElementForDict(const void *node) {
-    return zslGetNodeElement((zskiplistNode*)node);
-}
-
-/* Create a skiplist header node with ZSKIPLIST_MAXLEVEL levels */
-static zskiplistNode *zslCreateHeaderNode(zskiplist *zsl) {
-    size_t usable;
-    zskiplistNode *zn = zmalloc_usable(sizeof(*zn) + ZSKIPLIST_MAXLEVEL * sizeof(struct zskiplistLevel), &usable);
-
-    /* Initialize all fields */
-    zn->score = 0;
-    zn->backward = NULL;
-
-    /* Initialize all level pointers and spans */
-    for (int j = 0; j < ZSKIPLIST_MAXLEVEL; j++) {
-        zn->level[j].forward = NULL;
-        zn->level[j].span = 0;  /* Will be overwritten for level[0] below */
-    }
-
-    /* Use ZSL_OFFSET_NO_ELE as sentinel to indicate no embedded sds (header node) */
-    zslSetNodeInfo(zn, ZSKIPLIST_MAXLEVEL, ZSL_OFFSET_NO_ELE);
-
-    /* Track allocation size */
-    zsl->alloc_size += usable;
-
-    return zn;
-}
-
-/* Create a skiplist node with the specified number of levels.
- * The SDS string 'ele' is COPIED into an embedded sds within the node allocation.
- * This creates a single allocation containing: node + level[] + embedded sds.
- * The caller is responsible for freeing 'ele' if it's no longer needed. */
-static zskiplistNode *zslCreateNode(zskiplist *zsl, int level, double score, sds ele) {
-    size_t usable;
-    size_t ele_len = sdslen(ele);
-    char sds_type = sdsReqType(ele_len);
-    size_t sds_hdr_len = sdsHdrSize(sds_type);
-
-    /* Calculate total size: node fixed part + level[] + sds buffer space */
-    size_t node_size = sizeof(zskiplistNode) + level * sizeof(struct zskiplistLevel);
-    size_t sds_buf_size = sds_hdr_len + ele_len + 1;  /* header + data + null terminator */
-    size_t total_size = node_size + sds_buf_size;
-
-    /* Allocate single block for everything */
-    zskiplistNode *zn = zmalloc_usable(total_size, &usable);
-
-    /* Initialize node fields */
-    zn->score = score;
-    zn->backward = NULL;
-
-    /* Calculate offset from node start to sds data (after sds header) */
-    size_t sds_offset = node_size + sds_hdr_len;
-    debugServerAssert(sds_offset < ZSL_OFFSET_MAX_ELE);
-
-    /* Initialize embedded sds using sdsnewplacement */
-    char *sds_buf = (char*)zn + node_size;
-    sds embedded_sds = sdsnewplacement(sds_buf, sds_buf_size, sds_type, ele, ele_len);
-
-    /* Store node info in level[0].span */
-    zslSetNodeInfo(zn, level, sds_offset);
-
-    /* Verify that embedded_sds matches our calculated offset */
-    serverAssert(embedded_sds == (sds)((char*)zn + sds_offset));
-
-    /* Update allocation size tracking */
-    zsl->alloc_size += usable;
-
-    return zn;
-}
-
-/* Create a new skiplist. */
-zskiplist *zslCreate(void) {
-    zskiplist *zsl;
-    size_t zsl_size;
-
-    zsl = zmalloc_usable(sizeof(*zsl), &zsl_size);
-    zsl->level = 1;
-    zsl->length = 0;
-    zsl->alloc_size = zsl_size;
-    zsl->header = zslCreateHeaderNode(zsl);
-    zsl->header->backward = NULL;
-    zsl->tail = NULL;
-    return zsl;
-}
-
-/* Free the specified skiplist node. The embedded SDS is freed as part of
- * the single allocation (node + level[] + embedded sds). */
-static void zslFreeNode(zskiplist *zsl, zskiplistNode *node) {
-    size_t usable;
-    /* No separate sdsfree() needed - embedded sds is part of node allocation */
-    zfree_usable(node, &usable);
-    zsl->alloc_size -= usable;
-}
-
-/* Free a whole skiplist. */
-void zslFree(zskiplist *zsl) {
-    zskiplistNode *node = zsl->header->level[0].forward, *next;
-    size_t usable;
-
-    zfree_usable(zsl->header, &usable);
-    zsl->alloc_size -= usable;
-    while(node) {
-        next = node->level[0].forward;
-        zslFreeNode(zsl, node);
-        node = next;
-    }
-    debugServerAssert(zsl->alloc_size == zmalloc_usable_size(zsl));
-    zfree(zsl);
-}
-
-/* Return cached total memory used (in bytes) */
-size_t zslAllocSize(const zskiplist *zsl) { return zsl->alloc_size; }
-
-/* Returns a random level for the new skiplist node we are going to create.
- * The return value of this function is between 1 and ZSKIPLIST_MAXLEVEL
- * (both inclusive), with a powerlaw-alike distribution where higher
- * levels are less likely to be returned. */
-static int zslRandomLevel(void) {
-    static const int threshold = ZSKIPLIST_P*RAND_MAX;
-    int level = 1;
-    while (random() < threshold)
-        level += 1;
-    return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
-}
-
-/* Insert an already-created node, with its score, element set into the skiplist 
- * at the correct position. Updates all forward/backward pointers and spans.
- * The node's level must already be set via zslSetNodeInfo(). */
-static void zslInsertNode(zskiplist *zsl, zskiplistNode *node) {
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL];  /* Nodes that will point to the new node at each level */
-    unsigned long rank[ZSKIPLIST_MAXLEVEL];     /* Rank (0-based) at each level during traversal */
-    zskiplistNode *x;
-    int i, level;
-    double score = node->score;
-    sds ele = zslGetNodeElement(node);
-    level = zslGetNodeInfo(node)->levels;
-    serverAssert(!isnan(score));
-
-    /* Find the position where this node should be inserted */
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        /* store rank that is crossed to reach the insert position */
-        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
-        while (zslCompareWithNode(score, ele, x->level[i].forward) > 0) {
-            rank[i] += zslGetNodeSpanAtLevel(x, i);
-            x = x->level[i].forward;
-        }
-        update[i] = x;
-    }
-
-    /* Update skiplist level if needed */
-    if (level > zsl->level) {
-        for (i = zsl->level; i < level; i++) {
-            rank[i] = 0;
-            update[i] = zsl->header;
-            zslSetNodeSpanAtLevel(update[i], i, zsl->length);
-        }
-        zsl->level = level;
-        zslGetNodeInfo(zsl->header)->levels = level;
-    }
-
-    /* Insert the node at the found position */
-    for (i = 0; i < level; i++) {
-        node->level[i].forward = update[i]->level[i].forward;
-        update[i]->level[i].forward = node;
-
-        /* update span covered by update[i] as node is inserted here */
-        zslSetNodeSpanAtLevel(node, i, zslGetNodeSpanAtLevel(update[i], i) - (rank[0] - rank[i]));
-        zslSetNodeSpanAtLevel(update[i], i, (rank[0] - rank[i]) + 1);
-    }
-
-    /* increment span for untouched levels */
-    for (i = level; i < zsl->level; i++) {
-        zslIncrNodeSpanAtLevel(update[i], i, 1);
-    }
-
-    /* Update backward pointers */
-    node->backward = (update[0] == zsl->header) ? NULL : update[0];
-    if (node->level[0].forward)
-        node->level[0].forward->backward = node;
-    else
-        zsl->tail = node;
-
-    zsl->length++;
-}
-
-/* Insert a new node in the skiplist. Assumes the element does not already
- * exist (up to the caller to enforce that). The element 'ele' is COPIED
- * into the new node, so the caller retains ownership and can free it. */
-zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
-    int level;
-
-    serverAssert(!isnan(score));
-
-    /* we assume the element is not already inside, since we allow duplicated
-     * scores, reinserting the same element should never happen since the
-     * caller of zslInsert() should test in the hash table if the element is
-     * already inside or not. */
-    level = zslRandomLevel();
-    zskiplistNode *node = zslCreateNode(zsl, level, score, ele);
-    zslInsertNode(zsl, node);
-    return node;
-}
-
-/* Internal function used by zslDelete, zslDeleteRangeByScore and
- * zslDeleteRangeByRank.
- * This function only unlinks the node from the skiplist structure but does NOT free it.
- * The caller is responsible for freeing the node with zslFreeNode(). */
-static void zslUnlinkNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) {
-    int i;
-    for (i = 0; i < zsl->level; i++) {
-        if (update[i]->level[i].forward == x) {
-            zslIncrNodeSpanAtLevel(update[i], i, zslGetNodeSpanAtLevel(x, i) - 1);
-            update[i]->level[i].forward = x->level[i].forward;
-        } else {
-            zslDecrNodeSpanAtLevel(update[i], i, 1);
-        }
-    }
-    if (x->level[0].forward) {
-        x->level[0].forward->backward = x->backward;
-    } else {
-        zsl->tail = x->backward;
-    }
-    /* Decrease skiplist level if top levels are empty, and clear their spans */
-    while(zsl->level > 1 && zsl->header->level[zsl->level-1].forward == NULL) {
-        zsl->header->level[zsl->level-1].span = 0;
-        zsl->level--;
-    }
-    zsl->length--;
-}
-
-/* Delete the specified node from the skiplist.
- * The node is unlinked from all levels and then freed by zslFreeNode(),
- * which also frees the embedded SDS string. */
-static void zslDelete(zskiplist *zsl, zskiplistNode *node) {
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    int i;
-    double score = node->score;
-    sds ele = zslGetNodeElement(node);
-
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        while (zslCompareWithNode(score, ele, x->level[i].forward) > 0) {
-            x = x->level[i].forward;
-        }
-        update[i] = x;
-    }
-
-    /* Verify we truly found the node */
-    serverAssert(x->level[0].forward == node);
-
-    zslUnlinkNode(zsl, node, update);
-    zslFreeNode(zsl, node);
-}
-
-/* Update the score of an element inside the sorted set skiplist.
- * If the new score would keep the node in its current position, updates in-place and returns NULL.
- * Otherwise, unlinks the node, updates score, reinserts at correct position, and returns node.
- * Anyway, the node pointer stays the same (no dict update needed). */
-static void zslUpdateScore(zskiplist *zsl, zskiplistNode *node, double newscore) {
-    /* Fast path: if the node, after the score update, would be still exactly
-     * at the same position, we can just update the score without
-     * actually removing and re-inserting the element in the skiplist. */
-    if ((node->backward == NULL || node->backward->score < newscore) &&
-        (node->level[0].forward == NULL || node->level[0].forward->score > newscore))
-    {
-        node->score = newscore;
-        return;
-    }
-
-    /* Slow path: need to reposition the node.
-     * Find the update[] array for unlinking. */
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    int i;
-    double curscore = node->score;
-    sds ele = zslGetNodeElement(node);
-
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        while (zslCompareWithNode(curscore, ele, x->level[i].forward) > 0) {
-            x = x->level[i].forward;
-        }
-        update[i] = x;
-    }
-
-    /* Verify we found the right node */
-    serverAssert(x->level[0].forward == node);
-
-    /* Unlink, update score, and reinsert at new position.
-     * We reuse the same node to avoid dict updates. */
-    zslUnlinkNode(zsl, node, update);
-    node->score = newscore;
-    zslInsertNode(zsl, node);
-}
 
 int zslValueGteMin(double value, zrangespec *spec) {
     return spec->minex ? (value > spec->min) : (value >= spec->min);
@@ -435,278 +94,6 @@ int zslValueGteMin(double value, zrangespec *spec) {
 
 int zslValueLteMax(double value, zrangespec *spec) {
     return spec->maxex ? (value < spec->max) : (value <= spec->max);
-}
-
-/* Returns if there is a part of the zset is in range. */
-static int zslIsInRange(zskiplist *zsl, zrangespec *range) {
-    zskiplistNode *x;
-
-    /* Test for ranges that will always be empty. */
-    if (range->min > range->max ||
-            (range->min == range->max && (range->minex || range->maxex)))
-        return 0;
-    x = zsl->tail;
-    if (x == NULL || !zslValueGteMin(x->score,range))
-        return 0;
-    x = zsl->header->level[0].forward;
-    if (x == NULL || !zslValueLteMax(x->score,range))
-        return 0;
-    return 1;
-}
-
-/* Find the Nth element within the specified score range.
- *
- * Parameters:
- *   - N is 0-based for forward direction (0 = first element in range)
- *   - N can be negative for reverse direction (-1 = last element in range)
- *
- * Returns:
- *   - The skiplist node at position N within the range, or NULL if:
- *     * N is out of bounds for the range
- *     * The range contains no elements
- *   - If out_rank!=NULL, it receives the 1-based absolute rank of the returned node 
- */
-zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n, unsigned long *out_rank) {
-    zskiplistNode *x;
-    int i;
-    long edge_rank = 0; /* 0-based rank of the last element smaller than the range. */
-    long last_highest_level_rank = 0;
-    zskiplistNode *last_highest_level_node = NULL;
-    unsigned long rank_diff;
-
-    /* If everything is out of range, return early. */
-    if (!zslIsInRange(zsl,range)) return NULL;
-
-    /* Go forward while *OUT* of range at level of zsl->level-1. */
-    x = zsl->header;
-    i = zsl->level - 1;
-    while (x->level[i].forward && !zslValueGteMin(x->level[i].forward->score, range)) {
-        edge_rank += zslGetNodeSpanAtLevel(x, i);
-        x = x->level[i].forward;
-    }
-    /* Remember the last node which has zsl->level-1 levels and its rank. */
-    last_highest_level_node = x;
-    last_highest_level_rank = edge_rank;
-
-    if (n >= 0) {
-        for (i = zsl->level - 2; i >= 0; i--) {
-            /* Go forward while *OUT* of range. */
-            while (x->level[i].forward && !zslValueGteMin(x->level[i].forward->score, range)) {
-                /* Count the rank of the last element smaller than the range. */
-                edge_rank += zslGetNodeSpanAtLevel(x, i);
-                x = x->level[i].forward;
-            }
-        }
-        /* Check if zsl is long enough. */
-        if ((unsigned long)(edge_rank + n) >= zsl->length) return NULL;
-        if (n < ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            /* rank+1 is the first element in range, so we need n+1 steps to reach target. */
-            for (i = 0; i < n + 1; i++) { 
-                x = x->level[0].forward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score <= max. */
-        if (x && !zslValueLteMax(x->score,range)) return NULL;
-        /* Store rank if requested. For n >= 0, the returned node is at rank edge_rank + n + 1. */
-        if (x && out_rank) *out_rank = edge_rank + n + 1;
-    } else  {
-        for (i = zsl->level - 1; i >= 0; i--) {
-            /* Go forward while *IN* range. */
-            while (x->level[i].forward && zslValueLteMax(x->level[i].forward->score, range)) {
-                /* Count the rank of the last element in range. */
-                edge_rank += zslGetNodeSpanAtLevel(x, i);
-                x = x->level[i].forward;
-            }
-        }
-        /* Check if the range is big enough. */
-        if (edge_rank < -n) return NULL;
-        if (n + 1 > -ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            /* rank is the -1th element in range, so we need -n-1 steps to reach target. */
-            for (i = 0; i < -n - 1; i++) {
-                x = x->backward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            /* rank is the last element in range, n is -1-based, so we need n+1 to count backwards. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score >= min. */
-        if (x && !zslValueGteMin(x->score, range)) return NULL;
-        /* Store rank if requested. For n < 0, the returned node is at rank edge_rank + n + 1. */
-        if (x && out_rank) *out_rank = edge_rank + n + 1;
-    }
-
-    return x;
-}
-
-/* Delete all the elements with score between min and max from the skiplist.
- * Both min and max can be inclusive or exclusive (see range->minex and
- * range->maxex). When inclusive a score >= min && score <= max is deleted.
- * Note that this function takes the reference to the hash table view of the
- * sorted set, in order to remove the elements from the hash table too. */
-static unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dict) {
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    unsigned long removed = 0;
-    int i;
-
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        while (x->level[i].forward &&
-            !zslValueGteMin(x->level[i].forward->score, range))
-                x = x->level[i].forward;
-        update[i] = x;
-    }
-
-    /* Current node is the last with score < or <= min. */
-    x = x->level[0].forward;
-
-    /* Delete nodes while in range. */
-    while (x && zslValueLteMax(x->score, range)) {
-        zskiplistNode *next = x->level[0].forward;
-        zslUnlinkNode(zsl,x,update);
-        dictDelete(dict,zslGetNodeElement(x));
-        zslFreeNode(zsl, x); /* Here is where x->ele is actually released. */
-        removed++;
-        x = next;
-    }
-    return removed;
-}
-
-static unsigned long zslDeleteRangeByLex(zskiplist *zsl, zlexrangespec *range, dict *dict) {
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    unsigned long removed = 0;
-    int i;
-
-
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        while (x->level[i].forward &&
-            !zslLexValueGteMin(zslGetNodeElement(x->level[i].forward),range))
-                x = x->level[i].forward;
-        update[i] = x;
-    }
-
-    /* Current node is the last with score < or <= min. */
-    x = x->level[0].forward;
-
-    /* Delete nodes while in range. */
-    while (x && zslLexValueLteMax(zslGetNodeElement(x),range)) {
-        zskiplistNode *next = x->level[0].forward;
-        zslUnlinkNode(zsl,x,update);
-        dictDelete(dict,zslGetNodeElement(x));
-        zslFreeNode(zsl, x); /* Here is where x->ele is actually released. */
-        removed++;
-        x = next;
-    }
-    return removed;
-}
-
-/* Delete all the elements with rank between start and end from the skiplist.
- * Start and end are inclusive. Note that start and end need to be 1-based */
-static unsigned long zslDeleteRangeByRank(zskiplist *zsl, unsigned int start, unsigned int end, dict *dict) {
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    unsigned long traversed = 0, removed = 0;
-    int i;
-
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        while (x->level[i].forward && (traversed + zslGetNodeSpanAtLevel(x, i)) < start) {
-            traversed += zslGetNodeSpanAtLevel(x, i);
-            x = x->level[i].forward;
-        }
-        update[i] = x;
-    }
-
-    traversed++;
-    x = x->level[0].forward;
-    while (x && traversed <= end) {
-        zskiplistNode *next = x->level[0].forward;
-        zslUnlinkNode(zsl,x,update);
-        dictDelete(dict,zslGetNodeElement(x));
-        zslFreeNode(zsl, x);
-        removed++;
-        traversed++;
-        x = next;
-    }
-    return removed;
-}
-
-/* Find the rank for an element by both score and key.
- * Returns 0 when the element cannot be found, rank otherwise.
- * Note that the rank is 1-based due to the span of zsl->header to the
- * first element. */
-unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
-    zskiplistNode *x;
-    unsigned long rank = 0;
-    int i;
-
-    x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        while (zslCompareWithNode(score, ele, x->level[i].forward) >= 0) {
-            rank += zslGetNodeSpanAtLevel(x, i);
-            x = x->level[i].forward;
-        }
-
-        if (x != zsl->header && zslCompareWithNode(score, ele, x) == 0) {
-            return rank;
-        }
-    }
-    return 0;
-}
-
-/* Find the rank for a skiplist node by walking forward from the node to the end.
- * This avoids expensive string comparisons during traversal. The algorithm:
- * 1. Start at the given node's top level
- * 2. Walk forward to the tail, jumping at each node's top level
- * 3. Sum the spans to get distance from node to end
- * 4. Calculate rank as (list_length - distance_to_end)
- * Time complexity: O(log N) on average, same as traditional approach but faster
- * due to avoiding string comparisons. */
-unsigned long zslGetRankByNode(zskiplist *zsl, zskiplistNode *x) {
-    unsigned long distance_to_end = 0;
-    int level;
-    
-    /* Walk forward from x to the end, using top level of each node for fast jumps */
-    while (x) {
-        level = zslGetNodeInfo(x)->levels - 1;
-        distance_to_end += zslGetNodeSpanAtLevel(x, level);
-        x = x->level[level].forward;
-    }
-    
-    /* Rank = total nodes - nodes after this one */
-    return zsl->length - distance_to_end;
-}
-
-/* Finds an element by its rank from start node. The rank argument needs to be 1-based. */
-static zskiplistNode *zslGetElementByRankFromNode(zskiplistNode *start_node, int start_level, unsigned long rank) {
-    zskiplistNode *x;
-    unsigned long traversed = 0;
-    int i;
-
-    x = start_node;
-    for (i = start_level; i >= 0; i--) {
-        while (x->level[i].forward && (traversed + zslGetNodeSpanAtLevel(x, i)) <= rank)
-        {
-            traversed += zslGetNodeSpanAtLevel(x, i);
-            x = x->level[i].forward;
-        }
-        if (traversed == rank) {
-            return x;
-        }
-    }
-    return NULL;
-}
-
-/* Finds an element by its rank. The rank argument needs to be 1-based. */
-zskiplistNode *zslGetElementByRank(zskiplist *zsl, unsigned long rank) {
-    return zslGetElementByRankFromNode(zsl->header, zsl->level - 1, rank);
 }
 
 /* Populate the rangespec according to the objects min and max. */
@@ -840,106 +227,6 @@ int zslLexValueLteMax(sds value, zlexrangespec *spec) {
     return spec->maxex ?
         (sdscmplex(value,spec->max) < 0) :
         (sdscmplex(value,spec->max) <= 0);
-}
-
-/* Returns if there is a part of the zset is in the lex range. */
-static int zslIsInLexRange(zskiplist *zsl, zlexrangespec *range) {
-    zskiplistNode *x;
-
-    /* Test for ranges that will always be empty. */
-    int cmp = sdscmplex(range->min,range->max);
-    if (cmp > 0 || (cmp == 0 && (range->minex || range->maxex)))
-        return 0;
-    x = zsl->tail;
-    if ((x == NULL) || (!zslLexValueGteMin(zslGetNodeElement(x),range)))
-        return 0;
-    x = zsl->header->level[0].forward;
-    if ((x == NULL) || (!zslLexValueLteMax(zslGetNodeElement(x),range)))
-        return 0;
-    return 1;
-}
-
-/* Find the Nth node that is contained in the specified range. N should be 0-based.
- * Negative N works for reversed order (-1 represents the last element). Returns
- * NULL when no element is contained in the range.
- * If out_rank is not NULL, stores the 1-based rank of the returned node. */
-zskiplistNode *zslNthInLexRange(zskiplist *zsl, zlexrangespec *range, long n, unsigned long *out_rank) {
-    zskiplistNode *x;
-    int i;
-    long edge_rank = 0;
-    long last_highest_level_rank = 0;
-    zskiplistNode *last_highest_level_node = NULL;
-    unsigned long rank_diff;
-
-    /* If everything is out of range, return early. */
-    if (!zslIsInLexRange(zsl,range)) return NULL;
-
-    /* Go forward while *OUT* of range at level of zsl->level-1. */
-    x = zsl->header;
-    i = zsl->level - 1;
-    while (x->level[i].forward && !zslLexValueGteMin(zslGetNodeElement(x->level[i].forward), range)) {
-        edge_rank += zslGetNodeSpanAtLevel(x, i);
-        x = x->level[i].forward;
-    }
-    /* Remember the last node which has zsl->level-1 levels and its rank. */
-    last_highest_level_node = x;
-    last_highest_level_rank = edge_rank;
-
-    if (n >= 0) {
-        for (i = zsl->level - 2; i >= 0; i--) {
-            /* Go forward while *OUT* of range. */
-            while (x->level[i].forward && !zslLexValueGteMin(zslGetNodeElement(x->level[i].forward), range)) {
-                /* Count the rank of the last element smaller than the range. */
-                edge_rank += zslGetNodeSpanAtLevel(x, i);
-                x = x->level[i].forward;
-            }
-        }
-        /* Check if zsl is long enough. */
-        if ((unsigned long)(edge_rank + n) >= zsl->length) return NULL; 
-        if (n < ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            /* rank+1 is the first element in range, so we need n+1 steps to reach target. */
-            for (i = 0; i < n + 1; i++) { 
-                x = x->level[0].forward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score <= max. */
-        if (x && !zslLexValueLteMax(zslGetNodeElement(x),range)) return NULL;
-        /* Store rank if requested. For n >= 0, the returned node is at rank edge_rank + n + 1. */
-        if (x && out_rank) *out_rank = edge_rank + n + 1;
-    } else {
-        for (i = zsl->level - 1; i >= 0; i--) {
-            /* Go forward while *IN* range. */
-            while (x->level[i].forward && zslLexValueLteMax(zslGetNodeElement(x->level[i].forward), range)) {
-                /* Count the rank of the last element in range. */
-                edge_rank += zslGetNodeSpanAtLevel(x, i);
-                x = x->level[i].forward;
-            }
-        }
-        /* Check if the range is big enough. */
-        if (edge_rank < -n) return NULL;
-        if (n + 1 > -ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            for (i = 0; i < -n - 1; i++) {
-                x = x->backward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            /* rank is the last element in range, n is -1-based, so we need n+1 to count backwards. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score >= min. */
-        if (x && !zslLexValueGteMin(zslGetNodeElement(x), range)) return NULL;
-        /* Store rank if requested. For n < 0, the returned node is at rank edge_rank + n + 1. */
-        if (x && out_rank) *out_rank = edge_rank + n + 1;
-    }
-
-    return x;
 }
 
 /*-----------------------------------------------------------------------------
@@ -1374,12 +661,116 @@ static unsigned char *zzlDeleteRangeByRank(unsigned char *zl, unsigned int start
  * Common sorted set API
  *----------------------------------------------------------------------------*/
 
+/* ===== fbtree-backed sorted set helpers =====
+ * The ordered index has no direct value-seek in its vtable, so range bounds are
+ * resolved as 0-based ranks via binary search over get_by_rank, then iterated. */
+
+/* The lex range comparators operate on sds, so wrap the raw element bytes of an
+ * ordered-index item in a temporary sds. */
+int zsetIdxItemGteLexMin(const OrderedIndexItem *item, zlexrangespec *spec) {
+    const char *p;
+    size_t l;
+    orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+    sds tmp = sdsnewlen(p, l);
+    int r = zslLexValueGteMin(tmp, spec);
+    sdsfree(tmp);
+    return r;
+}
+
+int zsetIdxItemLteLexMax(const OrderedIndexItem *item, zlexrangespec *spec) {
+    const char *p;
+    size_t l;
+    orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+    sds tmp = sdsnewlen(p, l);
+    int r = zslLexValueLteMax(tmp, spec);
+    sdsfree(tmp);
+    return r;
+}
+
+/* Lex ranges assume all elements share a score, so the ordered index (sorted by
+ * [score][element]) is also sorted lexicographically by element. We can binary
+ * search over ranks. Returns the 0-based rank of the first element that is
+ * >= the lex min, or 'llen' if none qualifies. */
+unsigned long zsetIdxFirstInLexRange(zset *zs, zlexrangespec *range, unsigned long llen) {
+    unsigned long lo = 0, hi = llen; /* search in [lo, hi) */
+    while (lo < hi) {
+        unsigned long mid = lo + (hi - lo) / 2;
+        OrderedIndexItem *item = orderedIndexGetByRank(zsetIndexOps, zs->idx, mid);
+        if (zsetIdxItemGteLexMin(item, range))
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo;
+}
+
+/* Returns the 0-based rank of the last element that is <= the lex max, or -1 if
+ * none qualifies. */
+long zsetIdxLastInLexRange(zset *zs, zlexrangespec *range, unsigned long llen) {
+    long lo = 0, hi = (long)llen - 1, res = -1;
+    while (lo <= hi) {
+        long mid = lo + (hi - lo) / 2;
+        OrderedIndexItem *item = orderedIndexGetByRank(zsetIndexOps, zs->idx, (unsigned long)mid);
+        if (zsetIdxItemLteLexMax(item, range)) {
+            res = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return res;
+}
+
+static inline double zsetIdxScoreAtRank(zset *zs, unsigned long rank) {
+    OrderedIndexItem *item = orderedIndexGetByRank(zsetIndexOps, zs->idx, rank);
+    return orderedIndexGetScore(zsetIndexOps, item);
+}
+
+/* The index is sorted by score, so "score >= min" is monotonic over rank.
+ * Returns the 0-based rank of the first element with score >= the range min
+ * (honoring exclusivity), or 'llen' if none qualifies. */
+long zsetIdxFirstInScoreRange(zset *zs, zrangespec *range, unsigned long llen) {
+    long lo = 0, hi = (long)llen; /* search in [lo, hi) */
+    while (lo < hi) {
+        long mid = lo + (hi - lo) / 2;
+        if (zslValueGteMin(zsetIdxScoreAtRank(zs, (unsigned long)mid), range))
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo;
+}
+
+/* Returns the 0-based rank of the last element with score <= the range max
+ * (honoring exclusivity), or -1 if none qualifies. */
+long zsetIdxLastInScoreRange(zset *zs, zrangespec *range, unsigned long llen) {
+    long lo = 0, hi = (long)llen - 1, res = -1;
+    while (lo <= hi) {
+        long mid = lo + (hi - lo) / 2;
+        if (zslValueLteMax(zsetIdxScoreAtRank(zs, (unsigned long)mid), range)) {
+            res = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return res;
+}
+
+/* Add (score, ele) to both the dict and the ordered index. The element is
+ * assumed to not already exist. */
+void zsetInsertRaw(zset *zs, double score, sds ele) {
+    zsetEntry *e = zsetEntryNew(score, ele);
+    serverAssert(dictAdd(zs->dict, e, NULL) == DICT_OK);
+    orderedIndexInsert(zsetIndexOps, zs->idx, score, ele);
+}
+
 unsigned long zsetLength(const robj *zobj) {
     unsigned long length = 0;
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         length = zzlLength(zobj->ptr);
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
-        length = ((const zset*)zobj->ptr)->zsl->length;
+        length = orderedIndexLength(zsetIndexOps, ((const zset*)zobj->ptr)->idx);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -1393,8 +784,8 @@ size_t zsetAllocSize(const robj *o) {
         size = lpBytes(o->ptr);
     } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         dict *d = ((zset*)o->ptr)->dict;
-        zskiplist *zsl = ((zset*)o->ptr)->zsl;
-        size = sizeof(zset) + zslAllocSize(zsl) +
+        OrderedIndex *idx = ((zset*)o->ptr)->idx;
+        size = sizeof(zset) + orderedIndexMemUsage(zsetIndexOps, idx) +
             sizeof(dict) + dictMemUsage(d);
     } else {
         serverPanic("Unknown sorted set encoding");
@@ -1443,7 +834,6 @@ void zsetConvert(robj *zobj, int encoding) {
 /* Converts a zset to the specified encoding, pre-sizing it for 'cap' elements. */
 void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
     zset *zs;
-    zskiplistNode *node, *next;
     sds ele;
     double score;
 
@@ -1460,7 +850,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
         zs = zmalloc(sizeof(*zs));
         zs->dict = dictCreate(&zsetDictType);
-        zs->zsl = zslCreate();
+        zs->idx = orderedIndexCreate(zsetIndexOps);
 
         /* Presize the dict to avoid rehashing */
         dictExpand(zs->dict, cap);
@@ -1479,9 +869,8 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
             else
                 ele = sdsnewlen((char*)vstr,vlen);
 
-            node = zslInsert(zs->zsl,score,ele);
-            serverAssert(dictAdd(zs->dict, node, NULL) == DICT_OK);
-            sdsfree(ele); /* zslInsert copied it, we can free our copy */
+            zsetInsertRaw(zs, score, ele);
+            sdsfree(ele); /* zsetInsertRaw copied it, we can free our copy */
             zzlNext(zl,&eptr,&sptr);
         }
 
@@ -1494,21 +883,24 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         if (encoding != OBJ_ENCODING_LISTPACK)
             serverPanic("Unknown target encoding");
 
-        /* Approach similar to zslFree(), since we want to free the skiplist at
-         * the same time as creating the listpack. */
         zs = zobj->ptr;
-        dictRelease(zs->dict);
-        node = zs->zsl->header->level[0].forward;
-        zfree(zs->zsl->header);
 
-        while (node) {
-            zl = zzlInsertAt(zl,NULL,zslGetNodeElement(node),node->score);
-            next = node->level[0].forward;
-            zslFreeNode(zs->zsl, node);
-            node = next;
+        /* Walk the ordered index in order, appending each (element, score) to
+         * the listpack, then release both structures. */
+        OrderedIndexIterator iter;
+        OrderedIndexItem *item;
+        orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
+        while (orderedIndexNext(zsetIndexOps, &iter, &item)) {
+            const char *ptr;
+            size_t len;
+            orderedIndexGetElementRaw(zsetIndexOps, item, &ptr, &len);
+            sds tmp = sdsnewlen(ptr, len);
+            zl = zzlInsertAt(zl, NULL, tmp, orderedIndexGetScore(zsetIndexOps, item));
+            sdsfree(tmp);
         }
 
-        zfree(zs->zsl);
+        dictRelease(zs->dict);
+        orderedIndexFree(zsetIndexOps, zs->idx);
         zfree(zs);
         zobj->ptr = zl;
         zobj->encoding = OBJ_ENCODING_LISTPACK;
@@ -1524,7 +916,7 @@ void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelele
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) return;
     zset *zset = zobj->ptr;
 
-    if (zset->zsl->length <= server.zset_max_listpack_entries &&
+    if (orderedIndexLength(zsetIndexOps, zset->idx) <= server.zset_max_listpack_entries &&
         maxelelen <= server.zset_max_listpack_value &&
         lpSafeToAdd(NULL, totelelen))
     {
@@ -1545,8 +937,8 @@ int zsetScore(robj *zobj, sds member, double *score) {
         zset *zs = zobj->ptr;
         dictEntry *de = dictFind(zs->dict, member);
         if (de == NULL) return C_ERR;
-        zskiplistNode *znode = dictGetKey(de);
-        *score = znode->score;
+        zsetEntry *entry = dictGetKey(de);
+        *score = entry->score;
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -1673,7 +1065,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
      * converted the key to skiplist. */
     if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplistNode *znode;
+        zsetEntry *entry;
         dictEntry *de;
         dictEntryLink bucket, link;
 
@@ -1691,9 +1083,9 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
                 return 1;
             }
 
-            /* Get the node pointer from dict entry */
-            znode = dictGetKey(de);
-            curscore = znode->score;
+            /* Get the entry pointer from dict entry */
+            entry = dictGetKey(de);
+            curscore = entry->score;
 
             /* Prepare the score for the increment if needed. */
             if (incr) {
@@ -1712,21 +1104,23 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             if (newscore) *newscore = score;
 
-            /* Remove and re-insert when score changes. */
+            /* Remove and re-insert when score changes. The dict key (entry) is
+             * kept; we update its score in place and re-position the element in
+             * the ordered index. */
             if (score != curscore) {
-                zslUpdateScore(zs->zsl, znode, score);
-                /* Note that we did not remove the original element from
-                 * the hash table representing the sorted set, so we don't
-                 * need to update the dict - the node pointer stays the same. */
+                orderedIndexDeleteByValue(zsetIndexOps, zs->idx, curscore, ele);
+                orderedIndexInsert(zsetIndexOps, zs->idx, score, ele);
+                entry->score = score;
                 *out_flags |= ZADD_OUT_UPDATED;
             }
             return 1;
         } else if (!xx) {
-            /* Element doesn't exist - create node with embedded sds and add to skiplist */
-            znode = zslInsert(zs->zsl, score, ele);
+            /* Element doesn't exist - create entry and add to dict + ordered index */
+            entry = zsetEntryNew(score, ele);
 
-            /* Add node pointer to dict using the bucket we already found */
-            dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
+            /* Add entry pointer to dict using the bucket we already found */
+            dictSetKeyAtLink(zs->dict, entry, &bucket, 1);
+            orderedIndexInsert(zsetIndexOps, zs->idx, score, ele);
 
             *out_flags |= ZADD_OUT_ADDED;
             if (newscore) *newscore = score;
@@ -1750,19 +1144,11 @@ static int zsetRemoveFromSkiplist(zset *zs, sds ele) {
 
     de = dictUnlink(zs->dict,ele);
     if (de != NULL) {
-        /* Get the node and score in order to delete from the skiplist later. */
-        zskiplistNode *znode = dictGetKey(de);
-
-        /* Delete from the hash table and later from the skiplist.
-         * Note that the order is important: deleting from the skiplist
-         * actually releases the SDS string representing the element,
-         * which is shared between the skiplist and the hash table, so
-         * we need to delete from the skiplist as the final step. */
+        /* Get the entry to obtain its score, then remove from the ordered
+         * index before releasing the dict entry (which owns the element). */
+        zsetEntry *entry = dictGetKey(de);
+        orderedIndexDeleteByValue(zsetIndexOps, zs->idx, entry->score, ele);
         dictFreeUnlinkedEntry(zs->dict,de);
-
-        /* Delete from skiplist. */
-        zslDelete(zs->zsl, znode);
-
         return 1;
     }
 
@@ -1838,21 +1224,21 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
         dictEntry *de;
 
         de = dictFind(zs->dict,ele);
         if (de != NULL) {
-            zskiplistNode *n = dictGetKey(de);
-            rank = zslGetRankByNode(zsl, n);
+            zsetEntry *entry = dictGetKey(de);
+            /* 0-based rank within the ordered index. */
+            long rank0 = orderedIndexGetRankByValue(zsetIndexOps, zs->idx, entry->score, ele);
             /* Existing elements always have a rank. */
-            serverAssert(rank != 0);
+            serverAssert(rank0 >= 0);
             if (output_score)
-                *output_score = n->score;
+                *output_score = entry->score;
             if (reverse)
-                return llen-rank;
+                return llen - 1 - rank0;
             else
-                return rank-1;
+                return rank0;
         } else {
             return -1;
         }
@@ -1886,23 +1272,19 @@ robj *zsetDup(robj *o) {
         zs = o->ptr;
         new_zs = zobj->ptr;
         dictExpand(new_zs->dict,dictSize(zs->dict));
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
-        sds ele;
-        long llen = zsetLength(o);
 
-        /* We copy the skiplist elements from the greatest to the
-         * smallest (that's trivial since the elements are already ordered in
-         * the skiplist): this improves the load process, since the next loaded
-         * element will always be the smaller, so adding to the skiplist
-         * will always immediately stop at the head, making the insertion
-         * O(1) instead of O(log(N)). */
-        ln = zsl->tail;
-        while (llen--) {
-            ele = zslGetNodeElement(ln);
-            zskiplistNode *znode = zslInsert(new_zs->zsl,ln->score,ele);
-            dictAdd(new_zs->dict, znode, NULL);
-            ln = ln->backward;
+        /* Walk the ordered index in order and re-insert each element into the
+         * new zset's dict + ordered index. */
+        OrderedIndexIterator iter;
+        OrderedIndexItem *item;
+        orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
+        while (orderedIndexNext(zsetIndexOps, &iter, &item)) {
+            const char *ptr;
+            size_t len;
+            orderedIndexGetElementRaw(zsetIndexOps, item, &ptr, &len);
+            sds ele = sdsnewlen(ptr, len);
+            zsetInsertRaw(new_zs, orderedIndexGetScore(zsetIndexOps, item), ele);
+            sdsfree(ele);
         }
     } else {
         serverPanic("Unknown sorted set encoding");
@@ -1932,12 +1314,12 @@ void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, listpackEntry 
     if (zsetobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zsetobj->ptr;
         dictEntry *de = dictGetFairRandomKey(zs->dict);
-        zskiplistNode *znode = dictGetKey(de);
-        sds s = zslGetNodeElement(znode);
+        zsetEntry *entry = dictGetKey(de);
+        sds s = entry->ele;
         key->sval = (unsigned char*)s;
         key->slen = sdslen(s);
         if (score) {
-            *score = znode->score;
+            *score = entry->score;
         }
     } else if (zsetobj->encoding == OBJ_ENCODING_LISTPACK) {
         listpackEntry val;
@@ -2235,17 +1617,66 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         dictPauseAutoResize(zs->dict);
+        OrderedIndexIterator iter;
+        OrderedIndexItem *item;
+        const char *p;
+        size_t l;
         switch(rangetype) {
         case ZRANGE_AUTO:
-        case ZRANGE_RANK:
-            deleted = zslDeleteRangeByRank(zs->zsl,start+1,end+1,zs->dict);
+        case ZRANGE_RANK: {
+            /* start/end are already sanitized 0-based inclusive ranks. */
+            unsigned long rstart = (unsigned long)start, rend = (unsigned long)end;
+            unsigned long cnt = rend - rstart + 1;
+            orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
+            orderedIndexSeekToRank(zsetIndexOps, &iter, rstart);
+            while (cnt-- && orderedIndexNext(zsetIndexOps, &iter, &item)) {
+                orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+                sds tmp = sdsnewlen(p, l);
+                dictDelete(zs->dict, tmp);
+                sdsfree(tmp);
+                deleted++;
+            }
+            if (deleted)
+                orderedIndexDeleteRangeByRank(zsetIndexOps, zs->idx, rstart, rend);
             break;
-        case ZRANGE_SCORE:
-            deleted = zslDeleteRangeByScore(zs->zsl,&range,zs->dict);
+        }
+        case ZRANGE_SCORE: {
+            orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
+            orderedIndexSeekToScoreRange(zsetIndexOps, &iter, range.min, range.max,
+                                         range.minex, range.maxex, 0);
+            while (orderedIndexNext(zsetIndexOps, &iter, &item)) {
+                if (!zslValueLteMax(orderedIndexGetScore(zsetIndexOps, item), &range)) break;
+                orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+                sds tmp = sdsnewlen(p, l);
+                dictDelete(zs->dict, tmp);
+                sdsfree(tmp);
+                deleted++;
+            }
+            if (deleted)
+                orderedIndexDeleteRangeByScore(zsetIndexOps, zs->idx, range.min, range.max,
+                                               range.minex, range.maxex);
             break;
-        case ZRANGE_LEX:
-            deleted = zslDeleteRangeByLex(zs->zsl,&lexrange,zs->dict);
+        }
+        case ZRANGE_LEX: {
+            unsigned long llen2 = orderedIndexLength(zsetIndexOps, zs->idx);
+            unsigned long first = zsetIdxFirstInLexRange(zs, &lexrange, llen2);
+            long last = zsetIdxLastInLexRange(zs, &lexrange, llen2);
+            if (last >= 0 && first <= (unsigned long)last) {
+                unsigned long cnt = (unsigned long)last - first + 1;
+                orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
+                orderedIndexSeekToRank(zsetIndexOps, &iter, first);
+                while (cnt-- && orderedIndexNext(zsetIndexOps, &iter, &item)) {
+                    orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+                    sds tmp = sdsnewlen(p, l);
+                    dictDelete(zs->dict, tmp);
+                    sdsfree(tmp);
+                    deleted++;
+                }
+                if (deleted)
+                    orderedIndexDeleteRangeByRank(zsetIndexOps, zs->idx, first, (unsigned long)last);
+            }
             break;
+        }
         }
         dictResumeAutoResize(zs->dict);
         if (dictSize(zs->dict) == 0) {
@@ -2331,7 +1762,7 @@ typedef struct {
             } zl;
             struct {
                 zset *zs;
-                zskiplistNode *node;
+                OrderedIndexIterator iter;
             } sl;
         } zset;
     } iter;
@@ -2394,8 +1825,10 @@ void zuiInitIterator(zsetopsrc *op) {
                 serverAssert(it->zl.sptr != NULL);
             }
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
+            /* fbtree insertion cost is order independent, so a forward walk is
+             * fine (no need to traverse in reverse like the skiplist did). */
             it->sl.zs = op->subject->ptr;
-            it->sl.node = it->sl.zs->zsl->tail;
+            orderedIndexInitIterator(zsetIndexOps, &it->sl.iter, it->sl.zs->idx);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -2452,7 +1885,7 @@ unsigned long zuiLength(zsetopsrc *op) {
             return zzlLength(op->subject->ptr);
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = op->subject->ptr;
-            return zs->zsl->length;
+            return orderedIndexLength(zsetIndexOps, zs->idx);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -2515,13 +1948,15 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
             /* Move to next element (going backwards, see zuiInitIterator). */
             zzlPrev(it->zl.zl,&it->zl.eptr,&it->zl.sptr);
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
-            if (it->sl.node == NULL)
+            OrderedIndexItem *item;
+            if (!orderedIndexNext(zsetIndexOps, &it->sl.iter, &item))
                 return 0;
-            val->ele = zslGetNodeElement(it->sl.node);
-            val->score = it->sl.node->score;
-
-            /* Move to next element. (going backwards, see zuiInitIterator) */
-            it->sl.node = it->sl.node->backward;
+            const char *p;
+            size_t l;
+            orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+            val->estr = (unsigned char *)p;
+            val->elen = (unsigned int)l;
+            val->score = orderedIndexGetScore(zsetIndexOps, item);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -2621,8 +2056,8 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
             zset *zs = op->subject->ptr;
             dictEntry *de;
             if ((de = dictFind(zs->dict,val->ele)) != NULL) {
-                zskiplistNode *znode = dictGetKey(de);
-                *score = znode->score;
+                zsetEntry *entry = dictGetKey(de);
+                *score = entry->score;
                 return 1;
             } else {
                 return 0;
@@ -2690,9 +2125,9 @@ static size_t zsetDictGetMaxElementLength(dict *d, size_t *totallen) {
     dictInitIterator(&di, d);
 
     while((de = dictNext(&di)) != NULL) {
-        /* Extract sds from the node (key is zskiplistNode*) */
-        zskiplistNode *znode = dictGetKey(de);
-        sds ele = zslGetNodeElement(znode);
+        /* Extract sds from the stored zsetEntry. */
+        zsetEntry *entry = dictGetKey(de);
+        sds ele = entry->ele;
         if (sdslen(ele) > maxelelen) maxelelen = sdslen(ele);
         if (totallen)
             (*totallen) += sdslen(ele);
@@ -2719,7 +2154,6 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
      * The final complexity of this algorithm is O(N*M + K*log(K)). */
     int j;
     zsetopval zval;
-    zskiplistNode *znode;
     sds tmp;
 
     /* With algorithm 1 it is better to order the sets to subtract
@@ -2748,11 +2182,10 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
 
         if (!exists) {
             tmp = zuiNewSdsFromValue(&zval);
-            znode = zslInsert(dstzset->zsl,zval.score,tmp);
-            dictAdd(dstzset->dict, znode, NULL);
+            zsetInsertRaw(dstzset, zval.score, tmp);
             if (sdslen(tmp) > *maxelelen) *maxelelen = sdslen(tmp);
             (*totelelen) += sdslen(tmp);
-            sdsfree(tmp); /* zslInsert copied it, we can free our copy */
+            sdsfree(tmp); /* zsetInsertRaw copied it, we can free our copy */
         }
     }
     zuiClearIterator(&src[0]);
@@ -2778,7 +2211,6 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     int j;
     int cardinality = 0;
     zsetopval zval;
-    zskiplistNode *znode;
     sds tmp;
 
     for (j = 0; j < setnum; j++) {
@@ -2789,10 +2221,9 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
         while (zuiNext(&src[j],&zval)) {
             if (j == 0) {
                 tmp = zuiNewSdsFromValue(&zval);
-                znode = zslInsert(dstzset->zsl,zval.score,tmp);
-                dictAdd(dstzset->dict, znode, NULL);
+                zsetInsertRaw(dstzset, zval.score, tmp);
                 cardinality++;
-                sdsfree(tmp); /* zslInsert copied it, we can free our copy */
+                sdsfree(tmp); /* zsetInsertRaw copied it, we can free our copy */
             } else {
                 dictPauseAutoResize(dstzset->dict);
                 tmp = zuiSdsFromValue(&zval);
@@ -2893,7 +2324,6 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     size_t maxelelen = 0, totelelen = 0;
     robj *dstobj = NULL;
     zset *dstzset = NULL;
-    zskiplistNode *znode;
     int withscores = 0;
     unsigned long cardinality = 0;
     long limit = 0; /* Stop searching after reaching the limit. 0 means unlimited. */
@@ -3060,11 +2490,10 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     }
                 } else if (j == setnum) {
                     tmp = zuiNewSdsFromValue(&zval);
-                    znode = zslInsert(dstzset->zsl,score,tmp);
-                    dictAdd(dstzset->dict, znode, NULL);
+                    zsetInsertRaw(dstzset, score, tmp);
                     totelelen += sdslen(tmp);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
-                    sdsfree(tmp); /* zslInsert copied it, we can free our copy */
+                    sdsfree(tmp); /* zsetInsertRaw copied it, we can free our copy */
                 }
             }
             zuiClearIterator(&src[0]);
@@ -3080,8 +2509,9 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             dictExpand(dstzset->dict,zuiLength(&src[setnum-1]));
         }
 
-        /* Step 1: Iterate all sorted sets and aggregate scores.
-         * For each element, either insert into skiplist (new) or update score (existing). */
+        /* Step 1: Iterate all sorted sets and aggregate scores into the dict.
+         * For each element, either create a zsetEntry (new) or update its score
+         * (existing). The ordered index is populated in step 2. */
         for (i = 0; i < setnum; i++) {
             if (zuiLength(&src[i]) == 0) continue;
 
@@ -3091,42 +2521,40 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 score = zuiWeightedScore(zval.score, src[i].weight, aggregate);
                 if (isnan(score)) score = 0;
 
-                /* Search for this element in the dict (which stores node pointers). */
+                /* Search for this element in the dict (which stores zsetEntry). */
                 dictEntryLink bucket, link;
                 link = dictFindLink(dstzset->dict, zuiSdsFromValue(&zval), &bucket);
-                
+
                 if (link == NULL) {  /* if not exists */
-                    /* New element: create node and insert into dict */
-                    tmp = zuiNewSdsFromValue(&zval);
+                    /* New element: create entry owning a fresh element copy. */
+                    zsetEntry *entry = zmalloc(sizeof(*entry));
+                    entry->score = score;
+                    entry->ele = zuiNewSdsFromValue(&zval);
                     /* Remember the longest single element encountered,
                      * to understand if it's possible to convert to listpack
                      * at the end. */
-                     totelelen += sdslen(tmp);
-                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
-
-                    /* Create node with embedded sds and score */
-                    znode = zslCreateNode(dstzset->zsl, zslRandomLevel(), score, tmp);
-                    /* Add node pointer to dict using the bucket we already found */
-                    dictSetKeyAtLink(dstzset->dict, znode, &bucket, 1);
-                    sdsfree(tmp); /* zslCreateNode copied it, we can free our copy */
+                    totelelen += sdslen(entry->ele);
+                    if (sdslen(entry->ele) > maxelelen) maxelelen = sdslen(entry->ele);
+                    /* Add entry pointer to dict using the bucket we already found */
+                    dictSetKeyAtLink(dstzset->dict, entry, &bucket, 1);
                 } else {
                     /* Existing element: aggregate score */
                     de = *link;
-                    znode = dictGetKey(de);
-                    double newscore = znode->score;
+                    zsetEntry *entry = dictGetKey(de);
+                    double newscore = entry->score;
                     zunionInterAggregate(&newscore, score, aggregate);
-                    znode->score = newscore;
+                    entry->score = newscore;
                 }
             }
             zuiClearIterator(&src[i]);
         }
 
-        /* Step 2: Done filling dict with nodes and updating scores. Now insert skiplist */
+        /* Step 2: dict is fully populated and scores aggregated; now build the
+         * ordered index from the entries. */
         dictInitIterator(&di, dstzset->dict);
-
         while((de = dictNext(&di)) != NULL) {
-            zskiplistNode *znode = dictGetKey(de);
-            zslInsertNode(dstzset->zsl, znode);
+            zsetEntry *entry = dictGetKey(de);
+            orderedIndexInsert(zsetIndexOps, dstzset->idx, entry->score, entry->ele);
         }
         dictResetIterator(&di);
     } else if (op == SET_OP_DIFF) {
@@ -3144,7 +2572,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     }
 
     if (dstkey) {
-        if (dstzset->zsl->length) {
+        if (orderedIndexLength(zsetIndexOps, dstzset->idx)) {
             zsetConvertToListpackIfNeeded(dstobj, maxelelen, totelelen);
             setKey(c, c->db, dstkey, &dstobj, 0);
             addReplyLongLong(c, zsetLength(dstobj));
@@ -3165,9 +2593,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     } else if (cardinality_only) {
         addReplyLongLong(c, cardinality);
     } else {
-        unsigned long length = dstzset->zsl->length;
-        zskiplist *zsl = dstzset->zsl;
-        zskiplistNode *zn = zsl->header->level[0].forward;
+        unsigned long length = orderedIndexLength(zsetIndexOps, dstzset->idx);
         /* In case of WITHSCORES, respond with a single array in RESP2, and
          * nested arrays in RESP3. We can't use a map response type since the
          * client library needs to know to respect the order. */
@@ -3176,11 +2602,16 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         else
             addReplyArrayLen(c, length);
 
-        while (zn != NULL) {
+        OrderedIndexIterator iter;
+        OrderedIndexItem *item;
+        orderedIndexInitIterator(zsetIndexOps, &iter, dstzset->idx);
+        while (orderedIndexNext(zsetIndexOps, &iter, &item)) {
             if (withscores && c->resp > 2) addReplyArrayLen(c,2);
-            sds ele = zslGetNodeElement(zn); addReplyBulkCBuffer(c,ele,sdslen(ele));
-            if (withscores) addReplyDouble(c,zn->score);
-            zn = zn->level[0].forward;
+            const char *p;
+            size_t l;
+            orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+            addReplyBulkCBuffer(c,p,l);
+            if (withscores) addReplyDouble(c,orderedIndexGetScore(zsetIndexOps, item));
         }
         server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstobj, -1) :
                                           decrRefCount(dstobj);
@@ -3409,6 +2840,54 @@ static void zrangeResultHandlerDestinationKeySet (zrange_result_handler *handler
     handler->dstkey = dstkey;
 }
 
+/* Emit the elements of a skiplist-encoded sorted set whose 0-based ranks fall
+ * within the inclusive window [first, last], applying a LIMIT offset/count and
+ * an optional reverse direction. Returns the number of emitted elements.
+ *
+ * 'limit' < 0 means "no limit". Iteration uses only rank-based seeking plus
+ * next()/prev(), which have well-defined ordered-index semantics. */
+static unsigned long zsetIdxEmitRankWindow(zset *zs,
+                                           long first,
+                                           long last,
+                                           long offset,
+                                           long limit,
+                                           int reverse,
+                                           zrange_result_handler *handler) {
+    unsigned long emitted = 0;
+    if (first < 0 || last < 0 || first > last) return 0;
+
+    unsigned long winlen = (unsigned long)(last - first + 1);
+    if (offset < 0) offset = 0;
+    if ((unsigned long)offset >= winlen) return 0;
+
+    unsigned long remaining = winlen - (unsigned long)offset;
+    if (limit >= 0 && (unsigned long)limit < remaining) remaining = (unsigned long)limit;
+
+    OrderedIndexIterator iter;
+    OrderedIndexItem *item;
+    const char *p;
+    size_t l;
+    orderedIndexInitIterator(zsetIndexOps, &iter, zs->idx);
+    if (!reverse) {
+        orderedIndexSeekToRank(zsetIndexOps, &iter, (unsigned long)first + (unsigned long)offset);
+        while (remaining-- > 0 && orderedIndexNext(zsetIndexOps, &iter, &item)) {
+            orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+            handler->emitResultFromCBuffer(handler, p, l, orderedIndexGetScore(zsetIndexOps, item));
+            emitted++;
+        }
+    } else {
+        unsigned long start_rank = (unsigned long)last - (unsigned long)offset;
+        /* Position the cursor just past start_rank so prev() yields it first. */
+        orderedIndexSeekToRank(zsetIndexOps, &iter, start_rank + 1);
+        while (remaining-- > 0 && orderedIndexPrev(zsetIndexOps, &iter, &item)) {
+            orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+            handler->emitResultFromCBuffer(handler, p, l, orderedIndexGetScore(zsetIndexOps, item));
+            emitted++;
+        }
+    }
+    return emitted;
+}
+
 /* This command implements ZRANGE, ZREVRANGE. */
 void genericZrangebyrankCommand(zrange_result_handler *handler,
     robj *zobj, long start, long end, int withscores, int reverse) {
@@ -3474,26 +2953,14 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
 
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
-
-        /* Check if starting point is trivial, before doing log(N) lookup. */
-        if (reverse) {
-            ln = zsl->tail;
-            if (start > 0)
-                ln = zslGetElementByRank(zsl,llen-start);
-        } else {
-            ln = zsl->header->level[0].forward;
-            if (start > 0)
-                ln = zslGetElementByRank(zsl,start+1);
-        }
-
-        while(rangelen--) {
-            serverAssertWithInfo(c,zobj,ln != NULL);
-            sds ele = zslGetNodeElement(ln);
-            handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
-            ln = reverse ? ln->backward : ln->level[0].forward;
-        }
+        /* start/end are final 0-based positions in the requested order. In
+         * reverse, position i maps to ascending rank (llen - 1 - i), so the
+         * window [start, end] maps to forward ranks [llen-1-end, llen-1-start]
+         * walked backwards. */
+        if (reverse)
+            zsetIdxEmitRankWindow(zs, llen - 1 - end, llen - 1 - start, 0, -1, 1, handler);
+        else
+            zsetIdxEmitRankWindow(zs, start, end, 0, -1, 0, handler);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -3593,35 +3060,12 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
-
-        /* If reversed, get the last node in range as starting point. */
-        if (reverse) {
-            ln = zslNthInRange(zsl, range, -offset-1, NULL);
-        } else {
-            ln = zslNthInRange(zsl, range, offset, NULL);
-        }
-
-        while (ln && limit--) {
-            /* Abort when the node is no longer in range. */
-            if (reverse) {
-                if (!zslValueGteMin(ln->score,range)) break;
-            } else {
-                if (!zslValueLteMax(ln->score,range)) break;
-            }
-
-            rangelen++;
-            sds ele = zslGetNodeElement(ln);
-			handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
-
-            /* Move to next node */
-            if (reverse) {
-                ln = ln->backward;
-            } else {
-                ln = ln->level[0].forward;
-            }
-        }
+        /* Resolve the in-range rank window by binary search over scores, then
+         * emit it (forward or reverse) applying the LIMIT offset/count. */
+        unsigned long zsllen = orderedIndexLength(zsetIndexOps, zs->idx);
+        long first = zsetIdxFirstInScoreRange(zs, range, zsllen);
+        long last = zsetIdxLastInScoreRange(zs, range, zsllen);
+        rangelen = zsetIdxEmitRankWindow(zs, first, last, offset, limit, reverse, handler);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -3692,25 +3136,11 @@ void zcountCommand(client *c) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *zn;
-        unsigned long rank;
-
-        /* Find first element in range and get its rank */
-        zn = zslNthInRange(zsl, &range, 0, &rank);
-
-        /* Use rank of first element, if any, to determine preliminary count */
-        if (zn != NULL) {
-            count = (zsl->length - (rank - 1));
-
-            /* Find last element in range and get its rank */
-            zn = zslNthInRange(zsl, &range, -1, &rank);
-
-            /* Use rank of last element, if any, to determine the actual count */
-            if (zn != NULL) {
-                count -= (zsl->length - rank);
-            }
-        }
+        unsigned long zsllen = orderedIndexLength(zsetIndexOps, zs->idx);
+        long first = zsetIdxFirstInScoreRange(zs, &range, zsllen);
+        long last = zsetIdxLastInScoreRange(zs, &range, zsllen);
+        if (last >= 0 && first <= last)
+            count = (unsigned long)(last - first + 1);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -3768,25 +3198,11 @@ void zlexcountCommand(client *c) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *zn;
-        unsigned long rank;
-
-        /* Find first element in range and get its rank */
-        zn = zslNthInLexRange(zsl, &range, 0, &rank);
-
-        /* Use rank of first element, if any, to determine preliminary count */
-        if (zn != NULL) {
-            count = (zsl->length - (rank - 1));
-
-            /* Find last element in range and get its rank */
-            zn = zslNthInLexRange(zsl, &range, -1, &rank);
-
-            /* Use rank of last element, if any, to determine the actual count */
-            if (zn != NULL) {
-                count -= (zsl->length - rank);
-            }
-        }
+        unsigned long zsllen = orderedIndexLength(zsetIndexOps, zs->idx);
+        unsigned long ufirst = zsetIdxFirstInLexRange(zs, &range, zsllen);
+        long last = zsetIdxLastInLexRange(zs, &range, zsllen);
+        if (last >= 0 && ufirst <= (unsigned long)last)
+            count = (unsigned long)last - ufirst + 1;
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -3867,35 +3283,14 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
-
-        /* If reversed, get the last node in range as starting point. */
-        if (reverse) {
-            ln = zslNthInLexRange(zsl,range,-offset-1,NULL);
-        } else {
-            ln = zslNthInLexRange(zsl,range,offset,NULL);
-        }
-
-        while (ln && limit--) {
-            /* Abort when the node is no longer in range. */
-            if (reverse) {
-                if (!zslLexValueGteMin(zslGetNodeElement(ln),range)) break;
-            } else {
-                if (!zslLexValueLteMax(zslGetNodeElement(ln),range)) break;
-            }
-
-            rangelen++;
-            sds ele = zslGetNodeElement(ln);
-			handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
-
-            /* Move to next node */
-            if (reverse) {
-                ln = ln->backward;
-            } else {
-                ln = ln->level[0].forward;
-            }
-        }
+        /* Resolve the in-range rank window by binary search over elements
+         * (valid because all members share a score for a lex range), then
+         * emit it (forward or reverse) applying the LIMIT offset/count. */
+        unsigned long zsllen = orderedIndexLength(zsetIndexOps, zs->idx);
+        unsigned long ufirst = zsetIdxFirstInLexRange(zs, range, zsllen);
+        long first = (ufirst >= zsllen) ? -1 : (long)ufirst;
+        long last = zsetIdxLastInLexRange(zs, range, zsllen);
+        rangelen = zsetIdxEmitRankWindow(zs, first, last, offset, limit, reverse, handler);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -4312,17 +3707,17 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
             score = zzlGetScore(sptr);
         } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = zobj->ptr;
-            zskiplist *zsl = zs->zsl;
-            zskiplistNode *zln;
 
             /* Get the first or last element in the sorted set. */
-            zln = (where == ZSET_MAX ? zsl->tail :
-                                       zsl->header->level[0].forward);
-
-            /* There must be an element in the sorted set. */
-            serverAssertWithInfo(c,zobj,zln != NULL);
-            ele = sdsdup(zslGetNodeElement(zln));
-            score = zln->score;
+            unsigned long ilen = orderedIndexLength(zsetIndexOps, zs->idx);
+            serverAssertWithInfo(c,zobj,ilen != 0);
+            OrderedIndexItem *item = orderedIndexGetByRank(zsetIndexOps, zs->idx,
+                where == ZSET_MAX ? ilen - 1 : 0);
+            const char *p;
+            size_t l;
+            orderedIndexGetElementRaw(zsetIndexOps, item, &p, &l);
+            ele = sdsnewlen(p, l);
+            score = orderedIndexGetScore(zsetIndexOps, item);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -4542,13 +3937,13 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
             zset *zs = zsetobj->ptr;
             while (count--) {
                 dictEntry *de = dictGetFairRandomKey(zs->dict);
-                zskiplistNode *znode = dictGetKey(de);
-                sds key = zslGetNodeElement(znode);
+                zsetEntry *entry = dictGetKey(de);
+                sds key = entry->ele;
                 if (withscores && c->resp > 2)
                     addReplyArrayLen(c,2);
                 addReplyBulkCBuffer(c, key, sdslen(key));
                 if (withscores) {
-                    addReplyDouble(c, znode->score);
+                    addReplyDouble(c, entry->score);
                 }
                 if (c->flags & CLIENT_CLOSE_ASAP)
                     break;
@@ -4825,209 +4220,76 @@ void bzmpopCommand(client *c) {
 #include <assert.h>
 #include "testhelp.h"
 
-/* Verify the entire skiplist structure for debugging purposes:
- * - Header node has correct structure
- * - Level is correct (highest non-NULL level)
- * - Forward and backward pointers are correct
- * - Scores are in sorted order (with lexicographic tie-breaking)
- * - Node levels stored in level[0].span are correct
- * - Span values across all levels sum to zsl->length
- * - Length matches actual node count
- * - Tail pointer is correct
- *
- * Panics with detailed error message if any invariant is violated. */
-static void zslDebugVerifyStruct(zskiplist *zsl) {
-    zskiplistNode *x;
-    unsigned long length = 0;
-    int i;
-
-    /* Verify header node */
-    serverAssert(zsl->header != NULL);
-    serverAssert(zslGetNodeInfo(zsl->header)->sdsoffset == ZSL_OFFSET_NO_ELE);
-    serverAssert(zsl->header->backward == NULL);
-
-    /* Verify level is in valid range */
-    serverAssert(zsl->level >= 1 && zsl->level <= ZSKIPLIST_MAXLEVEL);
-
-    /* Verify that all levels >= zsl->level in header are NULL */
-    for (i = zsl->level; i < ZSKIPLIST_MAXLEVEL; i++) {
-        serverAssert(zsl->header->level[i].forward == NULL);
-        serverAssert(zsl->header->level[i].span == 0);
-    }
-
-    /* Verify that level zsl->level-1 has at least one node (if list is not empty) */
-    if (zsl->length > 0) {
-        serverAssert(zsl->header->level[zsl->level-1].forward != NULL);
-    }
-
-    /* Single pass: verify forward/backward pointers, scores, node levels, and accumulate spans */
-    x = zsl->header->level[0].forward;
-    zskiplistNode *prev = NULL;
-
-    while (x) {
-        length++;
-
-        /* Verify backward pointer */
-        serverAssert(x->backward == prev);
-
-        /* Verify node has valid element */
-        serverAssert(zslGetNodeInfo(x)->sdsoffset != ZSL_OFFSET_NO_ELE);
-
-        /* Verify node level is in valid range */
-        unsigned long node_level = zslGetNodeInfo(x)->levels;
-        serverAssert(node_level >= 1 && node_level <= ZSKIPLIST_MAXLEVEL);
-
-        /* Verify score ordering */
-        if (x->level[0].forward) {
-            zskiplistNode *next = x->level[0].forward;
-            serverAssert(next->score > x->score ||
-                       (next->score == x->score && sdscmp(zslGetNodeElement(next), zslGetNodeElement(x)) > 0));
-        }
-
-        /* Verify spans are correct for all levels this node participates in.
-         * Note: level 0 doesn't store span (it stores node level), so start from level 1.
-         *
-         * Span semantics:
-         * - If forward != NULL: span represents distance to next node at this level (must be > 0)
-         * - If forward == NULL: span represents number of nodes after this node at level 0
-         *   (needed for zslGetRankByNode optimization) */
-        for (i = 1; i < (int)node_level; i++) {
-            if (x->level[i].forward) {
-                /* Verify span is positive when there's a next node */
-                serverAssert(x->level[i].span > 0);
-            } else {
-                /* When forward is NULL, span should equal the number of nodes after this node.
-                 * We can verify this by counting remaining nodes at level 0. */
-                unsigned long nodes_after = 0;
-                zskiplistNode *temp = x->level[0].forward;
-                while (temp) {
-                    nodes_after++;
-                    temp = temp->level[0].forward;
-                }
-                serverAssert(x->level[i].span == nodes_after);
-            }
-        }
-
-        prev = x;
-        x = x->level[0].forward;
-    }
-
-    /* Verify length matches actual count */
-    serverAssert(length == zsl->length);
-
-    /* Verify tail pointer */
-    if (zsl->length == 0) {
-        serverAssert(zsl->tail == NULL);
-    } else {
-        serverAssert(zsl->tail == prev);
-        serverAssert(zsl->tail->level[0].forward == NULL);
-    }
-
-    /* Verify that the sum of spans at each level is consistent.
-     * At each level, we traverse from header following forward pointers and sum all spans.
-     * The sum should equal the rank of the last node at that level.
-     * If the last node at a level is the tail, the sum should equal zsl->length. */
-    for (i = 1; i < zsl->level; i++) {
-        unsigned long span_sum = 0;
-        zskiplistNode *last_at_level = zsl->header;
-        x = zsl->header;
-        while (x->level[i].forward) {
-            span_sum += x->level[i].span;
-            x = x->level[i].forward;
-            last_at_level = x;
-        }
-        /* If the last node at this level is the tail, span sum should equal length */
-        if (last_at_level == zsl->tail) {
-            serverAssert(span_sum == zsl->length);
-        } else {
-            /* Otherwise, span sum should be less than length */
-            serverAssert(span_sum < zsl->length);
-        }
-    }
-}
-
+/* Smoke test of the ordered index (fbtree) backing the sorted set: insert N
+ * elements with duplicate scores, then check length, rank, get-by-rank,
+ * in-order iteration and delete-by-value. Detailed structural invariants are
+ * the responsibility of the index implementation; here we validate the
+ * abstraction surface used by t_zset.c. */
 int zsetTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
     UNUSED(flags);
 
-    printf("Testing skiplist operations with structure verification\n");
+    printf("Testing ordered index (fbtree) operations\n");
 
     const int N = 1000;
-    zskiplist *zsl = zslCreate();
+    OrderedIndex *idx = orderedIndexCreate(zsetIndexOps);
 
-    /* Store inserted elements for later deletion */
-    typedef struct {
-        double score;
-        sds ele;
-        zskiplistNode *node;
-    } InsertedElement;
-
+    typedef struct { double score; sds ele; } InsertedElement;
     InsertedElement *elements = zmalloc(sizeof(InsertedElement) * N);
 
-    /* Seed random number generator for reproducible tests */
     srand(12345);
 
     printf("Inserting %d elements with scores 0-100 (with duplicates)...\n", N);
-
-    /* Insert N elements with random scores between 0 and 100 */
     for (int i = 0; i < N; i++) {
         double score = (double)(rand() % 101); /* 0 to 100 */
         char buf[32];
         snprintf(buf, sizeof(buf), "elem%d", i);
         sds ele = sdsnew(buf);
-
-        zskiplistNode *node = zslInsert(zsl, score, ele);
-
-        /* Store for later deletion - keep a copy of the element name */
+        orderedIndexInsert(zsetIndexOps, idx, score, ele);
         elements[i].score = score;
         elements[i].ele = ele;
-        elements[i].node = node;
 
-        /* Verify structure after each insertion */
-        zslDebugVerifyStruct(zsl);
-
-        /* Query the inserted element */
-        unsigned long rank = zslGetRank(zsl, score, ele);
-        assert(rank != 0);
-
-        /* Verify we can get the element by rank */
-        zskiplistNode *found = zslGetElementByRank(zsl, rank);
-        assert(found != NULL && found == node);
-
-        /* Verify rank by node */
-        unsigned long node_rank = zslGetRankByNode(zsl, node);
-        assert(node_rank == rank);
+        long rank = orderedIndexGetRankByValue(zsetIndexOps, idx, score, ele);
+        assert(rank >= 0);
+        OrderedIndexItem *found = orderedIndexGetByRank(zsetIndexOps, idx, (unsigned long)rank);
+        assert(found != NULL);
+        assert(orderedIndexGetScore(zsetIndexOps, found) == score);
     }
 
-    test_cond("Insert N elements with verification",
-        zsl->length == (unsigned long)N);
+    test_cond("Insert N elements",
+        orderedIndexLength(zsetIndexOps, idx) == (unsigned long)N);
+
+    /* Verify full in-order iteration is non-decreasing by score. */
+    {
+        OrderedIndexIterator it;
+        OrderedIndexItem *item;
+        orderedIndexInitIterator(zsetIndexOps, &it, idx);
+        double prev = -INFINITY;
+        unsigned long seen = 0;
+        while (orderedIndexNext(zsetIndexOps, &it, &item)) {
+            double s = orderedIndexGetScore(zsetIndexOps, item);
+            assert(s >= prev);
+            prev = s;
+            seen++;
+        }
+        orderedIndexResetIterator(zsetIndexOps, &it);
+        test_cond("In-order iteration visits all elements", seen == (unsigned long)N);
+    }
 
     printf("Deleting %d elements...\n", N);
-
-    /* Delete all elements in reverse order */
     for (int i = N - 1; i >= 0; i--) {
-        double score = elements[i].score;
-        sds ele = elements[i].ele;
-
-        /* Verify element exists before deletion with valid rank */
-        unsigned long rank = zslGetRank(zsl, score, ele);
-        assert(rank >= 1 && rank <= (unsigned long)(i + 1));
-
-        /* Delete the element - zslDelete frees the node's SDS string */
-        zslDelete(zsl, elements[i].node);
-
-        /* Verify structure after each deletion */
-        zslDebugVerifyStruct(zsl);
+        int deleted = orderedIndexDeleteByValue(zsetIndexOps, idx, elements[i].score, elements[i].ele);
+        assert(deleted == 1);
         sdsfree(elements[i].ele);
     }
 
-    test_cond("Delete N elements with verification",
-        zsl->length == 0 && zsl->tail == NULL);
+    test_cond("Delete N elements",
+        orderedIndexLength(zsetIndexOps, idx) == 0);
 
     zfree(elements);
-    zslFree(zsl);
-    
+    orderedIndexFree(zsetIndexOps, idx);
+
     return 0;
 }
 #endif

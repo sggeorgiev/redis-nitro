@@ -1683,7 +1683,7 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     serverAssert(!((data->type != LLONG_MAX) && o));
 
     kvobj *kv = NULL;
-    zskiplistNode *znode = NULL;
+    zsetEntry *zentry = NULL;
     if (!o) { /* If scanning keyspace */
         kv = dictGetKV(de);
         keyStr = kvobjGetKey(kv);
@@ -1691,8 +1691,8 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
         hashEntry = dictGetKey(de);
         keyStr = entryGetField(hashEntry);
     } else if (o->type == OBJ_ZSET) {
-        znode = dictGetKey(de);
-        keyStr = zslGetNodeElement(znode);
+        zentry = dictGetKey(de);
+        keyStr = zentry->ele;
     } else {
         keyStr = dictGetKey(de);
     }
@@ -1735,7 +1735,7 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
 
     } else if (o->type == OBJ_ZSET) {
         char buf[MAX_LONG_DOUBLE_CHARS];
-        int len = ld2string(buf, sizeof(buf), znode->score, LD_STR_AUTO);
+        int len = ld2string(buf, sizeof(buf), zentry->score, LD_STR_AUTO);
         key = sdsdup(keyStr);
         val = sdsnewlen(buf, len);
     } else {
