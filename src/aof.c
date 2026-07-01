@@ -2050,7 +2050,7 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
         dictInitIterator(&di, zs->dict);
         while((de = dictNext(&di)) != NULL) {
             zskiplistNode *znode = dictGetKey(de);
-            sds ele = zslGetNodeElement(znode);
+            sds ele = zsetNodeMemberDup(o, znode);
             double score = znode->score;
 
             if (count == 0) {
@@ -2061,6 +2061,7 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
                     !rioWriteBulkString(r,"ZADD",4) ||
                     !rioWriteBulkObject(r,key)) 
                 {
+                    sdsfree(ele);
                     dictResetIterator(&di);
                     return 0;
                 }
@@ -2068,9 +2069,11 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
             if (!rioWriteBulkDouble(r,score) ||
                 !rioWriteBulkString(r,ele,sdslen(ele)))
             {
+                sdsfree(ele);
                 dictResetIterator(&di);
                 return 0;
             }
+            sdsfree(ele);
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }

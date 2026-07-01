@@ -467,8 +467,9 @@ void sortCommandGeneric(client *c, int readonly) {
 
         while(rangelen--) {
             serverAssertWithInfo(c,sortval,ln != NULL);
-            sdsele = zslGetNodeElement(ln);
+            sdsele = zsetNodeMemberDup(sortval, ln);
             vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
+            sdsfree(sdsele);
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
@@ -487,8 +488,9 @@ void sortCommandGeneric(client *c, int readonly) {
             oldsize = kvobjAllocSize(sortval);
         dictInitIterator(&di, set);
         while((setele = dictNext(&di)) != NULL) {
-            sdsele = zslGetNodeElement(dictGetKey(setele));
+            sdsele = zsetNodeMemberDup(sortval, dictGetKey(setele));
             vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
+            sdsfree(sdsele);
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;

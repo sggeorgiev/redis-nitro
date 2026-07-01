@@ -138,6 +138,134 @@ const void *zslGetNodeElementForDict(const void *node) {
     return zslGetNodeElement((zskiplistNode*)node);
 }
 
+/* --------------------------------------------------------------------------
+ * HOPE member compression helpers.
+ *
+ * When a skiplist-encoded zset has an encoder (zs->enc != NULL) the member sds
+ * embedded in each node - which is also used as the dict key - stores the
+ * HOPE-compressed form of the member instead of the plaintext. HOPE is
+ * order-preserving, so the skiplist ordering, dict equality and lex-range
+ * comparisons all remain correct while operating directly on the compressed
+ * bytes; only paths that hand a member back to the outside world decode it.
+ *
+ * The per-node zskiplistNodeInfo "reserved" byte records what is needed to
+ * recover the exact plaintext: the number of trailing pad bits (low 3 bits)
+ * plus a flag for an odd original length (bit 3, since the Double-char scheme
+ * pads odd-length inputs with a trailing zero byte).
+ * -------------------------------------------------------------------------- */
+
+#define ZSET_HOPE_PAD_MASK  0x07
+#define ZSET_HOPE_ODD_FLAG  0x08
+
+/* Encode 'member' with the zset's encoder. Returns a newly allocated sds with
+ * the compressed bytes and stores the packed pad/odd info in *reserved. Returns
+ * NULL if the zset has no encoder (the caller should then store 'member' as is
+ * with a reserved byte of 0). */
+static sds zsetTryEncodeMember(const zset *zs, sds member, uint8_t *reserved) {
+    if (reserved) *reserved = 0;
+    if (zs->enc == NULL) return NULL;
+    size_t mlen = sdslen(member);
+    if (mlen == 0) return sdsempty();
+
+    size_t cap = mlen * 4 + 64; /* safe upper bound, see hope.h */
+    uint8_t *buf = zmalloc(cap);
+    int bits = hopeEncode(zs->enc, member, mlen, buf);
+    size_t bytes = (size_t)((bits + 7) / 8);
+    uint8_t pad = (uint8_t)(bytes * 8 - (size_t)bits);
+    if (reserved)
+        *reserved = (uint8_t)((pad & ZSET_HOPE_PAD_MASK) |
+                              ((mlen & 1) ? ZSET_HOPE_ODD_FLAG : 0));
+    sds out = sdsnewlen(buf, bytes);
+    zfree(buf);
+    return out;
+}
+
+/* Decode compressed bytes produced by zsetTryEncodeMember() back into a freshly
+ * allocated plaintext sds. */
+static sds zsetDecodeCompressed(const hopeEncoder *enc, const char *cbytes,
+                                size_t clen, uint8_t reserved) {
+    if (clen == 0) return sdsempty();
+    uint8_t pad = reserved & ZSET_HOPE_PAD_MASK;
+    int bits = (int)(clen * 8 - pad);
+    size_t cap = clen * 16 + 16; /* each symbol expands to <= 2 bytes */
+    uint8_t *out = zmalloc(cap);
+    int dlen = hopeDecode(enc, (const uint8_t*)cbytes, clen, bits, out);
+    if ((reserved & ZSET_HOPE_ODD_FLAG) && dlen > 0) dlen--; /* strip pad byte */
+    sds res = sdsnewlen(out, dlen);
+    zfree(out);
+    return res;
+}
+
+/* Return a newly allocated plaintext copy of a skiplist node's member,
+ * whether or not the zset is compressed. */
+static sds zsetNodeMemberDecodeDup(const zset *zs, const zskiplistNode *node) {
+    sds cele = zslGetNodeElement(node);
+    if (zs->enc == NULL) return sdsdup(cele);
+    uint8_t reserved = zslGetNodeInfo(node)->reserved;
+    return zsetDecodeCompressed(zs->enc, cele, sdslen(cele), reserved);
+}
+
+/* Public wrapper (used by rdb.c, aof.c, debug.c, geo.c, sort.c, db.c,
+ * module.c): newly allocated plaintext copy of a skiplist zset node's member.
+ * Caller owns the result. */
+sds zsetNodeMemberDup(const robj *zobj, const zskiplistNode *node) {
+    serverAssert(zobj->encoding == OBJ_ENCODING_SKIPLIST);
+    return zsetNodeMemberDecodeDup((const zset*)zobj->ptr, node);
+}
+
+/* Borrow-or-decode a node's member for immediate consumption (e.g. writing it
+ * straight into a reply that copies the bytes). When the zset is not
+ * compressed the embedded sds is returned directly with no allocation. When
+ * compressed, the member is decoded into a reusable buffer owned by this
+ * module; the returned pointer is valid only until the next call and must
+ * never be freed by the caller. Only safe when a single decoded member is live
+ * at a time. */
+static sds zsetNodeMemberScratch(const zset *zs, const zskiplistNode *node) {
+    static sds pending = NULL;
+    if (pending) { sdsfree(pending); pending = NULL; }
+    if (zs->enc == NULL) return zslGetNodeElement(node);
+    pending = zsetNodeMemberDecodeDup(zs, node);
+    return pending;
+}
+
+/* Encode the finite bounds of a lex range in place so that comparisons against
+ * stored (compressed) members are order-correct. No-op when the zset has no
+ * encoder. The +inf/-inf sentinels are left untouched. */
+static void zsetLexRangeEncodeSpec(const zset *zs, zlexrangespec *spec) {
+    if (zs->enc == NULL) return;
+    if (spec->min != shared.minstring && spec->min != shared.maxstring) {
+        sds c = zsetTryEncodeMember(zs, spec->min, NULL);
+        if (c) { sdsfree(spec->min); spec->min = c; }
+    }
+    if (spec->max != shared.minstring && spec->max != shared.maxstring) {
+        sds c = zsetTryEncodeMember(zs, spec->max, NULL);
+        if (c) { sdsfree(spec->max); spec->max = c; }
+    }
+}
+
+/* Public wrapper for module.c: encode lex-range bounds for a skiplist zset. */
+void zsetLexRangeEncode(robj *zobj, zlexrangespec *spec) {
+    if (zobj->encoding != OBJ_ENCODING_SKIPLIST) return;
+    zsetLexRangeEncodeSpec((const zset*)zobj->ptr, spec);
+}
+
+/* Train a HOPE encoder for a zset from a set of plaintext members. Returns the
+ * encoder, or NULL when compression is disabled, there are no members, or
+ * training fails (the caller then stores members uncompressed). */
+static hopeEncoder *zsetTrainEncoder(sds *members, size_t n) {
+    if (!server.zset_hope_compression || n == 0) return NULL;
+    hopeEncoder *e = hopeCreate();
+    if (!e) return NULL;
+    const char **keys = zmalloc(sizeof(char*) * n);
+    size_t *lens = zmalloc(sizeof(size_t) * n);
+    for (size_t i = 0; i < n; i++) { keys[i] = members[i]; lens[i] = sdslen(members[i]); }
+    int rc = hopeBuild(e, keys, lens, n);
+    zfree(keys);
+    zfree(lens);
+    if (rc != 0) { hopeFree(e); return NULL; }
+    return e;
+}
+
 /* Create a skiplist header node with ZSKIPLIST_MAXLEVEL levels */
 static zskiplistNode *zslCreateHeaderNode(zskiplist *zsl) {
     size_t usable;
@@ -1461,16 +1589,23 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         zs = zmalloc(sizeof(*zs));
         zs->dict = dictCreate(&zsetDictType);
         zs->zsl = zslCreate();
+        zs->enc = NULL;
 
         /* Presize the dict to avoid rehashing */
         dictExpand(zs->dict, cap);
+
+        /* First pass: materialize all members (and scores) so that we can
+         * train a per-zset HOPE encoder before inserting them compressed. */
+        unsigned long nele = zzlLength(zl);
+        sds *members = nele ? zmalloc(sizeof(sds) * nele) : NULL;
+        double *scores = nele ? zmalloc(sizeof(double) * nele) : NULL;
+        unsigned long collected = 0;
 
         eptr = lpSeek(zl,0);
         if (eptr != NULL) {
             sptr = lpNext(zl,eptr);
             serverAssertWithInfo(NULL,zobj,sptr != NULL);
         }
-
         while (eptr != NULL) {
             score = zzlGetScore(sptr);
             vstr = lpGetValue(eptr,&vlen,&vlong);
@@ -1478,12 +1613,27 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
                 ele = sdsfromlonglong(vlong);
             else
                 ele = sdsnewlen((char*)vstr,vlen);
-
-            node = zslInsert(zs->zsl,score,ele);
-            serverAssert(dictAdd(zs->dict, node, NULL) == DICT_OK);
-            sdsfree(ele); /* zslInsert copied it, we can free our copy */
+            members[collected] = ele;
+            scores[collected] = score;
+            collected++;
             zzlNext(zl,&eptr,&sptr);
         }
+
+        /* Train the encoder (no-op when compression is disabled or empty). */
+        zs->enc = zsetTrainEncoder(members, collected);
+
+        /* Second pass: insert every member, compressing it when we have an
+         * encoder. */
+        for (unsigned long i = 0; i < collected; i++) {
+            uint8_t reserved;
+            sds cele = zsetTryEncodeMember(zs, members[i], &reserved);
+            node = zslInsert(zs->zsl, scores[i], cele ? cele : members[i]);
+            if (cele) { zslGetNodeInfo(node)->reserved = reserved; sdsfree(cele); }
+            serverAssert(dictAdd(zs->dict, node, NULL) == DICT_OK);
+            sdsfree(members[i]); /* zslInsert copied it, we can free our copy */
+        }
+        zfree(members);
+        zfree(scores);
 
         zfree(zobj->ptr);
         zobj->ptr = zs;
@@ -1502,12 +1652,19 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         zfree(zs->zsl->header);
 
         while (node) {
-            zl = zzlInsertAt(zl,NULL,zslGetNodeElement(node),node->score);
+            if (zs->enc) {
+                sds ele = zsetNodeMemberDecodeDup(zs, node);
+                zl = zzlInsertAt(zl,NULL,ele,node->score);
+                sdsfree(ele);
+            } else {
+                zl = zzlInsertAt(zl,NULL,zslGetNodeElement(node),node->score);
+            }
             next = node->level[0].forward;
             zslFreeNode(zs->zsl, node);
             node = next;
         }
 
+        hopeFree(zs->enc);
         zfree(zs->zsl);
         zfree(zs);
         zobj->ptr = zl;
@@ -1543,7 +1700,9 @@ int zsetScore(robj *zobj, sds member, double *score) {
         if (zzlFind(zobj->ptr, member, score) == NULL) return C_ERR;
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        dictEntry *de = dictFind(zs->dict, member);
+        sds cmember = zsetTryEncodeMember(zs, member, NULL);
+        dictEntry *de = dictFind(zs->dict, cmember ? cmember : member);
+        if (cmember) sdsfree(cmember);
         if (de == NULL) return C_ERR;
         zskiplistNode *znode = dictGetKey(de);
         *score = znode->score;
@@ -1677,9 +1836,28 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
         dictEntry *de;
         dictEntryLink bucket, link;
 
+        /* First member of a fresh skiplist zset: train an encoder on it so the
+         * whole set is stored compressed from the start. We only do this when
+         * the skiplist is empty, to guarantee a zset is never a mix of
+         * compressed and plaintext members. */
+        if (zs->enc == NULL && server.zset_hope_compression &&
+            zs->zsl->length == 0)
+        {
+            const char *k = ele;
+            size_t kl = sdslen(ele);
+            hopeEncoder *e = hopeCreate();
+            if (e && hopeBuild(e, &k, &kl, 1) == 0) zs->enc = e;
+            else hopeFree(e);
+        }
+
+        /* Encode the member for storage/lookup (NULL when uncompressed). */
+        uint8_t reserved = 0;
+        sds cele = zsetTryEncodeMember(zs, ele, &reserved);
+        sds key = cele ? cele : ele;
+
         /* Use dictFindLink to find the element and get the bucket for potential insertion.
          * This avoids a second lookup in dictAdd() if the element doesn't exist. */
-        link = dictFindLink(zs->dict, ele, &bucket);
+        link = dictFindLink(zs->dict, key, &bucket);
 
         if (link != NULL) {
             /* Element exists - get the dictEntry from the link */
@@ -1687,6 +1865,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             /* NX? Return, same element already exists. */
             if (nx) {
+                if (cele) sdsfree(cele);
                 *out_flags |= ZADD_OUT_NOP;
                 return 1;
             }
@@ -1699,6 +1878,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             if (incr) {
                 score += curscore;
                 if (isnan(score)) {
+                    if (cele) sdsfree(cele);
                     *out_flags |= ZADD_OUT_NAN;
                     return 0;
                 }
@@ -1706,6 +1886,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             /* GT/LT? Only update if score is greater/less than current. */
             if ((lt && score >= curscore) || (gt && score <= curscore)) {
+                if (cele) sdsfree(cele);
                 *out_flags |= ZADD_OUT_NOP;
                 return 1;
             }
@@ -1720,18 +1901,22 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
                  * need to update the dict - the node pointer stays the same. */
                 *out_flags |= ZADD_OUT_UPDATED;
             }
+            if (cele) sdsfree(cele);
             return 1;
         } else if (!xx) {
             /* Element doesn't exist - create node with embedded sds and add to skiplist */
-            znode = zslInsert(zs->zsl, score, ele);
+            znode = zslInsert(zs->zsl, score, key);
+            if (cele) zslGetNodeInfo(znode)->reserved = reserved;
 
             /* Add node pointer to dict using the bucket we already found */
             dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
 
+            if (cele) sdsfree(cele);
             *out_flags |= ZADD_OUT_ADDED;
             if (newscore) *newscore = score;
             return 1;
         } else {
+            if (cele) sdsfree(cele);
             *out_flags |= ZADD_OUT_NOP;
             return 1;
         }
@@ -1748,7 +1933,9 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 static int zsetRemoveFromSkiplist(zset *zs, sds ele) {
     dictEntry *de;
 
-    de = dictUnlink(zs->dict,ele);
+    sds cele = zsetTryEncodeMember(zs, ele, NULL);
+    de = dictUnlink(zs->dict, cele ? cele : ele);
+    if (cele) sdsfree(cele);
     if (de != NULL) {
         /* Get the node and score in order to delete from the skiplist later. */
         zskiplistNode *znode = dictGetKey(de);
@@ -1841,7 +2028,9 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
         zskiplist *zsl = zs->zsl;
         dictEntry *de;
 
-        de = dictFind(zs->dict,ele);
+        sds cele = zsetTryEncodeMember(zs, ele, NULL);
+        de = dictFind(zs->dict, cele ? cele : ele);
+        if (cele) sdsfree(cele);
         if (de != NULL) {
             zskiplistNode *n = dictGetKey(de);
             rank = zslGetRankByNode(zsl, n);
@@ -1886,6 +2075,9 @@ robj *zsetDup(robj *o) {
         zs = o->ptr;
         new_zs = zobj->ptr;
         dictExpand(new_zs->dict,dictSize(zs->dict));
+        /* Duplicate the encoder so the copied (compressed) member bytes remain
+         * valid and decode identically. */
+        new_zs->enc = hopeDup(zs->enc);
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
         sds ele;
@@ -1896,11 +2088,13 @@ robj *zsetDup(robj *o) {
          * the skiplist): this improves the load process, since the next loaded
          * element will always be the smaller, so adding to the skiplist
          * will always immediately stop at the head, making the insertion
-         * O(1) instead of O(log(N)). */
+         * O(1) instead of O(log(N)). The stored bytes (compressed or not) are
+         * copied verbatim, so we also carry over the per-node reserved byte. */
         ln = zsl->tail;
         while (llen--) {
             ele = zslGetNodeElement(ln);
             zskiplistNode *znode = zslInsert(new_zs->zsl,ln->score,ele);
+            zslGetNodeInfo(znode)->reserved = zslGetNodeInfo(ln)->reserved;
             dictAdd(new_zs->dict, znode, NULL);
             ln = ln->backward;
         }
@@ -1933,7 +2127,7 @@ void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, listpackEntry 
         zset *zs = zsetobj->ptr;
         dictEntry *de = dictGetFairRandomKey(zs->dict);
         zskiplistNode *znode = dictGetKey(de);
-        sds s = zslGetNodeElement(znode);
+        sds s = zsetNodeMemberScratch(zs, znode);
         key->sval = (unsigned char*)s;
         key->slen = sdslen(s);
         if (score) {
@@ -2244,6 +2438,7 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
             deleted = zslDeleteRangeByScore(zs->zsl,&range,zs->dict);
             break;
         case ZRANGE_LEX:
+            zsetLexRangeEncodeSpec(zs, &lexrange);
             deleted = zslDeleteRangeByLex(zs->zsl,&lexrange,zs->dict);
             break;
         }
@@ -2517,7 +2712,15 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             if (it->sl.node == NULL)
                 return 0;
-            val->ele = zslGetNodeElement(it->sl.node);
+            /* Yield the plaintext member. When the source zset is compressed
+             * we decode into an owned sds and flag it dirty so it is freed on
+             * the next iteration / by zuiDiscardDirtyValue(). */
+            if (it->sl.zs->enc) {
+                val->ele = zsetNodeMemberDecodeDup(it->sl.zs, it->sl.node);
+                val->flags |= OPVAL_DIRTY_SDS;
+            } else {
+                val->ele = zslGetNodeElement(it->sl.node);
+            }
             val->score = it->sl.node->score;
 
             /* Move to next element. (going backwards, see zuiInitIterator) */
@@ -2620,7 +2823,10 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = op->subject->ptr;
             dictEntry *de;
-            if ((de = dictFind(zs->dict,val->ele)) != NULL) {
+            sds cele = zsetTryEncodeMember(zs, val->ele, NULL);
+            de = dictFind(zs->dict, cele ? cele : val->ele);
+            if (cele) sdsfree(cele);
+            if (de != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
                 *score = znode->score;
                 return 1;
@@ -3490,7 +3696,7 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
 
         while(rangelen--) {
             serverAssertWithInfo(c,zobj,ln != NULL);
-            sds ele = zslGetNodeElement(ln);
+            sds ele = zsetNodeMemberScratch(zs, ln);
             handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
             ln = reverse ? ln->backward : ln->level[0].forward;
         }
@@ -3612,7 +3818,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
             }
 
             rangelen++;
-            sds ele = zslGetNodeElement(ln);
+            sds ele = zsetNodeMemberScratch(zs, ln);
 			handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
 
             /* Move to next node */
@@ -3772,6 +3978,9 @@ void zlexcountCommand(client *c) {
         zskiplistNode *zn;
         unsigned long rank;
 
+        /* Encode the finite bounds so comparisons run on the stored form. */
+        zsetLexRangeEncodeSpec(zs, &range);
+
         /* Find first element in range and get its rank */
         zn = zslNthInLexRange(zsl, &range, 0, &rank);
 
@@ -3870,6 +4079,9 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
 
+        /* Encode the finite bounds so comparisons run on the stored form. */
+        zsetLexRangeEncodeSpec(zs, range);
+
         /* If reversed, get the last node in range as starting point. */
         if (reverse) {
             ln = zslNthInLexRange(zsl,range,-offset-1,NULL);
@@ -3886,7 +4098,7 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
             }
 
             rangelen++;
-            sds ele = zslGetNodeElement(ln);
+            sds ele = zsetNodeMemberScratch(zs, ln);
 			handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
 
             /* Move to next node */
@@ -4321,7 +4533,7 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
 
             /* There must be an element in the sorted set. */
             serverAssertWithInfo(c,zobj,zln != NULL);
-            ele = sdsdup(zslGetNodeElement(zln));
+            ele = zsetNodeMemberDecodeDup(zs, zln);
             score = zln->score;
         } else {
             serverPanic("Unknown sorted set encoding");
@@ -4543,7 +4755,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
             while (count--) {
                 dictEntry *de = dictGetFairRandomKey(zs->dict);
                 zskiplistNode *znode = dictGetKey(de);
-                sds key = zslGetNodeElement(znode);
+                sds key = zsetNodeMemberScratch(zs, znode);
                 if (withscores && c->resp > 2)
                     addReplyArrayLen(c,2);
                 addReplyBulkCBuffer(c, key, sdslen(key));

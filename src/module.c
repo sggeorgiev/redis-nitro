@@ -5438,6 +5438,10 @@ int zsetInitLexRange(RedisModuleKey *key, RedisModuleString *min, RedisModuleStr
     zlexrangespec *zlrs = &key->u.zset.lrs;
     if (zslParseLexRange(min, max, zlrs) == C_ERR) return REDISMODULE_ERR;
 
+    /* For a compressed skiplist zset, encode the finite bounds so comparisons
+     * against the stored (compressed) members remain order-correct. */
+    zsetLexRangeEncode(key->kv, zlrs);
+
     /* Set the range type to lex only after successfully parsing the range,
      * otherwise we don't want the zlexrangespec to be freed. */
     key->u.zset.type = REDISMODULE_ZSET_RANGE_LEX;
@@ -5500,8 +5504,9 @@ RedisModuleString *RM_ZsetRangeCurrentElement(RedisModuleKey *key, double *score
     } else if (key->kv->encoding == OBJ_ENCODING_SKIPLIST) {
         zskiplistNode *ln = key->u.zset.current;
         if (score) *score = ln->score;
-        sds ele = zslGetNodeElement(ln);
+        sds ele = zsetNodeMemberDup(key->kv, ln);
         str = createStringObject(ele,sdslen(ele));
+        sdsfree(ele);
     } else {
         serverPanic("Unsupported zset encoding");
     }
@@ -12292,8 +12297,9 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
         value = createStringObject(val, sdslen(val));
     } else if (kv->type == OBJ_ZSET) {
         zskiplistNode *znode = (zskiplistNode *) key;
-        sds fieldStr = zslGetNodeElement(znode);
+        sds fieldStr = zsetNodeMemberDup(kv, znode);
         field = createStringObject(fieldStr, sdslen(fieldStr));
+        sdsfree(fieldStr);
         value = createStringObjectFromLongDouble(znode->score, 0);
     }
     

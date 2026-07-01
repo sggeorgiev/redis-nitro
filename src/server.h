@@ -64,6 +64,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "quicklist.h"  /* Lists are encoded as linked lists of
                            N-elements flat arrays */
 #include "rax.h"     /* Radix tree */
+#include "hope.h"    /* HOPE order-preserving encoder (zset member compression) */
 #include "connection.h" /* Connection abstraction */
 #include "eventnotifier.h" /* Event notification */
 #include "memory_prefetch.h"
@@ -1783,6 +1784,11 @@ typedef struct zskiplist {
 typedef struct zset {
     dict *dict;
     zskiplist *zsl;
+    /* Optional per-zset HOPE order-preserving encoder. When non-NULL, the
+     * member sds embedded in each skiplist node (and used as the dict key)
+     * holds the HOPE-compressed form of the member instead of the plaintext.
+     * NULL means members are stored verbatim (no compression). */
+    hopeEncoder *enc;
 } zset;
 
 typedef struct clientBufferLimitsConfig {
@@ -2490,6 +2496,7 @@ struct redisServer {
     size_t set_max_listpack_value;
     size_t zset_max_listpack_entries;
     size_t zset_max_listpack_value;
+    int zset_hope_compression; /* Compress skiplist zset members with HOPE. */
     size_t hll_sparse_max_bytes;
     size_t stream_node_max_bytes;
     long long stream_node_max_entries;
@@ -3694,6 +3701,8 @@ int zzlLexValueGteMin(unsigned char *p, zlexrangespec *spec);
 int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec);
 int zslLexValueGteMin(sds value, zlexrangespec *spec);
 int zslLexValueLteMax(sds value, zlexrangespec *spec);
+sds zsetNodeMemberDup(const robj *zobj, const zskiplistNode *node);
+void zsetLexRangeEncode(robj *zobj, zlexrangespec *spec);
 
 /* gcra related */
 robj *gcraDup(robj *o);

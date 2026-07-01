@@ -1677,6 +1677,7 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     sds val = NULL;
     void *key = NULL;  /* if OBJ_HASH then key is of type `hfield`. Otherwise, `sds` */
     void *keyStr;
+    sds zsetKey = NULL; /* owned decoded member for zset (freed before return) */
     data->sampled++;
 
     /* o and typename can not have values at the same time. */
@@ -1692,7 +1693,8 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
         keyStr = entryGetField(hashEntry);
     } else if (o->type == OBJ_ZSET) {
         znode = dictGetKey(de);
-        keyStr = zslGetNodeElement(znode);
+        zsetKey = zsetNodeMemberDup(o, znode); /* decode (identity if uncompressed) */
+        keyStr = zsetKey;
     } else {
         keyStr = dictGetKey(de);
     }
@@ -1700,6 +1702,7 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     /* Filter element if it does not match the pattern. */
     if (data->pattern) {
         if (!stringmatchlen(data->pattern, sdslen(data->pattern), keyStr, sdslen(keyStr), 0)) {
+            sdsfree(zsetKey); /* NULL-safe for non-zset */
             return;
         }
     }
@@ -1744,6 +1747,7 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
 
     vecPush(keys, key);
     if (val && !data->no_values) vecPush(keys, val);
+    sdsfree(zsetKey); /* NULL-safe for non-zset; key was already duplicated */
 }
 
 /* Try to parse a SCAN cursor stored at object 'o':

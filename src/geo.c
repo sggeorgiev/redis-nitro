@@ -312,9 +312,9 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
             if (!zslValueLteMax(ln->score, &range))
                 break;
             if (geoWithinShape(shape, ln->score, xy, &distance) == C_OK) {
-                /* Append the new element. */
-                sds ele = zslGetNodeElement(ln);
-                geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ele));
+                /* Append the new element (decoded plaintext, owned by ga). */
+                geoArrayAppend(ga, xy, distance, ln->score,
+                               zsetNodeMemberDup(zobj, ln));
             }
             if (ga->used && limit && ga->used >= limit) break;
             ln = ln->level[0].forward;

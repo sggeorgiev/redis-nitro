@@ -210,13 +210,14 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             dictInitIterator(&di, zs->dict);
             while((de = dictNext(&di)) != NULL) {
                 zskiplistNode *znode = dictGetKey(de);
-                sds sdsele = zslGetNodeElement(znode);
+                sds sdsele = zsetNodeMemberDup(o, znode);
                 const int len = fpconv_dtoa(znode->score, buf);
                 buf[len] = '\0';
                 memset(eledigest,0,20);
                 mixDigest(eledigest,sdsele,sdslen(sdsele));
                 mixDigest(eledigest,buf,strlen(buf));
                 xorDigest(digest,eledigest,20);
+                sdsfree(sdsele);
             }
             dictResetIterator(&di);
         } else {

@@ -1216,12 +1216,14 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
              * O(1) instead of O(log(N)). */
             zskiplistNode *zn = zsl->tail;
             while (zn != NULL) {
-                sds ele = zslGetNodeElement(zn);
+                sds ele = zsetNodeMemberDup(o, zn);
                 if ((n = rdbSaveRawString(rdb,
                     (unsigned char*)ele,sdslen(ele))) == -1)
                 {
+                    sdsfree(ele);
                     return -1;
                 }
+                sdsfree(ele);
                 nwritten += n;
                 if ((n = rdbSaveBinaryDoubleValue(rdb,zn->score)) == -1)
                     return -1;

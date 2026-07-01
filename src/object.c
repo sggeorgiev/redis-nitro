@@ -495,6 +495,7 @@ robj *createZsetObject(void) {
 
     zs->dict = dictCreate(&zsetDictType);
     zs->zsl = zslCreate();
+    zs->enc = NULL;
     o = createObject(OBJ_ZSET,zs);
     o->encoding = OBJ_ENCODING_SKIPLIST;
     return o;
@@ -588,6 +589,7 @@ void freeZsetObject(robj *o) {
         zs = o->ptr;
         dictRelease(zs->dict);
         zslFree(zs->zsl);
+        hopeFree(zs->enc);
         zfree(zs);
         break;
     case OBJ_ENCODING_LISTPACK:
