@@ -148,17 +148,16 @@ const void *zslGetNodeElementForDict(const void *node) {
  * comparisons all remain correct while operating directly on the compressed
  * bytes; only paths that hand a member back to the outside world decode it.
  *
- * The per-node zskiplistNodeInfo "reserved" byte records what is needed to
- * recover the exact plaintext: the number of trailing pad bits (low 3 bits)
- * plus a flag for an odd original length (bit 3, since the Double-char scheme
- * pads odd-length inputs with a trailing zero byte).
+ * The per-node zskiplistNodeInfo "reserved" byte records the number of
+ * trailing pad bits in the last compressed byte (low 3 bits), which is all
+ * that is needed to recover the exact plaintext: the 3-gram scheme is lossless
+ * and reconstructs the original length exactly, so no length flag is required.
  * -------------------------------------------------------------------------- */
 
 #define ZSET_HOPE_PAD_MASK  0x07
-#define ZSET_HOPE_ODD_FLAG  0x08
 
 /* Encode 'member' with the zset's encoder. Returns a newly allocated sds with
- * the compressed bytes and stores the packed pad/odd info in *reserved. Returns
+ * the compressed bytes and stores the packed pad info in *reserved. Returns
  * NULL if the zset has no encoder (the caller should then store 'member' as is
  * with a reserved byte of 0). */
 static sds zsetTryEncodeMember(const zset *zs, sds member, uint8_t *reserved) {
@@ -173,8 +172,7 @@ static sds zsetTryEncodeMember(const zset *zs, sds member, uint8_t *reserved) {
     size_t bytes = (size_t)((bits + 7) / 8);
     uint8_t pad = (uint8_t)(bytes * 8 - (size_t)bits);
     if (reserved)
-        *reserved = (uint8_t)((pad & ZSET_HOPE_PAD_MASK) |
-                              ((mlen & 1) ? ZSET_HOPE_ODD_FLAG : 0));
+        *reserved = (uint8_t)(pad & ZSET_HOPE_PAD_MASK);
     sds out = sdsnewlen(buf, bytes);
     zfree(buf);
     return out;
@@ -187,10 +185,9 @@ static sds zsetDecodeCompressed(const hopeEncoder *enc, const char *cbytes,
     if (clen == 0) return sdsempty();
     uint8_t pad = reserved & ZSET_HOPE_PAD_MASK;
     int bits = (int)(clen * 8 - pad);
-    size_t cap = clen * 16 + 16; /* each symbol expands to <= 2 bytes */
+    size_t cap = clen * 24 + 16; /* each code expands to <= 3 bytes, see hope.h */
     uint8_t *out = zmalloc(cap);
     int dlen = hopeDecode(enc, (const uint8_t*)cbytes, clen, bits, out);
-    if ((reserved & ZSET_HOPE_ODD_FLAG) && dlen > 0) dlen--; /* strip pad byte */
     sds res = sdsnewlen(out, dlen);
     zfree(out);
     return res;
