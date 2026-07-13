@@ -33,6 +33,30 @@ typedef struct idmpProducer {
 /* Dictionary type for IDMP entries - uses IID as key */
 extern dictType idmpDictType;
 
+/* Sequential-read cursor: caches the position of the last entry emitted by a
+ * range read (see streamReplyWithRange()), so that a following forward read
+ * whose start is strictly greater than that entry (the XREAD / XREADGROUP
+ * pattern of "give me entries after the last delivered ID") can resume inside
+ * the macro-node listpack in O(1) instead of re-decoding it from the start.
+ *
+ * Byte offsets are stored instead of pointers: the listpack pointer is
+ * re-fetched from the rax at resume time, so reallocations that don't move
+ * bytes before the cached position (appends, lpShrinkToFit, active defrag
+ * relocations) keep the cursor valid. Any mutation that removes a node or may
+ * shift bytes inside one (XDEL, trimming, a width change of the master entry
+ * count field) must clear 'valid'. */
+typedef struct streamCursor {
+    uint64_t rax_key[2];    /* Rax key of the cached node, i.e. its master
+                               entry ID as a 128 bit big endian number. */
+    streamID last_id;       /* ID of the entry at flags_off: the position can
+                               only serve reads starting strictly after it. */
+    uint64_t master_fields_count; /* Master entry number of fields. */
+    uint32_t master_fields_off;   /* Offset of the first master field. */
+    uint32_t flags_off;     /* Offset of the flags element of the last
+                               emitted entry. */
+    unsigned int valid: 1;
+} streamCursor;
+
 typedef struct stream {
     rax *rax;               /* The radix tree holding the stream. */
     uint64_t length;        /* Current number of elements inside this stream. */
@@ -50,6 +74,7 @@ typedef struct stream {
     rax *idmp_producers;   /* IDMP producers radix tree: pid -> idmpProducer */
     uint64_t iids_added;   /* All time count of entries with IID added. */
     uint64_t iids_duplicates; /* All time count of duplicate IIDs detected. */
+    streamCursor cursor;   /* Sequential-read resume point, see streamCursor. */
 } stream;
 
 /* We define an iterator to iterate stream items in an abstract way, without
@@ -67,6 +92,9 @@ typedef struct streamIterator {
     int entry_flags;                    /* Flags of entry we are emitting. */
     int rev;                /* True if iterating end to start (reverse). */
     int skip_tombstones;    /* True if not emitting tombstone entries. */
+    int save_cursor;        /* True if forward iteration should record each
+                               emitted entry in the stream's sequential-read
+                               cursor (see streamCursor). */
     uint64_t start_key[2];  /* Start key as 128 bit big endian. */
     uint64_t end_key[2];    /* End key as 128 bit big endian. */
     /* Decoded native-endian fields for fast numeric comparison */
