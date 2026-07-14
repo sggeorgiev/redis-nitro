@@ -27,7 +27,7 @@
 
 /* Max pre-allocation for listpack. This is done to avoid abuse of a user
  * setting stream_node_max_bytes to a huge number. */
-#define STREAM_LISTPACK_MAX_PRE_ALLOCATE 4096
+#define STREAM_LISTPACK_MAX_PRE_ALLOCATE 8192
 
 /* Don't let listpacks grow too big, even if the user config allows it.
  * doing so can lead to an overflow (trying to store more than 32bit length
@@ -635,6 +635,11 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
 
     int flags = STREAM_ITEM_FLAG_NONE;
     if (lp == NULL) {
+        /* A new macro-node is created: the cursor node is no longer the tail
+         * (and lpShrinkToFit above may have moved its listpack), so drop it.
+         * This keeps the "valid cursor points into the tail node" invariant
+         * that bounds resume scans (see streamCursor). */
+        s->cursor.valid = 0;
         master_id = id;
         streamEncodeID(rax_key,&id);
         /* Create the listpack having the master entry ID and fields.
@@ -753,8 +758,14 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     s->alloc_size += lpBytes(lp);
 
     /* Insert back into the tree in order to update the listpack pointer. */
-    if (ri.data != lp)
+    if (ri.data != lp) {
+        /* The tail listpack was reallocated: keep the sequential-read cursor
+         * pointing at the new allocation. Its byte offsets are unaffected,
+         * since appends only add bytes at the end (a width change of the
+         * count field already invalidated the cursor above). */
+        if (s->cursor.valid && s->cursor.lp == ri.data) s->cursor.lp = lp;
         raxInsert(s->rax,(unsigned char*)&rax_key,sizeof(rax_key),lp,NULL);
+    }
     s->length++;
     if (s->entries_added < (uint64_t)LLONG_MAX)
         s->entries_added++;
@@ -1335,41 +1346,35 @@ static int streamParseAckDelArgsOrReply(client *c, int start_pos, streamAckDelAr
 }
 
 /* Try to resume a forward iteration from the stream's sequential-read cursor.
- * Must be called right after the "<=" rax seek on the iteration start key,
- * with a non-NULL, non-zero 'start'. Returns 1 if the iterator was primed
- * from the cursor, 0 if the caller should fall back to the normal path (the
- * rax iterator is left positioned by the seek, untouched).
+ * Must be called after the iterator fields are initialized but before any
+ * rax seek, with a non-NULL, non-zero 'start'. Returns 1 if the iterator was
+ * primed from the cursor (no rax seek is needed: it is deferred until the
+ * resumed listpack is exhausted, see deferred_seek), 0 if the caller should
+ * fall back to the normal seek path.
  *
- * The resume is valid when the range starts strictly after the entry the
+ * The resume is valid whenever the range starts strictly after the entry the
  * cursor points at: entries are laid out in ascending ID order, so every
- * entry before the cached position has an ID <= cursor->last_id < start and
- * would be skipped by a full re-scan anyway. */
+ * entry at or before the cached position has an ID <= cursor->last_id <
+ * start and would be skipped by a full re-scan anyway. Entries between
+ * last_id and start (if any) are decoded and discarded by the range check;
+ * since a valid cursor always points into the tail macro-node (see
+ * streamCursor), that scan is bounded by a single node. */
 static int streamIteratorTryResume(streamIterator *si, stream *s, streamID *start) {
     streamCursor *sc = &s->cursor;
     if (!sc->valid) return 0;
     if (streamCompareID(start,&sc->last_id) <= 0) return 0;
-    /* The seek must have landed on the cached node. It can land on a later
-     * node if macro-nodes were appended after the cursor was saved, in which
-     * case the normal path starts decoding that node from its head anyway. */
-    if (si->ri.key_len != sizeof(sc->rax_key) ||
-        memcmp(si->ri.key,sc->rax_key,sizeof(sc->rax_key)) != 0) return 0;
-    /* Consume the seeked node from the rax iterator, so that once this
-     * listpack is exhausted raxNext() will move to the following node. */
-    int found = raxNext(&si->ri);
-    serverAssert(found && si->ri.key_len == sizeof(sc->rax_key));
-    /* Re-fetch the listpack pointer from the rax: appends and defrag may
-     * have reallocated it since the cursor was saved, but the bytes up to
-     * the cached offsets are unchanged. */
-    si->lp = si->ri.data;
-    streamDecodeID(sc->rax_key,&si->master_id);
+    si->lp = sc->lp;
+    si->master_id = sc->master_id;
     si->master_fields_count = sc->master_fields_count;
     si->master_fields_start = si->lp + sc->master_fields_off;
-    /* Position the cursor on the element preceding the cached entry's flags,
-     * since streamIteratorGetID() steps with lpNext() before decoding an
-     * entry. The cached entry itself (ID < start) is decoded again and
-     * discarded by the range check. */
-    si->lp_ele = lpPrev(si->lp,si->lp + sc->flags_off);
-    serverAssert(si->lp_ele != NULL);
+    /* Position the cursor on the lp-count element closing the last emitted
+     * entry: the forward step in streamIteratorGetID() moves past it onto
+     * the next entry's flags, so nothing already delivered is re-decoded. */
+    si->lp_ele = si->lp + sc->end_off;
+    /* The rax iterator is not positioned: remember to seek past the resumed
+     * node if the iteration outlives its listpack. */
+    memcpy(si->resume_key,sc->rax_key,sizeof(si->resume_key));
+    si->deferred_seek = 1;
     return 1;
 }
 
@@ -1424,19 +1429,16 @@ void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamI
     si->lp_ele = NULL; /* Current listpack cursor. */
     si->rev = rev;     /* Direction, if non-zero reversed, from end to start. */
     si->skip_tombstones = 1;    /* By default tombstones aren't emitted. */
-    si->save_cursor = 0;        /* By default the read position isn't saved. */
+    si->deferred_seek = 0;      /* The rax iterator is positioned below. */
 
     /* Seek the correct node in the radix tree. */
     raxStart(&si->ri,s->rax);
     if (!rev) {
         if (start && (start->ms || start->seq)) {
+            if (streamIteratorTryResume(si,s,start)) return;
             raxSeek(&si->ri,"<=",(unsigned char*)si->start_key,
                     sizeof(si->start_key));
-            if (raxEOF(&si->ri)) {
-                raxSeek(&si->ri,"^",NULL,0);
-            } else if (streamIteratorTryResume(si,s,start)) {
-                return;
-            }
+            if (raxEOF(&si->ri)) raxSeek(&si->ri,"^",NULL,0);
         } else {
             raxSeek(&si->ri,"^",NULL,0);
         }
@@ -1466,6 +1468,14 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
          * iteration or the previous listpack was completely iterated.
          * Go to the next node. */
         if (si->lp == NULL || si->lp_ele == NULL) {
+            if (si->deferred_seek) {
+                /* The iteration was resumed from the stream's cursor without
+                 * positioning the rax iterator; now that the resumed node is
+                 * exhausted, seek the following one. */
+                si->deferred_seek = 0;
+                raxSeek(&si->ri,">",(unsigned char*)si->resume_key,
+                        sizeof(si->resume_key));
+            }
             if (!si->rev && !raxNext(&si->ri)) return 0;
             else if (si->rev && !raxPrev(&si->ri)) return 0;
             serverAssert(si->ri.key_len == sizeof(streamID));
@@ -1562,18 +1572,6 @@ int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields) {
                     si->entry_flags = flags;
                     if (flags & STREAM_ITEM_FLAG_SAMEFIELDS)
                         si->master_fields_ptr = si->master_fields_start;
-                    if (si->save_cursor) {
-                        /* Remember this position so that a following read
-                         * starting after this entry can resume here without
-                         * re-scanning the node from its start. */
-                        streamCursor *sc = &si->stream->cursor;
-                        memcpy(sc->rax_key,si->ri.key,sizeof(sc->rax_key));
-                        sc->last_id = *id;
-                        sc->master_fields_count = si->master_fields_count;
-                        sc->master_fields_off = si->master_fields_start - si->lp;
-                        sc->flags_off = si->lp_flags - si->lp;
-                        sc->valid = 1;
-                    }
                     return 1; /* Valid item returned. */
                 }
             } else {
@@ -1632,6 +1630,27 @@ void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsign
     si->lp_ele = lpNext(si->lp,si->lp_ele);
 }
 
+/* Record the iterator's current position into the stream's sequential-read
+ * cursor (see streamCursor), so that a following forward read starting
+ * strictly after the entry 'id' can resume right past it in O(1).
+ *
+ * 'id' is the entry last returned by streamIteratorGetID(), and ALL of its
+ * fields must have been consumed with streamIteratorGetField() already, so
+ * that si->lp_ele points at the lp-count element closing the entry. Reverse
+ * iterations cannot be resumed and are ignored. */
+void streamIteratorSaveCursor(streamIterator *si, streamID *id) {
+    if (si->rev) return;
+    streamCursor *sc = &si->stream->cursor;
+    sc->lp = si->lp;
+    streamEncodeID(sc->rax_key,&si->master_id);
+    sc->master_id = si->master_id;
+    sc->last_id = *id;
+    sc->master_fields_count = si->master_fields_count;
+    sc->master_fields_off = si->master_fields_start - si->lp;
+    sc->end_off = si->lp_ele - si->lp;
+    sc->valid = 1;
+}
+
 /* Remove the current entry from the stream: can be called after the
  * GetID() API or after any GetField() call, however we need to iterate
  * a valid entry while calling this function. Moreover the function
@@ -1652,6 +1671,13 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
      * it entirely), so any cached read position into it becomes stale. */
     s->cursor.valid = 0;
 
+    /* The rax key of the current node. si->ri.key cannot be used: on a
+     * cursor-resumed iteration the rax seek is deferred (see
+     * streamIteratorTryResume()) and the rax iterator may not be positioned.
+     * The master ID is the decoded node key on every path. */
+    unsigned char node_key[sizeof(streamID)];
+    streamEncodeID(node_key,&si->master_id);
+
     /* We do not really delete the entry here. Instead we mark it as
      * deleted by flagging it, and also incrementing the count of the
      * deleted entries in the listpack header.
@@ -1670,7 +1696,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
          * node. */
         s->alloc_size -= oldsize;
         lpFree(lp);
-        raxRemove(s->rax,si->ri.key,si->ri.key_len,NULL);
+        raxRemove(s->rax,node_key,sizeof(node_key),NULL);
     } else {
         /* In the base case we alter the counters of valid/deleted entries. */
         lp = lpReplaceInteger(lp,&p,aux-1);
@@ -1682,7 +1708,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 
         /* Update the listpack with the new pointer. */
         if (si->lp != lp)
-            raxInsert(s->rax,si->ri.key,si->ri.key_len,lp,NULL);
+            raxInsert(s->rax,node_key,sizeof(node_key),lp,NULL);
     }
 
     /* Update the number of entries counter. */
@@ -2269,10 +2295,6 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
     if (!(flags & STREAM_RWR_RAWENTRIES) && !arraylen_ptr)
         arraylen_ptr = addReplyDeferredLen(c);
     streamIteratorStart(&si,s,start,end,rev);
-    /* Range reads are typically sequential (XREAD / XREADGROUP asking for
-     * entries after the last delivered ID), so record the position of each
-     * emitted entry to let the next read resume in O(1). */
-    si.save_cursor = 1;
     while (streamIteratorGetID(&si,&id,&numfields)) {
         /* Break before delivering the entry so it is neither sent nor added to
          * the consumer's PEL. */
@@ -2322,6 +2344,12 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
             addReplyBulkCBuffer(c,key,key_len);
             addReplyBulkCBuffer(c,value,value_len);
         }
+
+        /* Range reads are typically sequential (XREAD / XREADGROUP asking
+         * for entries after the last delivered ID), so record the position
+         * past this fully consumed entry to let the next read resume there
+         * in O(1). */
+        streamIteratorSaveCursor(&si,&id);
 
         if (min_idle_time != -1) {
             /* For new entries idle time and delivery count is 0. */

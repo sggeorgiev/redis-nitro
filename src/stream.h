@@ -33,27 +33,35 @@ typedef struct idmpProducer {
 /* Dictionary type for IDMP entries - uses IID as key */
 extern dictType idmpDictType;
 
-/* Sequential-read cursor: caches the position of the last entry emitted by a
- * range read (see streamReplyWithRange()), so that a following forward read
- * whose start is strictly greater than that entry (the XREAD / XREADGROUP
- * pattern of "give me entries after the last delivered ID") can resume inside
- * the macro-node listpack in O(1) instead of re-decoding it from the start.
+/* Sequential-read cursor: caches the position right after the last entry
+ * emitted by a range read (see streamReplyWithRange()), so that a following
+ * forward read whose start is strictly greater than that entry (the XREAD /
+ * XREADGROUP pattern of "give me entries after the last delivered ID") can
+ * resume there in O(1): no rax seek and no re-decoding of already delivered
+ * entries.
  *
- * Byte offsets are stored instead of pointers: the listpack pointer is
- * re-fetched from the rax at resume time, so reallocations that don't move
- * bytes before the cached position (appends, lpShrinkToFit, active defrag
- * relocations) keep the cursor valid. Any mutation that removes a node or may
- * shift bytes inside one (XDEL, trimming, a width change of the master entry
- * count field) must clear 'valid'. */
+ * A valid cursor always points into the stream's tail macro-node: creating a
+ * new macro-node clears 'valid'. This keeps the resume scan bounded by one
+ * node and lets streamAppendItem() keep 'lp' in sync when appends reallocate
+ * the tail listpack (offsets are unaffected by appends). Any other mutation
+ * that may move a node's listpack or shift bytes inside it (XDEL, trimming,
+ * active defrag, a width change of the master entry count field) must clear
+ * 'valid'. */
 typedef struct streamCursor {
+    unsigned char *lp;      /* Listpack of the cached (tail) node. */
     uint64_t rax_key[2];    /* Rax key of the cached node, i.e. its master
-                               entry ID as a 128 bit big endian number. */
-    streamID last_id;       /* ID of the entry at flags_off: the position can
-                               only serve reads starting strictly after it. */
+                               entry ID as a 128 bit big endian number. Used
+                               to seek the following node once the cached
+                               listpack is exhausted. */
+    streamID master_id;     /* Decoded master entry ID of the cached node. */
+    streamID last_id;       /* ID of the entry closed by end_off: the cursor
+                               can only serve reads starting strictly after
+                               it. */
     uint64_t master_fields_count; /* Master entry number of fields. */
     uint32_t master_fields_off;   /* Offset of the first master field. */
-    uint32_t flags_off;     /* Offset of the flags element of the last
-                               emitted entry. */
+    uint32_t end_off;       /* Offset of the lp-count element closing the
+                               last emitted entry: iteration resumes right
+                               after it. */
     unsigned int valid: 1;
 } streamCursor;
 
@@ -92,9 +100,13 @@ typedef struct streamIterator {
     int entry_flags;                    /* Flags of entry we are emitting. */
     int rev;                /* True if iterating end to start (reverse). */
     int skip_tombstones;    /* True if not emitting tombstone entries. */
-    int save_cursor;        /* True if forward iteration should record each
-                               emitted entry in the stream's sequential-read
-                               cursor (see streamCursor). */
+    int deferred_seek;      /* True if the iteration was resumed from the
+                               stream's sequential-read cursor and the rax
+                               iterator is not positioned yet: it must be
+                               seeked past resume_key before leaving the
+                               resumed listpack (see streamCursor). */
+    uint64_t resume_key[2]; /* Rax key of the resumed node (big endian),
+                               only meaningful when deferred_seek is set. */
     uint64_t start_key[2];  /* Start key as 128 bit big endian. */
     uint64_t end_key[2];    /* End key as 128 bit big endian. */
     /* Decoded native-endian fields for fast numeric comparison */
@@ -224,6 +236,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args);
 void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamID *end, int rev);
 int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields);
 void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsigned char **valueptr, int64_t *fieldlen, int64_t *valuelen);
+void streamIteratorSaveCursor(streamIterator *si, streamID *id);
 void streamIteratorRemoveEntry(streamIterator *si, streamID *current);
 void streamIteratorStop(streamIterator *si);
 streamCG *streamLookupCG(stream *s, sds groupname);

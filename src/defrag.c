@@ -800,6 +800,9 @@ int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) 
     serverAssert(ob->type == OBJ_STREAM && ob->encoding == OBJ_ENCODING_STREAM);
 
     stream *s = ob->ptr;
+    /* Node listpacks may be relocated below, invalidating the raw pointer
+     * cached in the stream's sequential-read cursor. */
+    s->cursor.valid = 0;
     raxStart(&ri,s->rax);
     if (*cursor == 0) {
         /* if cursor is 0, we start new iteration */
@@ -1010,6 +1013,10 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
     /* handle the main struct */
     if ((news = activeDefragAlloc(s)))
         ob->ptr = s = news;
+
+    /* Node listpacks may be relocated below, invalidating the raw pointer
+     * cached in the stream's sequential-read cursor. */
+    s->cursor.valid = 0;
 
     /* Update rax back-pointer to new stream */
     s->rax->alloc_size = &s->alloc_size;
