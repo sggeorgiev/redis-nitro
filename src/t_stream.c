@@ -27,7 +27,7 @@
 
 /* Max pre-allocation for listpack. This is done to avoid abuse of a user
  * setting stream_node_max_bytes to a huge number. */
-#define STREAM_LISTPACK_MAX_PRE_ALLOCATE 8192
+#define STREAM_LISTPACK_MAX_PRE_ALLOCATE 4096
 
 /* Don't let listpacks grow too big, even if the user config allows it.
  * doing so can lead to an overflow (trying to store more than 32bit length
