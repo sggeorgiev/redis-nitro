@@ -2265,21 +2265,18 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
             unsigned char buf[sizeof(streamID)];
             streamEncodeID(buf,&id);
 
-            /* Try to add a new NACK. Most of the time this will work and
-             * will not require extra lookups. We'll fix the problem later
-             * if we find that there is already an entry for this ID. */
-            streamNACK *nack = streamCreateNACK(s, consumer, &id);
-            int group_inserted =
-                raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+            /* Find-or-insert the NACK in a single rax walk: raxFindLink
+             * records the stop position so raxInsertAt can commit without
+             * re-walking the tree. Most of the time the entry is new; if it
+             * already exists we reassign it to the new consumer. */
+            void *result = NULL;
+            raxNodeLink link;
+            int found = raxFindLink(group->pel,buf,sizeof(buf),&result,&link);
+            streamNACK *nack;
 
-            /* Now we can check if the entry was already busy, and
-             * in that case reassign the entry to the new consumer,
+            /* If the entry was already busy, reassign it to the new consumer,
              * or update it if the consumer is the same as before. */
-            if (group_inserted == 0) {
-                streamFreeNACK(s,nack);
-                void *result;
-                int found = raxFind(group->pel,buf,sizeof(buf),&result);
-                serverAssert(found);
+            if (found) {
                 nack = result;
                 /* Only transfer between consumers if they're different */
                 if (nack->consumer != consumer) {
@@ -2292,7 +2289,11 @@ size_t streamReplyWithRange(client *c, stream *s, streamReplyRangeArgs *args) {
                 /* Update delivery time and reposition in time list */
                 pelListUpdate(group, nack, cmd_time_snapshot);
             } else {
-                /* New NACK - insert into consumer's PEL and time list */
+                /* New NACK - insert into group and consumer PELs and time list.
+                 * We only allocate the NACK now, avoiding a throwaway
+                 * allocation on the reassign path above. */
+                nack = streamCreateNACK(s, consumer, &id);
+                raxInsertAt(group->pel,buf,sizeof(buf),nack,NULL,&link);
                 raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
                 nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
                 pelListInsertAtTail(group, nack);
@@ -3278,12 +3279,12 @@ void streamCleanupEntryCGroupRefs(stream *s, streamID *id) {
         streamNACK *nack;
         streamCG *group = listNodeValue(ln);
         
-        /* Find the message in this consumer group's PEL */
-        serverAssert(raxFind(group->pel, buf, sizeof(buf), (void **)&nack));
+        /* Remove the message from this consumer group's PEL, obtaining the
+         * NACK in one walk instead of a separate find + remove. */
+        serverAssert(raxRemove(group->pel, buf, sizeof(buf), (void **)&nack));
         
-        /* Remove from group and consumer PELs */
+        /* Remove from the consumer PEL as well. */
         pelListUnlink(group, nack);
-        raxRemove(group->pel, buf, sizeof(buf), NULL);
         if (nack->consumer)
             raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
         /* Since we're removing all references from the cgroups_ref, we can directly
@@ -3919,14 +3920,14 @@ void xackCommand(client *c) {
         unsigned char buf[sizeof(streamID)];
         streamEncodeID(buf,&ids[j-3]);
 
-        /* Lookup the ID in the group PEL: it will have a reference to the
-         * NACK structure that will have a reference to the consumer, so that
-         * we are able to remove the entry from both PELs. */
+        /* Remove the ID from the group PEL: on success it yields a reference
+         * to the NACK structure that has a reference to the consumer, so that
+         * we are able to remove the entry from the consumer PEL too. Removing
+         * directly avoids a redundant lookup on the successful path. */
         void *result;
-        if (raxFind(group->pel,buf,sizeof(buf),&result)) {
+        if (raxRemove(group->pel,buf,sizeof(buf),&result)) {
             streamNACK *nack = result;
             pelListUnlink(group, nack);
-            raxRemove(group->pel,buf,sizeof(buf),NULL);
             if (nack->consumer)
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             streamDestroyNACK(kv->ptr, nack, buf);
@@ -4152,14 +4153,14 @@ void xackdelCommand(client *c) {
         unsigned char buf[sizeof(streamID)];
         streamEncodeID(buf,id);
 
-        /* Lookup the ID in the group PEL: it will have a reference to the
-         * NACK structure that will have a reference to the consumer, so that
-         * we are able to remove the entry from both PELs. */
+        /* Remove the ID from the group PEL: on success it yields a reference
+         * to the NACK structure that has a reference to the consumer, so that
+         * we are able to remove the entry from the consumer PEL too. Removing
+         * directly avoids a redundant lookup on the successful path. */
         void *result;
-        if (raxFind(group->pel,buf,sizeof(buf),&result)) {
+        if (raxRemove(group->pel,buf,sizeof(buf),&result)) {
             streamNACK *nack = result;
             pelListUnlink(group, nack);
-            raxRemove(group->pel,buf,sizeof(buf),NULL);
             if (nack->consumer)
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             streamDestroyNACK(s, nack, buf);
@@ -4594,15 +4595,14 @@ void xclaimCommand(client *c) {
         unsigned char buf[sizeof(streamID)];
         streamEncodeID(buf,&id);
 
-        /* Lookup the ID in the group PEL. */
-        void *result = NULL;
-        raxFind(group->pel,buf,sizeof(buf),&result);
-        streamNACK *nack = result;
-
         /* Item must exist for us to transfer it to another consumer. */
         if (!streamEntryExists(s,&id)) {
-            /* Clear this entry from the PEL, it no longer exists */
-            if (nack != NULL) {
+            /* The entry no longer exists: drop it from the group PEL if
+             * present. raxRemove yields the NACK in the same walk, avoiding a
+             * separate lookup on this path. */
+            void *result = NULL;
+            if (raxRemove(group->pel,buf,sizeof(buf),&result)) {
+                streamNACK *nack = result;
                 /* Propagate this change (we are going to delete the NACK). */
                 if (nack->consumer) {
                     streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],c->argv[j],nack);
@@ -4613,15 +4613,23 @@ void xclaimCommand(client *c) {
                     streamPropagateXACK(c->db->id,c->argv[1],c->argv[2],c->argv[j]);
                 }
                 server.dirty++;
-                /* Release the NACK */
+                /* Release the NACK (already removed from the group PEL above). */
                 pelListUnlink(group, nack);
-                raxRemove(group->pel,buf,sizeof(buf),NULL);
                 if (nack->consumer)
                     raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
                 streamDestroyNACK(s, nack, buf);
             }
             continue;
         }
+
+        /* The entry still exists: look it up in the group PEL. It may be
+         * missing (nack == NULL), in which case FORCE below can recreate it.
+         * raxFindLink records the stop position so a FORCE insert can commit
+         * without re-walking the tree. */
+        void *result = NULL;
+        raxNodeLink link;
+        raxFindLink(group->pel,buf,sizeof(buf),&result,&link);
+        streamNACK *nack = result;
 
         /* If FORCE is passed, let's check if at least the entry
          * exists in the Stream. In such case, we'll create a new
@@ -4631,7 +4639,7 @@ void xclaimCommand(client *c) {
         if (force && nack == NULL) {
             /* Create the NACK. */
             nack = streamCreateNACK(s, NULL, &id);
-            raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
+            raxInsertAt(group->pel,buf,sizeof(buf),nack,NULL,&link);
             pelListInsertAtTail(group, nack);
             nack->cgroup_ref_node = streamLinkCGroupToEntry(s, group, buf);
         }
