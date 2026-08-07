@@ -186,23 +186,26 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
         stream *s = obj->ptr;
 
         /* Make a best effort estimate to maintain constant runtime. Every macro
-         * node in the Stream is one allocation. */
-        effort += s->rax->numnodes;
+         * node (listpack) in the Stream is one allocation, plus one per B+tree
+         * page. Pages alone undercount by the leaf fanout (~15-30 keys/page),
+         * which would make large streams look cheap enough to free
+         * synchronously. */
+        effort += bptSize(s->rax) + bptNumNodes(s->rax);
 
         /* Every consumer group is an allocation and so are the entries in its
          * PEL. We use size of the first group's PEL as an estimate for all
          * others. */
-        if (s->cgroups && raxSize(s->cgroups)) {
-            raxIterator ri;
+        if (s->cgroups && bptSize(s->cgroups)) {
+            bptIterator ri;
             streamCG *cg;
-            raxStart(&ri,s->cgroups);
-            raxSeek(&ri,"^",NULL,0);
+            bptStart(&ri,s->cgroups);
+            bptSeek(&ri,"^",NULL,0);
             /* There must be at least one group so the following should always
              * work. */
-            serverAssert(raxNext(&ri));
+            serverAssert(bptNext(&ri));
             cg = ri.data;
-            effort += raxSize(s->cgroups)*(1+raxSize(cg->pel));
-            raxStop(&ri);
+            effort += bptSize(s->cgroups)*(1+bptSize(cg->pel));
+            bptStop(&ri);
         }
         return effort;
     } else if (obj->type == OBJ_MODULE) {

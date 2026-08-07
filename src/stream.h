@@ -2,6 +2,7 @@
 #define STREAM_H
 
 #include "rax.h"
+#include "bptree.h"
 #include "listpack.h"
 #include "dict.h"
 #include "xxhash.h"
@@ -34,20 +35,21 @@ typedef struct idmpProducer {
 extern dictType idmpDictType;
 
 typedef struct stream {
-    rax *rax;               /* The radix tree holding the stream. */
+    bptree *rax;            /* The B+tree holding the stream entries (keyed by
+                               128-bit big-endian stream ID -> listpack). */
     uint64_t length;        /* Current number of elements inside this stream. */
     streamID last_id;       /* Zero if there are yet no items. */
     streamID first_id;      /* The first non-tombstone entry, zero if empty. */
     streamID max_deleted_entry_id;  /* The maximal ID that was deleted. */
     uint64_t entries_added; /* All time count of elements added. */
     size_t alloc_size;      /* Total allocated memory (in bytes) by this stream. */
-    rax *cgroups;           /* Consumer groups dictionary: name -> streamCG */
-    rax *cgroups_ref;       /* Index mapping message IDs to their consumer groups. */
+    bptree *cgroups;        /* Consumer groups dictionary: name -> streamCG */
+    bptree *cgroups_ref;    /* Index mapping message IDs to their consumer groups. */
     streamID min_cgroup_last_id;  /* The minimum ID of consume group. */
     unsigned int min_cgroup_last_id_valid: 1;
     uint64_t idmp_duration; /* IDMP duration in seconds. */
     uint64_t idmp_max_entries; /* Max number of IID for tracking. */
-    rax *idmp_producers;   /* IDMP producers radix tree: pid -> idmpProducer */
+    bptree *idmp_producers;/* IDMP producers B+tree: pid -> idmpProducer */
     uint64_t iids_added;   /* All time count of entries with IID added. */
     uint64_t iids_duplicates; /* All time count of duplicate IIDs detected. */
 } stream;
@@ -74,7 +76,7 @@ typedef struct streamIterator {
     uint64_t start_seq;
     uint64_t end_ms;
     uint64_t end_seq;
-    raxIterator ri;         /* Rax iterator. */
+    bptIterator ri;         /* B+tree iterator over the entries tree. */
     unsigned char *lp;      /* Current listpack. */
     unsigned char *lp_last_ele; /* Previous listpack element position for corruption detection. */
     unsigned char *lp_ele;  /* Current listpack cursor. */
@@ -99,10 +101,10 @@ typedef struct streamCG {
                                group reads. In the real world, the reasoning behind
                                this value is detailed at the top comment of
                                streamEstimateDistanceFromFirstEverEntry(). */
-    rax *pel;               /* Pending entries list. This is a radix tree that
+    bptree *pel;            /* Pending entries list. This is a B+tree that
                                has every message delivered to consumers (without
                                the NOACK option) that was yet not acknowledged
-                               as processed. The key of the radix tree is the
+                               as processed. The key of the tree is the
                                ID as a 64 bit big endian number, while the
                                associated value is a streamNACK structure.*/
     streamNACK *pel_time_head; /* Head of time-ordered doubly-linked list of pending
@@ -115,7 +117,7 @@ typedef struct streamCG {
                                   PEL time-ordered list. NACKed entries occupy
                                   positions from pel_time_head to pel_nack_tail.
                                   NULL if no NACKed entries exist. */
-    rax *consumers;         /* A radix tree representing the consumers by name
+    bptree *consumers;      /* A B+tree representing the consumers by name
                                and their associated representation in the form
                                of streamConsumer structures. */
 } streamCG;
@@ -127,7 +129,7 @@ typedef struct streamConsumer {
     sds name;                   /* Consumer name. This is how the consumer
                                    will be identified in the consumer group
                                    protocol. Case sensitive. */
-    rax *pel;                   /* Consumer specific pending entries list: all
+    bptree *pel;                /* Consumer specific pending entries list: all
                                    the pending messages delivered to this
                                    consumer not yet acknowledged. Keys are
                                    big endian message IDs, while values are

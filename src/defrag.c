@@ -832,58 +832,52 @@ int defragRaxNode(raxNode **noderef, void *privdata) {
 /* returns 0 if no more work needs to be been done, and 1 if time is up and more work is needed. */
 int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) {
     static unsigned char next[sizeof(streamID)];
-    raxIterator ri;
+    bptIterator ri;
     long iterations = 0;
     serverAssert(ob->type == OBJ_STREAM && ob->encoding == OBJ_ENCODING_STREAM);
 
     stream *s = ob->ptr;
-    raxStart(&ri,s->rax);
     if (*cursor == 0) {
-        /* if cursor is 0, we start new iteration */
-        defragRaxNode(&s->rax->head, NULL);
-        /* assign the iterator node callback before the seek, so that the
-         * initial nodes that are processed till the first item are covered */
-        ri.node_cb = defragRaxNode;
-        raxSeek(&ri,"^",NULL,0);
+        /* First call: relocate the whole B+tree spine (header, every page and
+         * every overflow blob) in one pass. Unlike rax -- which relocates one
+         * node per iterator step via a node callback -- bptree has no per-step
+         * node hook, but a stream B+tree holds ~entries/fanout pages, far fewer
+         * objects than the equivalent rax, so a single sweep is cheap. The
+         * time-budgeted loop below then relocates the listpack values. */
+        bptDefrag(&s->rax, activeDefragAlloc);
+        bptStart(&ri,s->rax);
+        bptSeek(&ri,"^",NULL,0);
     } else {
-        /* if cursor is non-zero, we seek to the static 'next'.
-         * Since node_cb is set after seek operation, any node traversed during seek wouldn't
-         * be defragmented. To prevent this, we advance to next node before exiting previous
-         * run, ensuring it gets defragmented instead of being skipped during current seek. */
-        if (!raxSeek(&ri,">=", next, sizeof(next))) {
-            *cursor = 0;
-            raxStop(&ri);
-            return 0;
-        }
-        /* assign the iterator node callback after the seek, so that the
-         * initial nodes that are processed till now aren't covered */
-        ri.node_cb = defragRaxNode;
+        /* Resume from the static 'next' key saved on the previous run. The
+         * spine was already relocated on the first (cursor == 0) call. */
+        bptStart(&ri,s->rax);
+        bptSeek(&ri,">=", next, sizeof(next));
     }
 
     (*cursor)++;
-    while (raxNext(&ri)) {
+    while (bptNext(&ri)) {
         void *newdata = activeDefragAlloc(ri.data);
         if (newdata)
-            raxIteratorSetData(&ri, newdata);
+            bptIteratorSetData(&ri, newdata);
         server.stat_active_defrag_scanned++;
         if (++iterations > 128) {
             if (getMonotonicUs() > endtime) {
                 /* Move to next node. */
-                if (!raxNext(&ri)) {
+                if (!bptNext(&ri)) {
                     /* If we reached the end, we can stop */
                     *cursor = 0;
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return 0;
                 }
                 serverAssert(ri.key_len==sizeof(next));
                 memcpy(next,ri.key,ri.key_len);
-                raxStop(&ri);
+                bptStop(&ri);
                 return 1;
             }
             iterations = 0;
         }
     }
-    raxStop(&ri);
+    bptStop(&ri);
     *cursor = 0;
     return 0;
 }
@@ -918,7 +912,34 @@ void defragRadixTree(rax **raxref, int defrag_data, raxDefragFunction *element_c
     raxStop(&ri);
 }
 
-void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
+/* optional callback used to defrag each bptree element (not the element pointer
+ * itself); returns a new pointer for the element, or NULL to leave it. */
+typedef void *(bptDefragFunction)(bptIterator *it, void *privdata);
+
+/* B+tree analogue of defragRadixTree(), used by the stream cgroup/PEL/consumer/
+ * idmp trees. bptDefrag() relocates the header, every page and every overflow
+ * blob up front (there is no per-node iterator hook as in rax), so the plain
+ * scan below only needs to relocate the per-element values. bptIteratorSetData()
+ * rewrites a payload without bumping the tree version, so the iterator stays
+ * valid across the walk. */
+void defragBptree(bptree **btref, int defrag_data, bptDefragFunction *element_cb, void *element_cb_data) {
+    bptDefrag(btref, activeDefragAlloc);
+    bptIterator it;
+    bptStart(&it, *btref);
+    bptSeek(&it, "^", NULL, 0);
+    while (bptNext(&it)) {
+        void *newdata = NULL;
+        if (element_cb)
+            newdata = element_cb(&it, element_cb_data);
+        if (defrag_data && !newdata)
+            newdata = activeDefragAlloc(it.data);
+        if (newdata)
+            bptIteratorSetData(&it, newdata);
+    }
+    bptStop(&it);
+}
+
+void* defragStreamConsumerPendingEntry(bptIterator *ri, void *privdata) {
     streamConsumer *c = privdata;
     streamNACK *nack = ri->data;
     /* NACKs are already defragged by the CG PEL walk (defragStreamCGPendingEntry).
@@ -929,7 +950,7 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
     return NULL;
 }
 
-void* defragStreamCGPendingEntry(raxIterator *ri, void *privdata) {
+void* defragStreamCGPendingEntry(bptIterator *ri, void *privdata) {
     streamCG *cg = privdata;
     streamNACK *nack = ri->data, *newnack;
     /* Update cgroup_ref_node to the possibly-relocated CG for every NACK.
@@ -942,7 +963,7 @@ void* defragStreamCGPendingEntry(raxIterator *ri, void *privdata) {
         /* If this NACK is owned by a consumer, update the consumer's PEL. */
         if (newnack->consumer) {
             void *prev;
-            raxInsert(newnack->consumer->pel, ri->key, ri->key_len, newnack, &prev);
+            bptInsert(newnack->consumer->pel, ri->key, ri->key_len, newnack, &prev);
             serverAssert(prev == nack);
         }
         if (newnack->pel_prev) {
@@ -962,7 +983,7 @@ void* defragStreamCGPendingEntry(raxIterator *ri, void *privdata) {
     return newnack;
 }
 
-void* defragStreamConsumer(raxIterator *ri, void *privdata) {
+void* defragStreamConsumer(bptIterator *ri, void *privdata) {
     stream *s = privdata;
     streamConsumer *c = ri->data;
     void *newc = activeDefragAlloc(c);
@@ -975,12 +996,12 @@ void* defragStreamConsumer(raxIterator *ri, void *privdata) {
     if (c->pel) {
         /* Update pel back-pointer to new stream */
         c->pel->alloc_size = &s->alloc_size;
-        defragRadixTree(&c->pel, 0, defragStreamConsumerPendingEntry, c);
+        defragBptree(&c->pel, 0, defragStreamConsumerPendingEntry, c);
     }
     return newc; /* returns NULL if c was not defragged */
 }
 
-void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {
+void* defragStreamConsumerGroup(bptIterator *ri, void *privdata) {
     stream *s = privdata;
     streamCG *newcg, *cg = ri->data;
     if ((newcg = activeDefragAlloc(cg)))
@@ -988,12 +1009,12 @@ void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {
     if (cg->pel) {
         /* Update pel back-pointer to new stream */
         cg->pel->alloc_size = &s->alloc_size;
-        defragRadixTree(&cg->pel, 0, defragStreamCGPendingEntry, cg);
+        defragBptree(&cg->pel, 0, defragStreamCGPendingEntry, cg);
     }
     if (cg->consumers) {
         /* Update consumers back-pointer to new stream */
         cg->consumers->alloc_size = &s->alloc_size;
-        defragRadixTree(&cg->consumers, 0, defragStreamConsumer, s);
+        defragBptree(&cg->consumers, 0, defragStreamConsumer, s);
     }
     return cg;
 }
@@ -1029,7 +1050,7 @@ static void defragIdmpProducer(idmpProducer *producer) {
     }
 }
 
-static void* defragIdmpProducerCallback(raxIterator *ri, void *privdata) {
+static void* defragIdmpProducerCallback(bptIterator *ri, void *privdata) {
     UNUSED(privdata);
     idmpProducer *producer = ri->data;
     idmpProducer *newproducer = activeDefragAlloc(producer);
@@ -1048,31 +1069,46 @@ void defragStream(defragKeysCtx *ctx, kvobj *ob) {
     if ((news = activeDefragAlloc(s)))
         ob->ptr = s = news;
 
-    /* Update rax back-pointer to new stream */
+    /* Update entries B+tree back-pointer to new stream */
     s->rax->alloc_size = &s->alloc_size;
-    if (raxSize(s->rax) > server.active_defrag_max_scan_fields) {
-        rax *newrax = activeDefragAlloc(s->rax);
+    if (bptSize(s->rax) > server.active_defrag_max_scan_fields) {
+        /* Relocate just the header now; the pages/blobs and listpack values
+         * are defragged incrementally by scanLaterStreamListpacks(). */
+        bptree *newrax = activeDefragAlloc(s->rax);
         if (newrax)
             s->rax = newrax;
         defragLater(ctx, ob);
-    } else
-        defragRadixTree(&s->rax, 1, NULL, NULL);
+    } else {
+        /* Relocate the whole spine, then the listpack values in place. */
+        bptDefrag(&s->rax, activeDefragAlloc);
+        bptIterator ri;
+        bptStart(&ri, s->rax);
+        bptSeek(&ri, "^", NULL, 0);
+        while (bptNext(&ri)) {
+            void *newdata = activeDefragAlloc(ri.data);
+            if (newdata) bptIteratorSetData(&ri, newdata);
+        }
+        bptStop(&ri);
+    }
 
     if (s->cgroups) {
         /* Update cgroups back-pointer to new stream */
         s->cgroups->alloc_size = &s->alloc_size;
-        defragRadixTree(&s->cgroups, 0, defragStreamConsumerGroup, s);
+        defragBptree(&s->cgroups, 0, defragStreamConsumerGroup, s);
     }
 
     if (s->cgroups_ref) {
         /* Update cgroups_ref back-pointer to new stream */
         s->cgroups_ref->alloc_size = &s->alloc_size;
+        /* Relocate the tree spine only: the values are lists whose nodes are
+         * referenced by nack->cgroup_ref_node, so they must stay in place. */
+        bptDefrag(&s->cgroups_ref, activeDefragAlloc);
     }
 
     if (s->idmp_producers) {
         /* Update idmp_producers back-pointer to new stream */
         s->idmp_producers->alloc_size = &s->alloc_size;
-        defragRadixTree(&s->idmp_producers, 0, defragIdmpProducerCallback, NULL);
+        defragBptree(&s->idmp_producers, 0, defragIdmpProducerCallback, NULL);
     }
 }
 

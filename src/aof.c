@@ -2651,10 +2651,10 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
 
     /* Create all the stream consumer groups. */
     if (s->cgroups) {
-        raxIterator ri;
-        raxStart(&ri,s->cgroups);
-        raxSeek(&ri,"^",NULL,0);
-        while(raxNext(&ri)) {
+        bptIterator ri;
+        bptStart(&ri,s->cgroups);
+        bptSeek(&ri,"^",NULL,0);
+        while(bptNext(&ri)) {
             streamCG *group = ri.data;
             /* Emit the XGROUP CREATE in order to create the group. */
             if (!rioWriteBulkCount(r,'*',7) ||
@@ -2666,49 +2666,49 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
                 !rioWriteBulkString(r,"ENTRIESREAD",11) ||
                 !rioWriteBulkLongLong(r,group->entries_read))
             {
-                raxStop(&ri);
+                bptStop(&ri);
                 return 0;
             }
 
             /* Generate XCLAIMs for each consumer that happens to
              * have pending entries. Empty consumers would be generated with
              * XGROUP CREATECONSUMER. */
-            raxIterator ri_cons;
-            raxStart(&ri_cons,group->consumers);
-            raxSeek(&ri_cons,"^",NULL,0);
-            while(raxNext(&ri_cons)) {
+            bptIterator ri_cons;
+            bptStart(&ri_cons,group->consumers);
+            bptSeek(&ri_cons,"^",NULL,0);
+            while(bptNext(&ri_cons)) {
                 streamConsumer *consumer = ri_cons.data;
                 /* If there are no pending entries, just emit XGROUP CREATECONSUMER */
-                if (raxSize(consumer->pel) == 0) {
+                if (bptSize(consumer->pel) == 0) {
                     if (rioWriteStreamEmptyConsumer(r,key,(char*)ri.key,
                                                     ri.key_len,consumer) == 0)
                     {
-                        raxStop(&ri_cons);
-                        raxStop(&ri);
+                        bptStop(&ri_cons);
+                        bptStop(&ri);
                         return 0;
                     }
                     continue;
                 }
                 /* For the current consumer, iterate all the PEL entries
                  * to emit the XCLAIM protocol. */
-                raxIterator ri_pel;
-                raxStart(&ri_pel,consumer->pel);
-                raxSeek(&ri_pel,"^",NULL,0);
-                while(raxNext(&ri_pel)) {
+                bptIterator ri_pel;
+                bptStart(&ri_pel,consumer->pel);
+                bptSeek(&ri_pel,"^",NULL,0);
+                while(bptNext(&ri_pel)) {
                     streamNACK *nack = ri_pel.data;
                     if (rioWriteStreamPendingEntry(r,key,(char*)ri.key,
                                                    ri.key_len,consumer,
                                                    ri_pel.key,nack) == 0)
                     {
-                        raxStop(&ri_pel);
-                        raxStop(&ri_cons);
-                        raxStop(&ri);
+                        bptStop(&ri_pel);
+                        bptStop(&ri_cons);
+                        bptStop(&ri);
                         return 0;
                     }
                 }
-                raxStop(&ri_pel);
+                bptStop(&ri_pel);
             }
-            raxStop(&ri_cons);
+            bptStop(&ri_cons);
 
             /* Emit XNACK FORCE for NACKed (unowned) entries from the
              * NACK zone of the PEL time-ordered list
@@ -2738,7 +2738,7 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
                                                         ri.key_len,batch_ids,
                                                         batch_count,batch_dc) == 0)
                         {
-                            raxStop(&ri);
+                            bptStop(&ri);
                             return 0;
                         }
                         batch_count = 0;
@@ -2747,7 +2747,7 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
                 }
             }
         }
-        raxStop(&ri);
+        bptStop(&ri);
     }
 
     /* Emit XCFGSET to restore per-stream IDMP configuration if it differs
@@ -2772,22 +2772,22 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
      * xidmprecordCommand() rejects references to missing IDs and would
      * cause AOF replay errors. */
     if (s->idmp_producers) {
-        raxIterator ri_idmp;
-        raxStart(&ri_idmp,s->idmp_producers);
-        raxSeek(&ri_idmp,"^",NULL,0);
-        while(raxNext(&ri_idmp)) {
+        bptIterator ri_idmp;
+        bptStart(&ri_idmp,s->idmp_producers);
+        bptSeek(&ri_idmp,"^",NULL,0);
+        while(bptNext(&ri_idmp)) {
             idmpProducer *producer = ri_idmp.data;
             for (idmpEntry *entry = producer->idmp_head; entry != NULL; entry = entry->next) {
                 if (!streamEntryExists(s, &entry->id)) continue;
                 if (rioWriteStreamIdmpEntry(r,key,(char*)ri_idmp.key,
                                             ri_idmp.key_len,entry) == 0)
                 {
-                    raxStop(&ri_idmp);
+                    bptStop(&ri_idmp);
                     return 0;
                 }
             }
         }
-        raxStop(&ri_idmp);
+        bptStop(&ri_idmp);
     }
 
     return 1;

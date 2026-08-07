@@ -774,22 +774,22 @@ int rdbLoadObjectType(rio *rdb) {
  * we serialized the NACKs as well, but when serializing the local consumer
  * PELs we just add the ID, that will be resolved inside the global PEL to
  * put a reference to the same structure. */
-ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
+ssize_t rdbSaveStreamPEL(rio *rdb, bptree *pel, int nacks) {
     ssize_t n, nwritten = 0;
 
     /* Number of entries in the PEL. */
-    if ((n = rdbSaveLen(rdb,raxSize(pel))) == -1) return -1;
+    if ((n = rdbSaveLen(rdb,bptSize(pel))) == -1) return -1;
     nwritten += n;
 
     /* Save each entry. */
-    raxIterator ri;
-    raxStart(&ri,pel);
-    raxSeek(&ri,"^",NULL,0);
-    while(raxNext(&ri)) {
+    bptIterator ri;
+    bptStart(&ri,pel);
+    bptSeek(&ri,"^",NULL,0);
+    while(bptNext(&ri)) {
         /* We store IDs in raw form as 128 big big endian numbers, like
-         * they are inside the radix tree key. */
+         * they are inside the tree key. */
         if ((n = rdbWriteRaw(rdb,ri.key,sizeof(streamID))) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
@@ -797,12 +797,12 @@ ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
         if (nacks) {
             streamNACK *nack = ri.data;
             if ((n = rdbSaveMillisecondTime(rdb,nack->delivery_time)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
             if ((n = rdbSaveLen(rdb,nack->delivery_count)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
@@ -811,7 +811,7 @@ ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
              * at loading time. */
         }
     }
-    raxStop(&ri);
+    bptStop(&ri);
     return nwritten;
 }
 
@@ -824,7 +824,7 @@ ssize_t rdbSaveStreamIdmpEntries(rio *rdb, stream *s) {
     ssize_t n, nwritten = 0;
 
     /* Save the number of producers. */
-    size_t num_producers = s->idmp_producers ? raxSize(s->idmp_producers) : 0;
+    size_t num_producers = s->idmp_producers ? bptSize(s->idmp_producers) : 0;
     if ((n = rdbSaveLen(rdb,num_producers)) == -1) return -1;
     nwritten += n;
 
@@ -833,15 +833,15 @@ ssize_t rdbSaveStreamIdmpEntries(rio *rdb, stream *s) {
     uint64_t expire_time = server.mstime - (s->idmp_duration * 1000);
 
     /* Iterate through all producers. */
-    raxIterator ri;
-    raxStart(&ri, s->idmp_producers);
-    raxSeek(&ri, "^", NULL, 0);
-    while (raxNext(&ri)) {
+    bptIterator ri;
+    bptStart(&ri, s->idmp_producers);
+    bptSeek(&ri, "^", NULL, 0);
+    while (bptNext(&ri)) {
         idmpProducer *producer = ri.data;
 
         /* Save the producer ID (pid). */
         if ((n = rdbSaveRawString(rdb, ri.key, ri.key_len)) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
@@ -858,7 +858,7 @@ ssize_t rdbSaveStreamIdmpEntries(rio *rdb, stream *s) {
         /* Save the number of entries for this producer. */
         size_t count = dictSize(producer->idmp_dict) - expired;
         if ((n = rdbSaveLen(rdb, count)) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
@@ -868,19 +868,19 @@ ssize_t rdbSaveStreamIdmpEntries(rio *rdb, stream *s) {
         while (entry != NULL) {
             /* Save the IID string (length + data). */
             if ((n = rdbSaveRawString(rdb,(unsigned char *)entry->iid,entry->iid_len)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
 
             /* Save the associated stream ID. */
             if ((n = rdbSaveLen(rdb,entry->id.ms)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
             if ((n = rdbSaveLen(rdb,entry->id.seq)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
@@ -888,7 +888,7 @@ ssize_t rdbSaveStreamIdmpEntries(rio *rdb, stream *s) {
             entry = entry->next;
         }
     }
-    raxStop(&ri);
+    bptStop(&ri);
     return nwritten;
 }
 
@@ -907,8 +907,8 @@ int rdbLoadStreamIdmpEntries(rio *rdb, stream *s) {
 
     uint64_t expire_time = server.mstime - (s->idmp_duration * 1000);
 
-    /* Create the producers rax tree. */
-    s->idmp_producers = raxNewEx(0, &s->alloc_size, 0);
+    /* Create the producers B+tree. */
+    s->idmp_producers = bptNewEx(BPT_PAGE_DEFAULT, &s->alloc_size);
     if (s->idmp_producers == NULL) {
         return -1;
     }
@@ -938,8 +938,8 @@ int rdbLoadStreamIdmpEntries(rio *rdb, stream *s) {
         /* Create the producer. */
         idmpProducer *producer = idmpProducerCreate(&s->alloc_size);
 
-        /* Insert producer into rax tree. */
-        int inserted = raxTryInsert(s->idmp_producers, (unsigned char *)pid, pid_len, producer, NULL);
+        /* Insert producer into B+tree. */
+        int inserted = bptTryInsert(s->idmp_producers, (unsigned char *)pid, pid_len, producer, NULL);
         if (!inserted) {
             idmpProducerFree(producer, &s->alloc_size);
             goto cleanup;
@@ -994,16 +994,16 @@ int rdbLoadStreamIdmpEntries(rio *rdb, stream *s) {
 
         /* If all entries were expired, remove the empty producer. */
         if (producer->idmp_head == NULL) {
-            raxRemove(s->idmp_producers, (unsigned char *)pid, pid_len, NULL);
+            bptRemove(s->idmp_producers, (unsigned char *)pid, pid_len, NULL);
             idmpProducerFree(producer, &s->alloc_size);
         }
         sdsfree(pid);
         pid = NULL;
     }
 
-    /* If no producers remain after filtering, free the rax tree. */
-    if (raxSize(s->idmp_producers) == 0) {
-        raxFree(s->idmp_producers);
+    /* If no producers remain after filtering, free the B+tree. */
+    if (bptSize(s->idmp_producers) == 0) {
+        bptFree(s->idmp_producers);
         s->idmp_producers = NULL;
     }
 
@@ -1014,7 +1014,7 @@ cleanup:
     /* Clean up partially constructed producers tree on error.
      * This prevents use-after-free when the stream is later freed. */
     if (s->idmp_producers) {
-        raxFreeWithCbAndContext(s->idmp_producers, streamFreeIdmpProducerGeneric, s);
+        bptFreeWithCbAndContext(s->idmp_producers, streamFreeIdmpProducerGeneric, s);
         s->idmp_producers = NULL;
     }
     return -1;
@@ -1027,33 +1027,33 @@ size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
     ssize_t n, nwritten = 0;
 
     /* Number of consumers in this consumer group. */
-    if ((n = rdbSaveLen(rdb,raxSize(cg->consumers))) == -1) return -1;
+    if ((n = rdbSaveLen(rdb,bptSize(cg->consumers))) == -1) return -1;
     nwritten += n;
 
     /* Save each consumer. */
-    raxIterator ri;
-    raxStart(&ri,cg->consumers);
-    raxSeek(&ri,"^",NULL,0);
-    while(raxNext(&ri)) {
+    bptIterator ri;
+    bptStart(&ri,cg->consumers);
+    bptSeek(&ri,"^",NULL,0);
+    while(bptNext(&ri)) {
         streamConsumer *consumer = ri.data;
 
         /* Consumer name. */
         if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
 
         /* Seen time. */
         if ((n = rdbSaveMillisecondTime(rdb,consumer->seen_time)) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
 
         /* Active time. */
         if ((n = rdbSaveMillisecondTime(rdb,consumer->active_time)) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
@@ -1063,12 +1063,12 @@ size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
          * in the consumer group global PEL and will put a reference in the
          * consumer local PEL. */
         if ((n = rdbSaveStreamPEL(rdb,consumer->pel,0)) == -1) {
-            raxStop(&ri);
+            bptStop(&ri);
             return -1;
         }
         nwritten += n;
     }
-    raxStop(&ri);
+    bptStop(&ri);
     return nwritten;
 }
 
@@ -1429,33 +1429,33 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             serverPanic("Unknown hash encoding");
         }
     } else if (o->type == OBJ_STREAM) {
-        /* Store how many listpacks we have inside the radix tree. */
+        /* Store how many listpacks we have inside the B+tree. */
         stream *s = o->ptr;
-        rax *rax = s->rax;
-        if ((n = rdbSaveLen(rdb,raxSize(rax))) == -1) return -1;
+        bptree *rax = s->rax;
+        if ((n = rdbSaveLen(rdb,bptSize(rax))) == -1) return -1;
         nwritten += n;
 
-        /* Serialize all the listpacks inside the radix tree as they are,
+        /* Serialize all the listpacks inside the B+tree as they are,
          * when loading back, we'll use the first entry of each listpack
-         * to insert it back into the radix tree. */
-        raxIterator ri;
-        raxStart(&ri,rax);
-        raxSeek(&ri,"^",NULL,0);
-        while (raxNext(&ri)) {
+         * to insert it back into the B+tree. */
+        bptIterator ri;
+        bptStart(&ri,rax);
+        bptSeek(&ri,"^",NULL,0);
+        while (bptNext(&ri)) {
             unsigned char *lp = ri.data;
             size_t lp_bytes = lpBytes(lp);
             if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
             if ((n = rdbSaveRawString(rdb,lp,lp_bytes)) == -1) {
-                raxStop(&ri);
+                bptStop(&ri);
                 return -1;
             }
             nwritten += n;
         }
-        raxStop(&ri);
+        bptStop(&ri);
 
         /* Save the number of elements inside the stream. We cannot obtain
          * this easily later, since our macro nodes should be checked for
@@ -1485,53 +1485,53 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
          * type, so serialize every consumer group. */
 
         /* Save the number of groups. */
-        size_t num_cgroups = s->cgroups ? raxSize(s->cgroups) : 0;
+        size_t num_cgroups = s->cgroups ? bptSize(s->cgroups) : 0;
         if ((n = rdbSaveLen(rdb,num_cgroups)) == -1) return -1;
         nwritten += n;
 
         if (num_cgroups) {
             /* Serialize each consumer group. */
-            raxStart(&ri,s->cgroups);
-            raxSeek(&ri,"^",NULL,0);
-            while(raxNext(&ri)) {
+            bptStart(&ri,s->cgroups);
+            bptSeek(&ri,"^",NULL,0);
+            while(bptNext(&ri)) {
                 streamCG *cg = ri.data;
 
                 /* Save the group name. */
                 if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
                 /* Last ID. */
                 if ((n = rdbSaveLen(rdb,cg->last_id.ms)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
                 if ((n = rdbSaveLen(rdb,cg->last_id.seq)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
                 
                 /* Save the group's logical reads counter. */
                 if ((n = rdbSaveLen(rdb,cg->entries_read)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
                 /* Save the global PEL. */
                 if ((n = rdbSaveStreamPEL(rdb,cg->pel,1)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
                 /* Save the consumers of this group. */
                 if ((n = rdbSaveStreamConsumers(rdb,cg)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
@@ -1539,7 +1539,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                 /* Save NACK zone: count followed by the IDs of NACKed entries. */
                 uint64_t nacked_count = pelListNackedCount(cg);
                 if ((n = rdbSaveLen(rdb, nacked_count)) == -1) {
-                    raxStop(&ri);
+                    bptStop(&ri);
                     return -1;
                 }
                 nwritten += n;
@@ -1550,7 +1550,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                         unsigned char buf[sizeof(streamID)];
                         streamEncodeID(buf, &nack->id);
                         if ((n = rdbWriteRaw(rdb, buf, sizeof(buf))) == -1) {
-                            raxStop(&ri);
+                            bptStop(&ri);
                             return -1;
                         }
                         nwritten += n;
@@ -1559,7 +1559,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                     }
                 }
             }
-            raxStop(&ri);
+            bptStop(&ri);
         }
 
         /* Save IDMP (Idempotent Message Producer) configuration and entries. */
@@ -3945,8 +3945,10 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
             live_entries += lp_live;
 
-            /* Insert the key in the radix tree. */
-            int retval = raxTryInsert(s->rax,
+            /* Insert the key in the B+tree. Keys are saved in ascending
+             * order, so this is an O(1) tail append; a duplicate (corrupt
+             * RDB) is rejected exactly like bptTryInsert would. */
+            int retval = bptAppend(s->rax,
                 (unsigned char*)nodekey,sizeof(streamID),lp,NULL);
             sdsfree(nodekey);
             if (!retval) {
@@ -4098,7 +4100,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     decrRefCount(o);
                     return NULL;
                 }
-                if (!raxTryInsert(cgroup->pel,rawid,sizeof(rawid),nack,NULL)) {
+                if (!bptAppend(cgroup->pel,rawid,sizeof(rawid),nack,NULL)) {
                     rdbReportCorruptRDB("Duplicated global PEL entry "
                                             "loading stream consumer group");
                     streamFreeNACK(s, nack);
@@ -4172,7 +4174,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                         return NULL;
                     }
                     void *result;
-                    if (!raxFind(cgroup->pel,rawid,sizeof(rawid),&result)) {
+                    if (!bptFind(cgroup->pel,rawid,sizeof(rawid),&result)) {
                         rdbReportCorruptRDB("Consumer entry not found in "
                                                 "group global PEL");
                         decrRefCount(o);
@@ -4192,7 +4194,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                      * loading the global PEL. Then set the same shared
                      * NACK structure also in the consumer-specific PEL. */
                     nack->consumer = consumer;
-                    if (!raxTryInsert(consumer->pel,rawid,sizeof(rawid),nack,NULL)) {
+                    if (!bptAppend(consumer->pel,rawid,sizeof(rawid),nack,NULL)) {
                         rdbReportCorruptRDB("Duplicated consumer PEL entry "
                                                 " loading a stream consumer "
                                                 "group");
@@ -4228,7 +4230,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     }
 
                     void *result;
-                    if (!raxFind(cgroup->pel, rawid, sizeof(rawid), &result)) {
+                    if (!bptFind(cgroup->pel, rawid, sizeof(rawid), &result)) {
                         rdbReportCorruptRDB("Stream NACK zone entry not found "
                                             "in group global PEL");
                         decrRefCount(o);

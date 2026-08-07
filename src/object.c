@@ -824,20 +824,20 @@ void dismissHashObject(robj *o, size_t size_hint) {
 /* See dismissObject() */
 void dismissStreamObject(robj *o, size_t size_hint) {
     stream *s = o->ptr;
-    rax *rax = s->rax;
-    if (raxSize(rax) == 0) return;
+    bptree *rax = s->rax;
+    if (bptSize(rax) == 0) return;
 
     /* Iterate only on stream entries, although size_hint may include serialized
      * consumer groups info, but usually, stream entries take up most of
      * the space. */
-    if (size_hint / raxSize(rax) >= server.page_size) {
-        raxIterator ri;
-        raxStart(&ri,rax);
-        raxSeek(&ri,"^",NULL,0);
-        while (raxNext(&ri)) {
+    if (size_hint / bptSize(rax) >= server.page_size) {
+        bptIterator ri;
+        bptStart(&ri,rax);
+        bptSeek(&ri,"^",NULL,0);
+        while (bptNext(&ri)) {
             dismissMemory(ri.data, lpBytes(ri.data));
         }
-        raxStop(&ri);
+        bptStop(&ri);
     }
 }
 

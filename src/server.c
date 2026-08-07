@@ -8032,6 +8032,7 @@ struct redisTest {
     {"vector", vectorTest},
     {"bitmap", bitopsTest},
     {"rax", raxTest},
+    {"bptree", bptTest},
     {"zset", zsetTest},
     {"topk", chkTopKTest},
     {"fastfloat", fastFloatTest},
