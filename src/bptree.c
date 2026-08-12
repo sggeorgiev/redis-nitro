@@ -251,7 +251,10 @@ static uint32_t bptLcp(const unsigned char *a, uint32_t alen,
     return i;
 }
 
-/* memcmp with lexicographic tie-break by length. */
+#ifdef REDIS_TEST
+/* memcmp with lexicographic tie-break by length. Searches inside a node
+ * compare suffixes against the node prefix instead, so this whole-key form is
+ * only needed by the test oracles. */
 static int bptKeyCmp(const unsigned char *a, uint32_t alen,
                      const unsigned char *b, uint32_t blen) {
     uint32_t n = alen < blen ? alen : blen;
@@ -261,6 +264,7 @@ static int bptKeyCmp(const unsigned char *a, uint32_t alen,
     if (alen > blen) return 1;
     return 0;
 }
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Memory accounting                                                         */
@@ -849,6 +853,9 @@ uint64_t bptNumNodes(bptree *bt) {
 /* Find                                                                      */
 /* ------------------------------------------------------------------------- */
 
+#ifdef REDIS_TEST
+/* Point lookup. Callers of the tree seek instead (they need the iterator
+ * position anyway), so this only backs the tests. */
 static int bptFind(bptree *bt, unsigned char *s, size_t len, void **value) {
     bptNode *n = bt->root;
     while (!n->isleaf) {
@@ -863,6 +870,7 @@ static int bptFind(bptree *bt, unsigned char *s, size_t len, void **value) {
     if (value) *value = bptCellPayload(bt, n, bptCellOff(bt, n, idx));
     return 1;
 }
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* In-place cell insertion / removal helpers                                 */
