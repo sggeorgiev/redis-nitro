@@ -490,12 +490,8 @@ robj *createHashObject(void) {
 }
 
 robj *createZsetObject(void) {
-    zset *zs = zmalloc(sizeof(*zs));
-    robj *o;
-
-    zs->dict = dictCreate(&zsetDictType);
-    zs->zsl = zslCreate();
-    o = createObject(OBJ_ZSET,zs);
+    zset *zs = zsetCreate();
+    robj *o = createObject(OBJ_ZSET,zs);
     o->encoding = OBJ_ENCODING_SKIPLIST;
     return o;
 }
@@ -586,9 +582,7 @@ void freeZsetObject(robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_SKIPLIST:
         zs = o->ptr;
-        dictRelease(zs->dict);
-        zslFree(zs->zsl);
-        zfree(zs);
+        zsetFree(zs);
         break;
     case OBJ_ENCODING_LISTPACK:
         zfree(o->ptr);
@@ -753,21 +747,31 @@ void dismissSetObject(robj *o, size_t size_hint) {
     }
 }
 
+/* bptForEachPage() callback: hand a single B+tree page/blob to dismissMemory(). */
+static void dismissZsetPage(void *page, size_t size, void *ctx) {
+    UNUSED(ctx);
+    dismissMemory(page, size);
+}
+
 /* See dismissObject() */
 void dismissZsetObject(robj *o, size_t size_hint) {
     if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = o->ptr;
-        zskiplist *zsl = zs->zsl;
-        serverAssert(zsl->length != 0);
-        /* We iterate all nodes only when average member size is bigger than a
+        unsigned long len = (unsigned long)bptSize(zs->bt);
+        serverAssert(len != 0);
+        /* We iterate all pages only when average member size is bigger than a
          * page size, and there's a high chance we'll actually dismiss something. */
-        if (size_hint / zsl->length >= server.page_size) {
-            zskiplistNode *zn = zsl->header->level[0].forward;
-            while (zn != NULL) {
-                zskiplistNode *next = zn->level[0].forward;
-                dismissMemory(zn, 0);
-                zn = next;
+        if (size_hint / len >= server.page_size) {
+            bptForEachPage(zs->bt, dismissZsetPage, NULL);
+
+            /* The dict owns a separate sds copy of every member. */
+            dictEntry *de;
+            dictIterator di;
+            dictInitIterator(&di, zs->dict);
+            while ((de = dictNext(&di)) != NULL) {
+                dismissSds(dictGetKey(de));
             }
+            dictResetIterator(&di);
         }
 
         /* Dismiss hash table memory. */

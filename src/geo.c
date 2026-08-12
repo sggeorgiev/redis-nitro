@@ -297,28 +297,30 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        zskiplist *zsl = zs->zsl;
-        zskiplistNode *ln;
+        bptIterator it;
+        bptStart(&it, zs->bt);
 
-        if ((ln = zslNthInRange(zsl, &range, 0, NULL)) == NULL) {
+        if (!zsetBtSeekNthInRange(zs, &it, &range, 0, NULL)) {
             /* Nothing exists starting at our min.  No results. */
+            bptStop(&it);
             return 0;
         }
 
-        while (ln) {
+        while (bptNext(&it)) {
             double xy[2];
             double distance = 0;
-            /* Abort when the node is no longer in range. */
-            if (!zslValueLteMax(ln->score, &range))
+            double score = zsetKeyScore(it.key);
+            /* Abort when the element is no longer in range. */
+            if (!zslValueLteMax(score, &range))
                 break;
-            if (geoWithinShape(shape, ln->score, xy, &distance) == C_OK) {
-                /* Append the new element. */
-                sds ele = zslGetNodeElement(ln);
-                geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ele));
+            if (geoWithinShape(shape, score, xy, &distance) == C_OK) {
+                /* Append the new element (take ownership of the fresh sds). */
+                sds ele = sdsnewlen(it.key + 8, it.key_len - 8);
+                geoArrayAppend(ga, xy, distance, score, ele);
             }
             if (ga->used && limit && ga->used >= limit) break;
-            ln = ln->level[0].forward;
         }
+        bptStop(&it);
     }
     return ga->used - origincount;
 }
@@ -814,7 +816,6 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         }
 
         for (i = 0; i < returned_items; i++) {
-            zskiplistNode *znode;
             geoPoint *gp = ga->array+i;
             gp->dist /= shape.conversion; /* Fix according to unit. */
             double score = storedist ? gp->dist : gp->score;
@@ -822,9 +823,8 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
 
             if (maxelelen < elelen) maxelelen = elelen;
             totelelen += elelen;
-            znode = zslInsert(zs->zsl,score,gp->member);
-            serverAssert(dictAdd(zs->dict, znode, NULL) == DICT_OK);
-            sdsfree(gp->member); /* zslInsert copies the sds, so free the original */
+            serverAssert(zsetInsertRaw(zs, score, gp->member) == 1);
+            sdsfree(gp->member); /* zsetInsertRaw copies the sds, so free the original */
             gp->member = NULL;
         }
 

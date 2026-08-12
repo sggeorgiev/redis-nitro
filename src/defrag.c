@@ -115,6 +115,8 @@ typedef struct {
      * before "later" and we will search by key name to find the entry when we defrag the item later. */
     list *defrag_later;
     unsigned long defrag_later_cursor;
+    uint64_t defrag_later_bpt_cursor;
+    int defrag_later_bpt_done;
 } defragKeysCtx;
 static_assert(offsetof(defragKeysCtx, kvstate) == 0, "defragStageKvstoreHelper requires this");
 
@@ -382,59 +384,6 @@ dict *dictDefragTables(dict *d) {
     return ret;
 }
 
-/* Internal function used by activeDefragZsetNode */
-void zslUpdateNode(zskiplist *zsl, zskiplistNode *oldnode, zskiplistNode *newnode, zskiplistNode **update) {
-    int i;
-    for (i = 0; i < zsl->level; i++) {
-        if (update[i]->level[i].forward == oldnode)
-            update[i]->level[i].forward = newnode;
-    }
-    serverAssert(zsl->header!=oldnode);
-    if (newnode->level[0].forward) {
-        serverAssert(newnode->level[0].forward->backward==oldnode);
-        newnode->level[0].forward->backward = newnode;
-    } else {
-        serverAssert(zsl->tail==oldnode);
-        zsl->tail = newnode;
-    }
-}
-
-/* Defrag a single zset node, update dictEntry and skiplist struct */
-void activeDefragZsetNode(zset *zs, dictEntry *de, dictEntryLink plink) {
-    zskiplistNode *znode = dictGetKey(de);
-
-    /* Try to defrag the skiplist node first */
-    zskiplistNode *newnode = activeDefragAllocWithoutFree(znode);
-    if (!newnode) return; /* No defrag needed */
-
-    /* Node was defragged, now we need to update all skiplist pointers */
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *iter;
-    int i;
-    double score = newnode->score;
-    sds ele = zslGetNodeElement(newnode);
-
-    /* Find all pointers that need to be updated */
-    iter = zs->zsl->header;
-    for (i = zs->zsl->level-1; i >= 0; i--) {
-        while (iter->level[i].forward &&
-            iter->level[i].forward != znode &&
-            zslCompareWithNode(score, ele, iter->level[i].forward) > 0)
-            iter = iter->level[i].forward;
-        update[i] = iter;
-    }
-
-    /* Verify we found the right node */
-    iter = iter->level[0].forward;
-    serverAssert(iter && iter == znode);
-
-    /* Update all skiplist pointers and dict key */
-    zslUpdateNode(zs->zsl, znode, newnode, update);
-    dictSetKeyAtLink(zs->dict, newnode, &plink, 0);
-
-    /* Free the old node now that all pointers have been updated */
-    activeDefragFree(znode);
-}
-
 #define DEFRAG_SDS_DICT_NO_VAL 0
 #define DEFRAG_SDS_DICT_VAL_IS_SDS 1
 #define DEFRAG_SDS_DICT_VAL_IS_STROB 2
@@ -555,6 +504,8 @@ void defragLater(defragKeysCtx *ctx, kvobj *kv) {
         ctx->defrag_later = listCreate();
         listSetFreeMethod(ctx->defrag_later, sdsfreegeneric);
         ctx->defrag_later_cursor = 0;
+        ctx->defrag_later_bpt_cursor = 0;
+        ctx->defrag_later_bpt_done = 0;
     }
     sds key = sdsdup(kvobjGetKey(kv));
     listAddNodeTail(ctx->defrag_later, key);
@@ -603,24 +554,26 @@ long scanLaterList(robj *ob, unsigned long *cursor, monotime endtime) {
     return bookmark_failed? 1: 0;
 }
 
-typedef struct {
-    zset *zs;
-} scanLaterZsetData;
+void scanCallbackCountScanned(void *privdata, const dictEntry *de, dictEntryLink plink);
 
-void scanZsetCallback(void *privdata, const dictEntry *_de, dictEntryLink plink) {
-    dictEntry *de = (dictEntry*)_de;
-    scanLaterZsetData *data = privdata;
-    activeDefragZsetNode(data->zs, de, plink);
-    server.stat_active_defrag_scanned++;
-}
-
-void scanLaterZset(robj *ob, unsigned long *cursor) {
+int scanLaterZset(robj *ob, unsigned long *cursor, uint64_t *bpt_cursor,
+                  int *bpt_done, monotime endtime) {
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
     zset *zs = (zset*)ob->ptr;
     dict *d = zs->dict;
-    scanLaterZsetData data = {zs};
-    dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
-    *cursor = dictScanDefrag(d, *cursor, scanZsetCallback, &defragfns, &data);
+    while (!*bpt_done) {
+        *bpt_done = !bptDefragStep(&zs->bt, bpt_cursor, activeDefragAlloc);
+        server.stat_active_defrag_scanned++;
+        if (getMonotonicUs() > endtime) return 1;
+    }
+    /* The dict maps sds member -> inline double; only the key sds needs a
+     * relocation callback (the value has no pointer). */
+    dictDefragFunctions defragfns = {
+        .defragAlloc = activeDefragAlloc,
+        .defragKey = (dictDefragAllocFunction *)activeDefragSds
+    };
+    *cursor = dictScanDefrag(d, *cursor, scanCallbackCountScanned, &defragfns, NULL);
+    return 0;
 }
 
 /* Used as scan callback when all the work is done in the dictDefragFunctions. */
@@ -700,27 +653,31 @@ void defragQuicklist(defragKeysCtx *ctx, kvobj *kv) {
 void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
     zset *zs = (zset*)ob->ptr;
     zset *newzs;
-    zskiplist *newzsl;
     dict *newdict;
-    struct zskiplistNode *newheader;
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
-    if ((newzs = activeDefragAlloc(zs)))
+    if ((newzs = activeDefragAlloc(zs))) {
         ob->ptr = zs = newzs;
-    if ((newzsl = activeDefragAlloc(zs->zsl)))
-        zs->zsl = newzsl;
-    if ((newheader = activeDefragAlloc(zs->zsl->header)))
-        zs->zsl->header = newheader;
-    if (dictSize(zs->dict) > server.active_defrag_max_scan_fields)
+        /* The bptree's alloc_size hook points into the (now relocated) zset
+         * struct, so re-point it before any tree operation accounts memory. */
+        zs->bt->alloc_size = &zs->alloc_size;
+    }
+
+    if (dictSize(zs->dict) > server.active_defrag_max_scan_fields) {
+        /* Large: defrag incrementally in scanLaterZset() (tree + dict). */
         defragLater(ctx, ob);
-    else {
-        /* Use dictScanDefrag to iterate and defrag both dictEntry structures and skiplist nodes.
-         * dictScanDefrag handles defragging dictEntry/dictEntryNoValue structures via defragfns,
-         * and calls our callback with plink for each entry so we can defrag skiplist nodes. */
-        scanLaterZsetData data = {zs};
-        dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
+    } else {
+        /* Defrag the whole B+tree (pages + overflow blobs + header) in one
+         * shot: cheap since pages number roughly numele/fanout. */
+        bptDefrag(&zs->bt, activeDefragAlloc);
+        /* Defrag the dict entries and their sds member keys (inline double
+         * values carry no pointer). */
+        dictDefragFunctions defragfns = {
+            .defragAlloc = activeDefragAlloc,
+            .defragKey = (dictDefragAllocFunction *)activeDefragSds
+        };
         unsigned long cursor = 0;
         do {
-            cursor = dictScanDefrag(zs->dict, cursor, scanZsetCallback, &defragfns, &data);
+            cursor = dictScanDefrag(zs->dict, cursor, scanCallbackCountScanned, &defragfns, NULL);
         } while (cursor != 0);
     }
     /* defrag the dict struct and tables */
@@ -1344,14 +1301,15 @@ void defragPubsubScanCallback(void *privdata, const dictEntry *de, dictEntryLink
 
 /* returns 0 more work may or may not be needed (see non-zero cursor),
  * and 1 if time is up and more work is needed. */
-int defragLaterItem(kvobj *ob, unsigned long *cursor, monotime endtime, int dbid) {
+int defragLaterItem(kvobj *ob, unsigned long *cursor, uint64_t *bpt_cursor,
+                    int *bpt_done, monotime endtime, int dbid) {
     if (ob) {
         if (ob->type == OBJ_LIST && ob->encoding == OBJ_ENCODING_QUICKLIST) {
             return scanLaterList(ob, cursor, endtime);
         } else if (ob->type == OBJ_SET && ob->encoding == OBJ_ENCODING_HT) {
             scanLaterSet(ob, cursor);
         } else if (ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST) {
-            scanLaterZset(ob, cursor);
+            return scanLaterZset(ob, cursor, bpt_cursor, bpt_done, endtime);
         } else if (ob->type == OBJ_HASH && ob->encoding == OBJ_ENCODING_HT) {
             scanLaterHash(ob, cursor);
         } else if (ob->type == OBJ_HASH && ob->encoding == OBJ_ENCODING_TMPL_ARRAY) {
@@ -1399,7 +1357,10 @@ static doneStatus defragLaterStep(void *ctx, monotime endtime) {
         long long key_defragged = server.stat_active_defrag_hits;
         if (server.memory_tracking_enabled && kv)
             oldsize = kvobjAllocSize(kv);
-        int timeout = (defragLaterItem(kv, &defrag_keys_ctx->defrag_later_cursor, endtime, defrag_keys_ctx->dbid) == 1);
+        int timeout = (defragLaterItem(kv, &defrag_keys_ctx->defrag_later_cursor,
+                                      &defrag_keys_ctx->defrag_later_bpt_cursor,
+                                      &defrag_keys_ctx->defrag_later_bpt_done,
+                                      endtime, defrag_keys_ctx->dbid) == 1);
         if (server.memory_tracking_enabled && kv)
             updateSlotAllocSize(db, slot, kv, oldsize, kvobjAllocSize(kv));
         if (key_defragged != server.stat_active_defrag_hits) {
@@ -1413,6 +1374,8 @@ static doneStatus defragLaterStep(void *ctx, monotime endtime) {
         if (defrag_keys_ctx->defrag_later_cursor == 0) {
             /* the item is finished, move on */
             listDelNode(defrag_keys_ctx->defrag_later, head);
+            defrag_keys_ctx->defrag_later_bpt_cursor = 0;
+            defrag_keys_ctx->defrag_later_bpt_done = 0;
         }
 
         if (++iterations > 16 || server.stat_active_defrag_hits - prev_defragged > 512 ||
