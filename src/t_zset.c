@@ -3595,9 +3595,45 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
         addReplyArrayLen(c, rangelen);
     }
 
-    /* Remove the element. */
-    do {
-        if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    /* Remove the elements. */
+    if (zobj->encoding == OBJ_ENCODING_BTREE) {
+        /* The popped elements form a rank window at one end of the tree, so
+         * the whole reply can be emitted by walking the leaf chain and the
+         * removal done in a single pass afterwards. Deleting one element at a
+         * time instead would cost a dict lookup, a root-to-leaf descent and a
+         * possible rebalance for each of them. */
+        zset *zs = zobj->ptr;
+        zbtree *t = zs->tree;
+        zbtIter it;
+        zbtElem *zln = (where == ZSET_MAX) ? zbtLast(t, &it) : zbtFirst(t, &it);
+
+        for (long i = 0; i < rangelen; i++) {
+            serverAssertWithInfo(c,zobj,zln != NULL);
+            if (use_nested_array) {
+                addReplyArrayLen(c,2);
+            }
+            /* The reply layer copies the member out, so it stays valid once
+             * the elements are freed below. */
+            sds member = zbtGetEle(zln);
+            addReplyBulkCBuffer(c,member,sdslen(member));
+            addReplyDouble(c,zln->score);
+            zln = (where == ZSET_MAX) ? zbtIterPrev(&it) : zbtIterNext(&it);
+        }
+
+        dictPauseAutoResize(zs->dict);
+        unsigned long removed = (where == ZSET_MAX) ?
+            zbtDeleteRangeByRank(t, t->length - rangelen + 1, t->length, zs->dict) :
+            zbtDeleteRangeByRank(t, 1, rangelen, zs->dict);
+        dictResumeAutoResize(zs->dict);
+        serverAssertWithInfo(c,zobj,removed == (unsigned long)rangelen);
+        if (dictSize(zs->dict)) dictShrinkIfNeeded(zs->dict);
+
+        result_count = rangelen;
+        server.dirty += rangelen;
+        char *events[2] = {"zpopmin","zpopmax"};
+        notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
+    } else if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        do {
             unsigned char *zl = zobj->ptr;
             unsigned char *eptr, *sptr;
             unsigned char *vstr;
@@ -3617,38 +3653,26 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
             sptr = lpNext(zl,eptr);
             serverAssertWithInfo(c,zobj,sptr != NULL);
             score = zzlGetScore(sptr);
-        } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
-            zset *zs = zobj->ptr;
-            zbtree *t = zs->tree;
-            zbtElem *zln;
 
-            /* Get the first or last element in the sorted set. */
-            zln = (where == ZSET_MAX ? zbtLast(t, NULL) : zbtFirst(t, NULL));
+            serverAssertWithInfo(c,zobj,zsetDel(zobj,ele));
+            server.dirty++;
 
-            /* There must be an element in the sorted set. */
-            serverAssertWithInfo(c,zobj,zln != NULL);
-            ele = sdsdup(zbtGetEle(zln));
-            score = zln->score;
-        } else {
-            serverPanic("Unknown sorted set encoding");
-        }
+            if (result_count == 0) { /* Do this only for the first iteration. */
+                char *events[2] = {"zpopmin","zpopmax"};
+                notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
+            }
 
-        serverAssertWithInfo(c,zobj,zsetDel(zobj,ele));
-        server.dirty++;
-
-        if (result_count == 0) { /* Do this only for the first iteration. */
-            char *events[2] = {"zpopmin","zpopmax"};
-            notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
-        }
-
-        if (use_nested_array) {
-            addReplyArrayLen(c,2);
-        }
-        addReplyBulkCBuffer(c,ele,sdslen(ele));
-        addReplyDouble(c,score);
-        sdsfree(ele);
-        ++result_count;
-    } while(--rangelen);
+            if (use_nested_array) {
+                addReplyArrayLen(c,2);
+            }
+            addReplyBulkCBuffer(c,ele,sdslen(ele));
+            addReplyDouble(c,score);
+            sdsfree(ele);
+            ++result_count;
+        } while(--rangelen);
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
 
     if (server.memory_tracking_enabled)
         updateSlotAllocSize(c->db, getKeySlot(key->ptr), zobj, oldsize, kvobjAllocSize(zobj));

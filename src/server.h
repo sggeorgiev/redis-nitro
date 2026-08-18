@@ -3832,7 +3832,7 @@ zbtElem *zbtFirstInLexRange(zbtree *t, zlexrangespec *range, unsigned long *out_
 zbtElem *zbtLastInLexRange(zbtree *t, zlexrangespec *range, unsigned long *out_rank, zbtIter *it);
 unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d);
 unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start, unsigned int end, dict *d);
+unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned long start, unsigned long end, dict *d);
 void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe);
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *));
 int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budget);
