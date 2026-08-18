@@ -46,6 +46,15 @@ typedef struct zbtInner {
     struct zbtNode *child[ZBT_INNER_MAX + 1];
     unsigned long csize[ZBT_INNER_MAX + 1]; /* subtree element count of child[i] */
     zbtElem *sep[ZBT_INNER_MAX + 1];        /* minimum element of child[i] */
+    /* Cache of sep[i]->score kept in a contiguous array, so descents compare
+     * doubles from (at most) eight cache lines instead of dereferencing one
+     * random heap pointer per probe. Invariant: sepscore[i] == sep[i]->score
+     * for every used slot. This can never go stale from score mutation,
+     * because no element's score is modified while it is linked in a tree:
+     * zbtUpdateScore() detaches the element (repairing all separators) before
+     * writing the new score, and the other writers (ZUNION aggregation, RDB
+     * load, defrag) only touch detached or content-identical elements. */
+    double sepscore[ZBT_INNER_MAX + 1];
 } zbtInner;
 
 /*-----------------------------------------------------------------------------
@@ -201,11 +210,36 @@ static int zbtChildIdx(zbtInner *p, zbtNode *c) {
     serverPanic("zbtree: child not found in parent");
 }
 
+/* Set separator slot 'i' of 'in', keeping the sepscore cache in sync. Every
+ * single-slot sep[] write must go through here (bulk memmove/memcpy sites
+ * mirror the sepscore range explicitly). */
+static inline void zbtSetSep(zbtInner *in, int i, zbtElem *e) {
+    in->sep[i] = e;
+    in->sepscore[i] = e->score;
+}
+
+/* First index j in [1, count) such that sep[j] > (score,ele), or count if no
+ * such separator exists. sep[0] is never examined: it bounds the subtree from
+ * below and slot 0 is the fallback child. Scores are compared against the
+ * contiguous sepscore cache; sep[j] is dereferenced only to break score ties
+ * on the member. */
+static int zbtSepUpperBound(zbtInner *in, double score, sds ele) {
+    int lo = 1, hi = (int)in->n.count;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        double ms = in->sepscore[mid];
+        int gt; /* sep[mid] > (score,ele) ? */
+        if (score < ms) gt = 1;
+        else if (score > ms) gt = 0;
+        else gt = sdscmp(ele, zbtGetEle(in->sep[mid])) < 0;
+        if (gt) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+
 /* Choose the child of inner node 'in' whose key range contains (score,ele). */
 static int zbtInnerChildIdx(zbtInner *in, double score, sds ele) {
-    int i = (int)in->n.count - 1;
-    while (i > 0 && zbtCompare(score, ele, in->sep[i]) < 0) i--;
-    return i;
+    return zbtSepUpperBound(in, score, ele) - 1;
 }
 
 /* Descend from the root to the leaf that would contain (score,ele). */
@@ -219,16 +253,18 @@ static zbtLeaf *zbtFindLeaf(zbtree *t, double score, sds ele) {
 }
 
 /* Locate (score,ele) inside a leaf. Sets *found and returns the index where
- * the element is (if found) or where it should be inserted. */
+ * the element is (if found) or where it should be inserted. Lower-bound
+ * binary search; members are unique, so equality can return immediately. */
 static int zbtLeafSearch(zbtLeaf *lf, double score, sds ele, int *found) {
-    uint32_t i;
-    for (i = 0; i < lf->n.count; i++) {
-        int c = zbtCompare(score, ele, lf->elems[i]);
-        if (c == 0) { *found = 1; return (int)i; }
-        if (c < 0) { *found = 0; return (int)i; }
+    int lo = 0, hi = (int)lf->n.count;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        int c = zbtCompare(score, ele, lf->elems[mid]);
+        if (c == 0) { *found = 1; return mid; }
+        if (c > 0) lo = mid + 1; else hi = mid;
     }
     *found = 0;
-    return (int)lf->n.count;
+    return lo;
 }
 
 /* Refresh csize/sep for every ancestor of 'n' up to the root. Used after an
@@ -265,7 +301,7 @@ static void zbtUpdateToRoot(zbtree *t, zbtNode *n) {
         zbtElem *newsep = zbtNodeMin(n);
         if (newsize == oldsize && newsep == p->sep[idx]) return;
         p->csize[idx] = newsize;
-        p->sep[idx] = newsep;
+        zbtSetSep(p, idx, newsep);
         n = (zbtNode *)p;
     }
 }
@@ -284,8 +320,8 @@ static void zbtInsertChild(zbtree *t, zbtInner *p, zbtNode *left, zbtNode *right
         root->n.count = 2;
         root->child[0] = left;  left->parent = (zbtNode *)root;
         root->child[1] = right; right->parent = (zbtNode *)root;
-        root->csize[0] = zbtSubtreeSize(left);  root->sep[0] = zbtNodeMin(left);
-        root->csize[1] = zbtSubtreeSize(right); root->sep[1] = zbtNodeMin(right);
+        root->csize[0] = zbtSubtreeSize(left);  zbtSetSep(root, 0, zbtNodeMin(left));
+        root->csize[1] = zbtSubtreeSize(right); zbtSetSep(root, 1, zbtNodeMin(right));
         t->root = (zbtNode *)root;
         return;
     }
@@ -296,12 +332,13 @@ static void zbtInsertChild(zbtree *t, zbtInner *p, zbtNode *left, zbtNode *right
     memmove(&p->child[at + 1], &p->child[at], tail * sizeof(zbtNode *));
     memmove(&p->csize[at + 1], &p->csize[at], tail * sizeof(unsigned long));
     memmove(&p->sep[at + 1], &p->sep[at], tail * sizeof(zbtElem *));
+    memmove(&p->sepscore[at + 1], &p->sepscore[at], tail * sizeof(double));
     p->child[at] = right;
     right->parent = (zbtNode *)p;
     p->n.count++;
 
-    p->csize[li] = zbtSubtreeSize(left);  p->sep[li] = zbtNodeMin(left);
-    p->csize[at] = zbtSubtreeSize(right); p->sep[at] = zbtNodeMin(right);
+    p->csize[li] = zbtSubtreeSize(left);  zbtSetSep(p, li, zbtNodeMin(left));
+    p->csize[at] = zbtSubtreeSize(right); zbtSetSep(p, at, zbtNodeMin(right));
 
     if (p->n.count > ZBT_INNER_MAX)
         zbtSplitInner(t, p);
@@ -317,6 +354,7 @@ static void zbtSplitInner(zbtree *t, zbtInner *in) {
     memcpy(r->child, &in->child[keep], move * sizeof(zbtNode *));
     memcpy(r->csize, &in->csize[keep], move * sizeof(unsigned long));
     memcpy(r->sep, &in->sep[keep], move * sizeof(zbtElem *));
+    memcpy(r->sepscore, &in->sepscore[keep], move * sizeof(double));
     r->n.count = move;
     in->n.count = keep;
     for (int i = 0; i < move; i++) r->child[i]->parent = (zbtNode *)r;
@@ -425,7 +463,7 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
                 zbtNode *c = level[ci++];
                 in->child[k] = c;
                 in->csize[k] = zbtSubtreeSize(c);
-                in->sep[k] = zbtNodeMin(c);
+                zbtSetSep(in, (int)k, zbtNodeMin(c));
                 c->parent = (zbtNode *)in;
             }
             parents[p] = (zbtNode *)in;
@@ -456,6 +494,7 @@ static void zbtRemoveChild(zbtInner *p, int pos) {
     memmove(&p->child[pos], &p->child[pos + 1], tail * sizeof(zbtNode *));
     memmove(&p->csize[pos], &p->csize[pos + 1], tail * sizeof(unsigned long));
     memmove(&p->sep[pos], &p->sep[pos + 1], tail * sizeof(zbtElem *));
+    memmove(&p->sepscore[pos], &p->sepscore[pos + 1], tail * sizeof(double));
     p->n.count--;
 }
 
@@ -463,7 +502,7 @@ static void zbtRemoveChild(zbtInner *p, int pos) {
  * shrank: fix up parent slots or collapse the root as needed. */
 static void zbtFixupInnerAfterShrink(zbtree *t, zbtInner *p, int slot) {
     p->csize[slot] = zbtSubtreeSize(p->child[slot]);
-    p->sep[slot] = zbtNodeMin(p->child[slot]);
+    zbtSetSep(p, slot, zbtNodeMin(p->child[slot]));
     if (p->n.parent && p->n.count < ZBT_INNER_MIN) {
         zbtRebalanceInner(t, p);
     } else if (!p->n.parent && p->n.count == 1) {
@@ -487,15 +526,17 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
             memmove(&in->child[1], &in->child[0], in->n.count * sizeof(zbtNode *));
             memmove(&in->csize[1], &in->csize[0], in->n.count * sizeof(unsigned long));
             memmove(&in->sep[1], &in->sep[0], in->n.count * sizeof(zbtElem *));
+            memmove(&in->sepscore[1], &in->sepscore[0], in->n.count * sizeof(double));
             int last = (int)L->n.count - 1;
             in->child[0] = L->child[last];
             in->csize[0] = L->csize[last];
             in->sep[0] = L->sep[last];
+            in->sepscore[0] = L->sepscore[last];
             in->child[0]->parent = (zbtNode *)in;
             in->n.count++;
             L->n.count--;
-            p->csize[idx - 1] = zbtSubtreeSize((zbtNode *)L); p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
-            p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   p->sep[idx] = zbtNodeMin((zbtNode *)in);
+            p->csize[idx - 1] = zbtSubtreeSize((zbtNode *)L); zbtSetSep(p, idx - 1, zbtNodeMin((zbtNode *)L));
+            p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   zbtSetSep(p, idx, zbtNodeMin((zbtNode *)in));
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -507,11 +548,12 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
             in->child[in->n.count] = R->child[0];
             in->csize[in->n.count] = R->csize[0];
             in->sep[in->n.count] = R->sep[0];
+            in->sepscore[in->n.count] = R->sepscore[0];
             in->child[in->n.count]->parent = (zbtNode *)in;
             in->n.count++;
             zbtRemoveChild(R, 0);
-            p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   p->sep[idx] = zbtNodeMin((zbtNode *)in);
-            p->csize[idx + 1] = zbtSubtreeSize((zbtNode *)R); p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
+            p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   zbtSetSep(p, idx, zbtNodeMin((zbtNode *)in));
+            p->csize[idx + 1] = zbtSubtreeSize((zbtNode *)R); zbtSetSep(p, idx + 1, zbtNodeMin((zbtNode *)R));
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -526,6 +568,7 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
         a->child[a->n.count] = b->child[i];
         a->csize[a->n.count] = b->csize[i];
         a->sep[a->n.count] = b->sep[i];
+        a->sepscore[a->n.count] = b->sepscore[i];
         b->child[i]->parent = (zbtNode *)a;
         a->n.count++;
     }
@@ -546,8 +589,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
             lf->elems[0] = L->elems[L->n.count - 1];
             L->n.count--;
             lf->n.count++;
-            p->csize[idx - 1] = L->n.count; p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
-            p->csize[idx] = lf->n.count;    p->sep[idx] = zbtNodeMin((zbtNode *)lf);
+            p->csize[idx - 1] = L->n.count; zbtSetSep(p, idx - 1, zbtNodeMin((zbtNode *)L));
+            p->csize[idx] = lf->n.count;    zbtSetSep(p, idx, zbtNodeMin((zbtNode *)lf));
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -560,8 +603,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
             memmove(&R->elems[0], &R->elems[1], (R->n.count - 1) * sizeof(zbtElem *));
             R->n.count--;
             lf->n.count++;
-            p->csize[idx] = lf->n.count;     p->sep[idx] = zbtNodeMin((zbtNode *)lf);
-            p->csize[idx + 1] = R->n.count;  p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
+            p->csize[idx] = lf->n.count;     zbtSetSep(p, idx, zbtNodeMin((zbtNode *)lf));
+            p->csize[idx + 1] = R->n.count;  zbtSetSep(p, idx + 1, zbtNodeMin((zbtNode *)R));
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -764,37 +807,81 @@ zbtElem *zbtPrev(zbtree *t, zbtElem *e) {
  * Range queries
  *----------------------------------------------------------------------------*/
 
-/* Count the elements at the start of the sorted order for which before()
- * returns true. 'before' must be monotonic in tree order (true for a prefix,
- * then false). */
-typedef int (*zbtBeforeFn)(const zbtElem *e, void *arg);
+/* The two partition functions below split the sorted order into a passing
+ * prefix and a failing suffix under a monotonic predicate (true for a prefix
+ * of the order, then false), in one root-to-leaf descent. They return the
+ * size of the passing prefix, and optionally the position of the first
+ * failing element as (*lf_out, *idx_out). When every element of the chosen
+ * leaf passes, *idx_out == (*lf_out)->n.count and the first failing element
+ * (if any) is the first element of the next leaf.
+ *
+ * Each inner level binary-searches the first failing separator in [1, count)
+ * and descends into the child before it: children left of that child contain
+ * only passing elements (each is bounded above by a passing separator), and
+ * their csize[] prefix is accumulated into the count. */
 
-static unsigned long zbtCountBefore(zbtree *t, zbtBeforeFn before, void *arg) {
+/* Score partition: passing means (inclusive ? score <= v : score < v).
+ * Score predicates ignore the member, so inner levels compare only the
+ * contiguous sepscore cache and never dereference an element. */
+static unsigned long zbtPartitionScore(zbtree *t, double v, int inclusive,
+                                       zbtLeaf **lf_out, int *idx_out) {
     unsigned long cnt = 0;
     zbtNode *n = t->root;
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
-        int i = 0;
-        while (i < (int)in->n.count - 1 && before(in->sep[i + 1], arg)) {
-            cnt += in->csize[i];
-            i++;
+        int lo = 1, hi = (int)in->n.count;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            int pass = inclusive ? (in->sepscore[mid] <= v)
+                                 : (in->sepscore[mid] < v);
+            if (pass) lo = mid + 1; else hi = mid;
         }
-        n = in->child[i];
+        for (int i = 0; i < lo - 1; i++) cnt += in->csize[i];
+        n = in->child[lo - 1];
     }
     zbtLeaf *lf = (zbtLeaf *)n;
-    for (uint32_t i = 0; i < lf->n.count; i++) {
-        if (before(lf->elems[i], arg)) cnt++;
-        else break;
+    int lo = 0, hi = (int)lf->n.count;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        double s = lf->elems[mid]->score;
+        int pass = inclusive ? (s <= v) : (s < v);
+        if (pass) lo = mid + 1; else hi = mid;
     }
+    cnt += lo;
+    if (lf_out) *lf_out = lf;
+    if (idx_out) *idx_out = lo;
     return cnt;
 }
 
-/* Predicates for score ranges. */
-static int beforeScoreLt(const zbtElem *e, void *arg) {
-    return e->score < *(double *)arg;
-}
-static int beforeScoreLe(const zbtElem *e, void *arg) {
-    return e->score <= *(double *)arg;
+/* Generic-predicate partition, used for lex ranges (the predicate has to
+ * examine the member, so each binary-search probe dereferences one
+ * element). */
+typedef int (*zbtBeforeFn)(const zbtElem *e, void *arg);
+
+static unsigned long zbtPartitionFn(zbtree *t, zbtBeforeFn before, void *arg,
+                                    zbtLeaf **lf_out, int *idx_out) {
+    unsigned long cnt = 0;
+    zbtNode *n = t->root;
+    while (!n->isleaf) {
+        zbtInner *in = (zbtInner *)n;
+        int lo = 1, hi = (int)in->n.count;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (before(in->sep[mid], arg)) lo = mid + 1; else hi = mid;
+        }
+        for (int i = 0; i < lo - 1; i++) cnt += in->csize[i];
+        n = in->child[lo - 1];
+    }
+    zbtLeaf *lf = (zbtLeaf *)n;
+    int lo = 0, hi = (int)lf->n.count;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (before(lf->elems[mid], arg)) lo = mid + 1; else hi = mid;
+    }
+    cnt += lo;
+    if (lf_out) *lf_out = lf;
+    if (idx_out) *idx_out = lo;
+    return cnt;
 }
 
 /* Predicates for lex ranges. */
@@ -823,23 +910,20 @@ static zbtElem *zbtNthGeneric(zbtree *t, long n, unsigned long *out_rank,
 zbtElem *zbtNthInRange(zbtree *t, zrangespec *range, long n,
                        unsigned long *out_rank, zbtIter *it) {
     if (t->length == 0) return NULL;
-    double minv = range->min, maxv = range->max;
     /* Elements strictly before the range start. */
-    unsigned long before = range->minex ?
-        zbtCountBefore(t, beforeScoreLe, &minv) :
-        zbtCountBefore(t, beforeScoreLt, &minv);
+    unsigned long before =
+        zbtPartitionScore(t, range->min, range->minex, NULL, NULL);
     /* Elements up to and including the range end. */
-    unsigned long upto = range->maxex ?
-        zbtCountBefore(t, beforeScoreLt, &maxv) :
-        zbtCountBefore(t, beforeScoreLe, &maxv);
+    unsigned long upto =
+        zbtPartitionScore(t, range->max, !range->maxex, NULL, NULL);
     return zbtNthGeneric(t, n, out_rank, it, before + 1, upto);
 }
 
 zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
                           unsigned long *out_rank, zbtIter *it) {
     if (t->length == 0) return NULL;
-    unsigned long before = zbtCountBefore(t, beforeNotGteMin, range);
-    unsigned long upto = zbtCountBefore(t, beforeLteMax, range);
+    unsigned long before = zbtPartitionFn(t, beforeNotGteMin, range, NULL, NULL);
+    unsigned long upto = zbtPartitionFn(t, beforeLteMax, range, NULL, NULL);
     return zbtNthGeneric(t, n, out_rank, it, before + 1, upto);
 }
 
@@ -896,21 +980,18 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
 
 unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
     if (t->length == 0) return 0;
-    double minv = range->min, maxv = range->max;
-    unsigned long before = range->minex ?
-        zbtCountBefore(t, beforeScoreLe, &minv) :
-        zbtCountBefore(t, beforeScoreLt, &minv);
-    unsigned long upto = range->maxex ?
-        zbtCountBefore(t, beforeScoreLt, &maxv) :
-        zbtCountBefore(t, beforeScoreLe, &maxv);
+    unsigned long before =
+        zbtPartitionScore(t, range->min, range->minex, NULL, NULL);
+    unsigned long upto =
+        zbtPartitionScore(t, range->max, !range->maxex, NULL, NULL);
     if (before >= upto) return 0;
     return zbtDeleteRankRange(t, before + 1, upto, d);
 }
 
 unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d) {
     if (t->length == 0) return 0;
-    unsigned long before = zbtCountBefore(t, beforeNotGteMin, range);
-    unsigned long upto = zbtCountBefore(t, beforeLteMax, range);
+    unsigned long before = zbtPartitionFn(t, beforeNotGteMin, range, NULL, NULL);
+    unsigned long upto = zbtPartitionFn(t, beforeLteMax, range, NULL, NULL);
     if (before >= upto) return 0;
     return zbtDeleteRankRange(t, before + 1, upto, d);
 }
@@ -1101,6 +1182,7 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
     for (uint32_t i = 0; i < n->count; i++) {
         serverAssert(in->child[i]->parent == n);
         serverAssert(zbtNodeMinDescend(in->child[i]) == in->sep[i]);
+        serverAssert(in->sepscore[i] == in->sep[i]->score);
         unsigned long cs = zbtVerifyNode(t, in->child[i], depth + 1, leafdepth);
         serverAssert(cs == in->csize[i]);
         total += cs;
@@ -1231,6 +1313,42 @@ int zbtreeTest(int argc, char **argv, int flags) {
     for (int i = 0; i < N; i++) sdsfree(elements[i].ele);
     zfree(elements);
     zbtFree(t);
+
+    /* --- Duplicate-score-heavy workload ---
+     * With only 7 distinct scores every separator comparison degenerates to
+     * the member tie-break, exercising the sdscmp arm of the binary searches
+     * through splits, merges and borrows. */
+    {
+        const int M = 5000;
+        zbtree *dt = zbtCreate();
+        zbtElem **held = zmalloc(sizeof(zbtElem *) * M);
+        for (int i = 0; i < M; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "dup:%d", i * 7919 % M);
+            sds s = sdsnew(buf);
+            held[i] = zbtInsert(dt, (double)(i % 7), s);
+            sdsfree(s);
+            if (i % 97 == 0) zbtDebugVerify(dt);
+        }
+        zbtDebugVerify(dt);
+        for (int i = 0; i < M; i++) {
+            zbtElem *e = held[i];
+            unsigned long rank = zbtGetRank(dt, e->score, zbtGetEle(e));
+            assert(rank != 0);
+            assert(zbtElemByRank(dt, rank, NULL) == e);
+            assert(zbtRankByElem(dt, e) == rank);
+        }
+        /* Delete two thirds in scattered order, verifying as we go. */
+        for (int i = 0; i < M; i++) {
+            if (i % 3 == 0) continue;
+            zbtDeleteElem(dt, held[i]);
+            if (i % 101 == 0) zbtDebugVerify(dt);
+        }
+        zbtDebugVerify(dt);
+        assert(dt->length == (unsigned long)(M + 2) / 3);
+        zbtFree(dt);
+        test_cond("Duplicate-score tie-break workload", 1);
+    }
 
     /* --- Bottom-up bulk build and batched range deletion --- */
     for (int trial = 0; trial < 3; trial++) {
