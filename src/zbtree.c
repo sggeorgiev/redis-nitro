@@ -927,6 +927,26 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
     return zbtNthGeneric(t, n, out_rank, it, before + 1, upto);
 }
 
+/* Number of elements inside a score range. Two partition descents are enough:
+ * the range holds everything up to its end minus everything before its start.
+ * Inverted or empty ranges make the difference non-positive and count 0. */
+unsigned long zbtCountInRange(zbtree *t, zrangespec *range) {
+    if (t->length == 0) return 0;
+    unsigned long before =
+        zbtPartitionScore(t, range->min, range->minex, NULL, NULL);
+    unsigned long upto =
+        zbtPartitionScore(t, range->max, !range->maxex, NULL, NULL);
+    return upto > before ? upto - before : 0;
+}
+
+/* Number of elements inside a lex range. See zbtCountInRange(). */
+unsigned long zbtCountInLexRange(zbtree *t, zlexrangespec *range) {
+    if (t->length == 0) return 0;
+    unsigned long before = zbtPartitionFn(t, beforeNotGteMin, range, NULL, NULL);
+    unsigned long upto = zbtPartitionFn(t, beforeLteMax, range, NULL, NULL);
+    return upto > before ? upto - before : 0;
+}
+
 /*-----------------------------------------------------------------------------
  * Range deletion (also removes the members from the ZSET dict)
  *----------------------------------------------------------------------------*/
@@ -1348,6 +1368,92 @@ int zbtreeTest(int argc, char **argv, int flags) {
         assert(dt->length == (unsigned long)(M + 2) / 3);
         zbtFree(dt);
         test_cond("Duplicate-score tie-break workload", 1);
+    }
+
+    /* --- Range counting against a brute-force scan ---
+     * Four elements share every score, so range bounds land both on and
+     * between distinct scores. The tree is bulk built, which packs leaves
+     * exactly full, so bounds at multiples of ZBT_LEAF_MAX/4 fall on leaf
+     * boundaries and exercise the exact-separator descent. */
+    {
+        const int M = 3000;
+        zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
+        for (int i = 0; i < M; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "cnt:%06d", i);
+            sds s = sdsnew(buf);
+            arr[i] = zbtCreateElem((double)(i / 4), s);
+            sdsfree(s);
+        }
+        zbtree *ct = zbtCreate();
+        zbtBuildFromSorted(ct, arr, M);
+        zfree(arr);
+        zbtDebugVerify(ct);
+
+        static const double bounds[] = {-100, 0, 1, 15, 16, 63, 64, 100,
+                                        374, 749, 750, 10000};
+        int nb = (int)(sizeof(bounds) / sizeof(bounds[0]));
+        for (int a = 0; a < nb; a++) {
+            for (int b = 0; b < nb; b++) {
+                for (int ex = 0; ex < 4; ex++) {
+                    zrangespec rs = {.min = bounds[a], .max = bounds[b],
+                                     .minex = ex & 1, .maxex = (ex >> 1) & 1};
+                    /* Brute-force reference over the whole leaf chain. */
+                    unsigned long want = 0;
+                    zbtIter bit;
+                    for (zbtElem *e = zbtFirst(ct, &bit); e;
+                         e = zbtIterNext(&bit)) {
+                        if (zslValueGteMin(e->score, &rs) &&
+                            zslValueLteMax(e->score, &rs)) want++;
+                    }
+                    serverAssert(zbtCountInRange(ct, &rs) == want);
+                }
+            }
+        }
+        zbtFree(ct);
+
+        /* Lex ranges: one shared score forces every comparison through the
+         * member, which is what the lex predicates look at. */
+        const int L = 2000;
+        arr = zmalloc(sizeof(zbtElem *) * L);
+        for (int i = 0; i < L; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "lex:%06d", i);
+            sds s = sdsnew(buf);
+            arr[i] = zbtCreateElem(1.0, s);
+            sdsfree(s);
+        }
+        zbtree *lt = zbtCreate();
+        zbtBuildFromSorted(lt, arr, L);
+        zfree(arr);
+        zbtDebugVerify(lt);
+
+        static const int lexb[] = {-1, 0, 1, 63, 64, 999, 1999, 2000};
+        int nl = (int)(sizeof(lexb) / sizeof(lexb[0]));
+        for (int a = 0; a < nl; a++) {
+            for (int b = 0; b < nl; b++) {
+                for (int ex = 0; ex < 4; ex++) {
+                    char lo[32], hi[32];
+                    snprintf(lo, sizeof(lo), "lex:%06d", lexb[a]);
+                    snprintf(hi, sizeof(hi), "lex:%06d", lexb[b]);
+                    zlexrangespec ls = {.min = sdsnew(lo), .max = sdsnew(hi),
+                                        .minex = ex & 1, .maxex = (ex >> 1) & 1};
+                    unsigned long want = 0;
+                    zbtIter bit;
+                    for (zbtElem *e = zbtFirst(lt, &bit); e;
+                         e = zbtIterNext(&bit)) {
+                        sds v = zbtGetEle(e);
+                        if (zslLexValueGteMin(v, &ls) &&
+                            zslLexValueLteMax(v, &ls)) want++;
+                    }
+                    serverAssert(zbtCountInLexRange(lt, &ls) == want);
+                    sdsfree(ls.min);
+                    sdsfree(ls.max);
+                }
+            }
+        }
+        zbtFree(lt);
+        test_cond("Range counting matches brute force", 1);
     }
 
     /* --- Bottom-up bulk build and batched range deletion --- */

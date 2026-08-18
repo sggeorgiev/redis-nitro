@@ -3034,25 +3034,7 @@ void zcountCommand(client *c) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
-        zbtree *t = zs->tree;
-        zbtElem *zn;
-        unsigned long rank;
-
-        /* Find first element in range and get its rank */
-        zn = zbtNthInRange(t, &range, 0, &rank, NULL);
-
-        /* Use rank of first element, if any, to determine preliminary count */
-        if (zn != NULL) {
-            count = (t->length - (rank - 1));
-
-            /* Find last element in range and get its rank */
-            zn = zbtNthInRange(t, &range, -1, &rank, NULL);
-
-            /* Use rank of last element, if any, to determine the actual count */
-            if (zn != NULL) {
-                count -= (t->length - rank);
-            }
-        }
+        count = zbtCountInRange(zs->tree, &range);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -3110,25 +3092,7 @@ void zlexcountCommand(client *c) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
-        zbtree *t = zs->tree;
-        zbtElem *zn;
-        unsigned long rank;
-
-        /* Find first element in range and get its rank */
-        zn = zbtNthInLexRange(t, &range, 0, &rank, NULL);
-
-        /* Use rank of first element, if any, to determine preliminary count */
-        if (zn != NULL) {
-            count = (t->length - (rank - 1));
-
-            /* Find last element in range and get its rank */
-            zn = zbtNthInLexRange(t, &range, -1, &rank, NULL);
-
-            /* Use rank of last element, if any, to determine the actual count */
-            if (zn != NULL) {
-                count -= (t->length - rank);
-            }
-        }
+        count = zbtCountInLexRange(zs->tree, &range);
     } else {
         serverPanic("Unknown sorted set encoding");
     }

@@ -3824,6 +3824,8 @@ zbtElem *zbtNext(zbtree *t, zbtElem *e);
 zbtElem *zbtPrev(zbtree *t, zbtElem *e);
 zbtElem *zbtNthInRange(zbtree *t, zrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
 zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
+unsigned long zbtCountInRange(zbtree *t, zrangespec *range);
+unsigned long zbtCountInLexRange(zbtree *t, zlexrangespec *range);
 unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d);
 unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d);
 unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start, unsigned int end, dict *d);
