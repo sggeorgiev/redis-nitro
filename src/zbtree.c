@@ -892,39 +892,164 @@ static int beforeLteMax(const zbtElem *e, void *arg) {
     return zslLexValueLteMax(zbtGetEle((zbtElem *)e), (zlexrangespec *)arg);
 }
 
-/* Shared implementation once the [firstRank, lastRank] window of the range
- * is known. Mirrors the skiplist zslNthIn*Range semantics: n >= 0 counts
- * forward from the first in-range element, n < 0 counts back from the last. */
-static zbtElem *zbtNthGeneric(zbtree *t, long n, unsigned long *out_rank,
-                              zbtIter *it, unsigned long firstRank,
-                              unsigned long lastRank) {
-    if (firstRank == 0 || firstRank > lastRank) return NULL;
-    long target;
-    if (n >= 0) target = (long)firstRank + n;
-    else target = (long)lastRank + 1 + n;
-    if (target < (long)firstRank || target > (long)lastRank) return NULL;
-    if (out_rank) *out_rank = (unsigned long)target;
-    return zbtElemByRank(t, (unsigned long)target, it);
+/* Position 'it' on the partition point reported by a partition descent (the
+ * first failing element) and return it, or NULL when the whole tree passes.
+ *
+ * When every element of the reported leaf passes, the partition point is the
+ * separator of the next subtree, which in leaf order is the first element of
+ * the next leaf. */
+static zbtElem *zbtElemAtPartition(zbtLeaf *lf, int idx, zbtIter *it) {
+    if (idx < (int)lf->n.count) {
+        it->leaf = (zbtNode *)lf;
+        it->idx = idx;
+        return lf->elems[idx];
+    }
+    zbtLeaf *nx = lf->next;
+    if (!nx || nx->n.count == 0) return NULL;
+    it->leaf = (zbtNode *)nx;
+    it->idx = 0;
+    return nx->elems[0];
 }
 
+/* First element of a score range, or NULL if the range holds nothing.
+ *
+ * A single partition descent both counts the elements before the range start
+ * and lands on the first element that is not before it. That element is in
+ * range unless it already runs past the range end, which is the only extra
+ * check needed: the order is monotonic, so if the first candidate exceeds the
+ * end then no element can be in range. '*out_rank' receives its 1-based rank
+ * and 'it' is positioned on it, ready to be stepped with zbtIterNext(). */
+zbtElem *zbtFirstInRange(zbtree *t, zrangespec *range, unsigned long *out_rank,
+                         zbtIter *it) {
+    if (t->length == 0) return NULL;
+    zbtIter local;
+    if (!it) it = &local;
+    zbtLeaf *lf;
+    int idx;
+    unsigned long before =
+        zbtPartitionScore(t, range->min, range->minex, &lf, &idx);
+    zbtElem *e = zbtElemAtPartition(lf, idx, it);
+    if (!e) return NULL;
+    if (!zslValueLteMax(e->score, range)) return NULL;
+    if (out_rank) *out_rank = before + 1;
+    return e;
+}
+
+/* Last element of a score range, or NULL if the range holds nothing. The
+ * partition counts everything up to the range end, so the last in-range
+ * candidate is the element right before the partition point. */
+zbtElem *zbtLastInRange(zbtree *t, zrangespec *range, unsigned long *out_rank,
+                        zbtIter *it) {
+    if (t->length == 0) return NULL;
+    zbtLeaf *lf;
+    int idx;
+    unsigned long upto =
+        zbtPartitionScore(t, range->max, !range->maxex, &lf, &idx);
+    if (upto == 0) return NULL;
+    /* A non-empty passing prefix always leaves the partition point at least
+     * one slot into its leaf: the descent only enters a subtree whose minimum
+     * passes, so the leaf's first element passes too. */
+    serverAssert(idx >= 1);
+    zbtElem *e = lf->elems[idx - 1];
+    if (!zslValueGteMin(e->score, range)) return NULL;
+    if (it) { it->leaf = (zbtNode *)lf; it->idx = idx - 1; }
+    if (out_rank) *out_rank = upto;
+    return e;
+}
+
+/* Lex-range counterparts of the two functions above. */
+zbtElem *zbtFirstInLexRange(zbtree *t, zlexrangespec *range,
+                            unsigned long *out_rank, zbtIter *it) {
+    if (t->length == 0) return NULL;
+    zbtIter local;
+    if (!it) it = &local;
+    zbtLeaf *lf;
+    int idx;
+    unsigned long before = zbtPartitionFn(t, beforeNotGteMin, range, &lf, &idx);
+    zbtElem *e = zbtElemAtPartition(lf, idx, it);
+    if (!e) return NULL;
+    if (!zslLexValueLteMax(zbtGetEle(e), range)) return NULL;
+    if (out_rank) *out_rank = before + 1;
+    return e;
+}
+
+zbtElem *zbtLastInLexRange(zbtree *t, zlexrangespec *range,
+                           unsigned long *out_rank, zbtIter *it) {
+    if (t->length == 0) return NULL;
+    zbtLeaf *lf;
+    int idx;
+    unsigned long upto = zbtPartitionFn(t, beforeLteMax, range, &lf, &idx);
+    if (upto == 0) return NULL;
+    serverAssert(idx >= 1);
+    zbtElem *e = lf->elems[idx - 1];
+    if (!zslLexValueGteMin(zbtGetEle(e), range)) return NULL;
+    if (it) { it->leaf = (zbtNode *)lf; it->idx = idx - 1; }
+    if (out_rank) *out_rank = upto;
+    return e;
+}
+
+/* Mirrors the skiplist zslNthIn*Range semantics: n >= 0 counts forward from
+ * the first in-range element, n < 0 counts back from the last. The edge of
+ * the range is found with one seek and the offset is then resolved by rank,
+ * so the opposite edge never has to be located. Checking the resolved element
+ * against the far bound is equivalent to comparing its rank with the opposite
+ * edge's rank, the order being monotonic. */
 zbtElem *zbtNthInRange(zbtree *t, zrangespec *range, long n,
                        unsigned long *out_rank, zbtIter *it) {
-    if (t->length == 0) return NULL;
-    /* Elements strictly before the range start. */
-    unsigned long before =
-        zbtPartitionScore(t, range->min, range->minex, NULL, NULL);
-    /* Elements up to and including the range end. */
-    unsigned long upto =
-        zbtPartitionScore(t, range->max, !range->maxex, NULL, NULL);
-    return zbtNthGeneric(t, n, out_rank, it, before + 1, upto);
+    if (n >= 0) {
+        unsigned long frank;
+        zbtElem *e = zbtFirstInRange(t, range, &frank, it);
+        if (!e) return NULL;
+        if (n > 0) {
+            frank += (unsigned long)n;
+            e = zbtElemByRank(t, frank, it);
+            if (!e || !zslValueLteMax(e->score, range)) return NULL;
+        }
+        if (out_rank) *out_rank = frank;
+        return e;
+    }
+
+    unsigned long lrank;
+    zbtElem *e = zbtLastInRange(t, range, &lrank, it);
+    if (!e) return NULL;
+    if (n < -1) {
+        long target = (long)lrank + 1 + n;
+        if (target < 1) return NULL;
+        lrank = (unsigned long)target;
+        e = zbtElemByRank(t, lrank, it);
+        if (!e || !zslValueGteMin(e->score, range)) return NULL;
+    }
+    if (out_rank) *out_rank = lrank;
+    return e;
 }
 
 zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
                           unsigned long *out_rank, zbtIter *it) {
-    if (t->length == 0) return NULL;
-    unsigned long before = zbtPartitionFn(t, beforeNotGteMin, range, NULL, NULL);
-    unsigned long upto = zbtPartitionFn(t, beforeLteMax, range, NULL, NULL);
-    return zbtNthGeneric(t, n, out_rank, it, before + 1, upto);
+    if (n >= 0) {
+        unsigned long frank;
+        zbtElem *e = zbtFirstInLexRange(t, range, &frank, it);
+        if (!e) return NULL;
+        if (n > 0) {
+            frank += (unsigned long)n;
+            e = zbtElemByRank(t, frank, it);
+            if (!e || !zslLexValueLteMax(zbtGetEle(e), range)) return NULL;
+        }
+        if (out_rank) *out_rank = frank;
+        return e;
+    }
+
+    unsigned long lrank;
+    zbtElem *e = zbtLastInLexRange(t, range, &lrank, it);
+    if (!e) return NULL;
+    if (n < -1) {
+        long target = (long)lrank + 1 + n;
+        if (target < 1) return NULL;
+        lrank = (unsigned long)target;
+        e = zbtElemByRank(t, lrank, it);
+        if (!e || !zslLexValueGteMin(zbtGetEle(e), range)) return NULL;
+    }
+    if (out_rank) *out_rank = lrank;
+    return e;
 }
 
 /* Number of elements inside a score range. Two partition descents are enough:
@@ -1399,14 +1524,63 @@ int zbtreeTest(int argc, char **argv, int flags) {
                     zrangespec rs = {.min = bounds[a], .max = bounds[b],
                                      .minex = ex & 1, .maxex = (ex >> 1) & 1};
                     /* Brute-force reference over the whole leaf chain. */
-                    unsigned long want = 0;
+                    unsigned long want = 0, wfrank = 0, wlrank = 0;
+                    zbtElem *wfirst = NULL, *wsecond = NULL, *wlast = NULL;
+                    unsigned long rank = 0;
                     zbtIter bit;
                     for (zbtElem *e = zbtFirst(ct, &bit); e;
                          e = zbtIterNext(&bit)) {
+                        rank++;
                         if (zslValueGteMin(e->score, &rs) &&
-                            zslValueLteMax(e->score, &rs)) want++;
+                            zslValueLteMax(e->score, &rs)) {
+                            if (!want) { wfirst = e; wfrank = rank; }
+                            else if (want == 1) wsecond = e;
+                            wlast = e; wlrank = rank;
+                            want++;
+                        }
                     }
                     serverAssert(zbtCountInRange(ct, &rs) == want);
+
+                    /* First/last seek: element, rank and iterator position. */
+                    unsigned long got_rank = 0;
+                    zbtIter fit;
+                    zbtElem *f = zbtFirstInRange(ct, &rs, &got_rank, &fit);
+                    serverAssert(f == wfirst);
+                    if (f) {
+                        serverAssert(got_rank == wfrank);
+                        serverAssert(zbtIterNext(&fit) == wsecond ||
+                                     want == 1);
+                    }
+                    zbtIter lit;
+                    zbtElem *l = zbtLastInRange(ct, &rs, &got_rank, &lit);
+                    serverAssert(l == wlast);
+                    if (l) {
+                        serverAssert(got_rank == wlrank);
+                        serverAssert(zbtIterPrev(&lit) == NULL || want >= 1);
+                    }
+
+                    /* Offset-based access must agree with the reference. */
+                    static const long offs[] = {0, 1, 2, -1, -2, -3, 5000};
+                    for (int oi = 0; oi < (int)(sizeof(offs)/sizeof(offs[0]));
+                         oi++) {
+                        long nth = offs[oi];
+                        unsigned long target = 0;
+                        if (nth >= 0) {
+                            if ((unsigned long)nth < want)
+                                target = wfrank + (unsigned long)nth;
+                        } else {
+                            long back = -nth - 1;
+                            if ((unsigned long)back < want)
+                                target = wlrank - (unsigned long)back;
+                        }
+                        zbtElem *want_e = target ?
+                            zbtElemByRank(ct, target, NULL) : NULL;
+                        got_rank = 0;
+                        zbtElem *got_e =
+                            zbtNthInRange(ct, &rs, nth, &got_rank, NULL);
+                        serverAssert(got_e == want_e);
+                        if (got_e) serverAssert(got_rank == target);
+                    }
                 }
             }
         }
@@ -1438,22 +1612,66 @@ int zbtreeTest(int argc, char **argv, int flags) {
                     snprintf(hi, sizeof(hi), "lex:%06d", lexb[b]);
                     zlexrangespec ls = {.min = sdsnew(lo), .max = sdsnew(hi),
                                         .minex = ex & 1, .maxex = (ex >> 1) & 1};
-                    unsigned long want = 0;
+                    unsigned long want = 0, wfrank = 0, wlrank = 0;
+                    zbtElem *wfirst = NULL, *wsecond = NULL, *wlast = NULL;
+                    unsigned long rank = 0;
                     zbtIter bit;
                     for (zbtElem *e = zbtFirst(lt, &bit); e;
                          e = zbtIterNext(&bit)) {
                         sds v = zbtGetEle(e);
+                        rank++;
                         if (zslLexValueGteMin(v, &ls) &&
-                            zslLexValueLteMax(v, &ls)) want++;
+                            zslLexValueLteMax(v, &ls)) {
+                            if (!want) { wfirst = e; wfrank = rank; }
+                            else if (want == 1) wsecond = e;
+                            wlast = e; wlrank = rank;
+                            want++;
+                        }
                     }
                     serverAssert(zbtCountInLexRange(lt, &ls) == want);
+
+                    unsigned long got_rank = 0;
+                    zbtIter fit;
+                    zbtElem *f = zbtFirstInLexRange(lt, &ls, &got_rank, &fit);
+                    serverAssert(f == wfirst);
+                    if (f) {
+                        serverAssert(got_rank == wfrank);
+                        serverAssert(zbtIterNext(&fit) == wsecond ||
+                                     want == 1);
+                    }
+                    zbtElem *l = zbtLastInLexRange(lt, &ls, &got_rank, NULL);
+                    serverAssert(l == wlast);
+                    if (l) serverAssert(got_rank == wlrank);
+
+                    /* Offsets, including past both ends of the range. */
+                    static const long loffs[] = {0, 1, -1, -2, 3000};
+                    for (int oi = 0; oi < (int)(sizeof(loffs)/sizeof(loffs[0]));
+                         oi++) {
+                        long nth = loffs[oi];
+                        unsigned long target = 0;
+                        if (nth >= 0) {
+                            if ((unsigned long)nth < want)
+                                target = wfrank + (unsigned long)nth;
+                        } else {
+                            long back = -nth - 1;
+                            if ((unsigned long)back < want)
+                                target = wlrank - (unsigned long)back;
+                        }
+                        zbtElem *want_e = target ?
+                            zbtElemByRank(lt, target, NULL) : NULL;
+                        got_rank = 0;
+                        zbtElem *got_e =
+                            zbtNthInLexRange(lt, &ls, nth, &got_rank, NULL);
+                        serverAssert(got_e == want_e);
+                        if (got_e) serverAssert(got_rank == target);
+                    }
                     sdsfree(ls.min);
                     sdsfree(ls.max);
                 }
             }
         }
         zbtFree(lt);
-        test_cond("Range counting matches brute force", 1);
+        test_cond("Range count/seek/nth match brute force", 1);
     }
 
     /* --- Bottom-up bulk build and batched range deletion --- */
