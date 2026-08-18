@@ -739,12 +739,31 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
         zbtUpdateToRoot(t, (zbtNode *)lf);
 }
 
+/* Last element of the leaf preceding 'lf', or NULL when 'lf' starts the tree.
+ * Every leaf except a lone root leaf is at least half full, so a sibling in the
+ * chain always has an element to report. */
+static zbtElem *zbtElemBeforeLeaf(zbtLeaf *lf) {
+    zbtLeaf *pv = lf->prev;
+    return pv ? pv->elems[pv->n.count - 1] : NULL;
+}
+
+/* First element of the leaf following 'lf', or NULL when 'lf' ends the tree. */
+static zbtElem *zbtElemAfterLeaf(zbtLeaf *lf) {
+    zbtLeaf *nx = lf->next;
+    return nx ? nx->elems[0] : NULL;
+}
+
 /* Move an existing element to reflect a new score. The element object is
- * reused so the ZSET dict entry does not need updating. */
+ * reused so the ZSET dict entry does not need updating.
+ *
+ * A score change usually leaves the element in the leaf it already occupies:
+ * ZINCRBY on a leaderboard moves it by a small delta, and it has to overtake a
+ * whole leaf's worth of members to land anywhere else. Handling that in place
+ * avoids the delete-and-reinsert pair of descents along with the
+ * rebalance-then-split churn that can come with them. */
 void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
-    /* Remove and reinsert. We must remove from the dict? No: the dict maps
-     * member -> elem and the member is unchanged, so only the tree position
-     * changes. Detach the element object, reinsert it with the new score. */
+    /* The dict maps member -> elem and the member is unchanged, so whatever
+     * happens below, the dict entry stays valid. */
     double score = e->score;
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = zbtFindLeaf(t, score, ele);
@@ -752,6 +771,49 @@ void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     int idx = zbtLeafSearch(lf, score, ele, &found);
     serverAssert(found && lf->elems[idx] == e);
 
+    /* The element stays in this leaf as long as the new score keeps it within
+     * the key span the leaf owns, which the elements flanking the leaf in the
+     * sibling chain delimit. Staying inside that span is what makes the update
+     * invisible to the rest of the tree: the leaf's minimum may change, and
+     * with it this leaf's separator, but it still orders strictly between the
+     * neighbouring subtrees, so no descent is misdirected. */
+    zbtElem *lpred = zbtElemBeforeLeaf(lf);
+    zbtElem *lsucc = zbtElemAfterLeaf(lf);
+    if ((lpred == NULL || zbtCompare(newscore, ele, lpred) > 0) &&
+        (lsucc == NULL || zbtCompare(newscore, ele, lsucc) < 0))
+    {
+        int nidx = idx;
+        zbtElem *pred = idx > 0 ? lf->elems[idx - 1] : NULL;
+        zbtElem *succ = idx + 1 < (int)lf->n.count ? lf->elems[idx + 1] : NULL;
+
+        if ((pred == NULL || zbtCompare(newscore, ele, pred) > 0) &&
+            (succ == NULL || zbtCompare(newscore, ele, succ) < 0))
+        {
+            /* Its neighbours still bracket it: the slot does not change. */
+            e->score = newscore;
+        } else {
+            /* Re-seat it within the leaf. The element count is unchanged, so
+             * nothing above the leaf has to be resized. */
+            lf->n.count--;
+            memmove(&lf->elems[idx], &lf->elems[idx + 1],
+                    ((int)lf->n.count - idx) * sizeof(zbtElem *));
+            e->score = newscore;
+            nidx = zbtLeafSearch(lf, newscore, ele, &found);
+            serverAssert(!found);
+            memmove(&lf->elems[nidx + 1], &lf->elems[nidx],
+                    ((int)lf->n.count - nidx) * sizeof(zbtElem *));
+            lf->elems[nidx] = e;
+            lf->n.count++;
+        }
+
+        /* Whenever the leaf's minimum is involved, it is also the separator
+         * some ancestors recorded, and its cached score has just gone stale. */
+        if (idx == 0 || nidx == 0) zbtRefreshLeafSep(t, lf);
+        return;
+    }
+
+    /* Slow path: detach the element (which repairs every separator that
+     * referenced it) and reinsert it at its new position. */
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
     lf->n.count--;
@@ -1870,6 +1932,65 @@ int zbtreeTest(int argc, char **argv, int flags) {
         zbtFree(bt);
     }
     test_cond("Bulk build + range delete", 1);
+
+    /* --- Score updates ---
+     * Deltas are sized to hit each path of zbtUpdateScore(): tiny ones leave
+     * the element where it is, mid-sized ones move it inside its leaf, and
+     * large ones push it into a different subtree entirely. zbtDebugVerify()
+     * re-derives every separator by descending to the leftmost leaf, so it
+     * catches a stale sep[]/sepscore[] left behind by an in-place update. */
+    {
+        const int M = 6000;
+        zbtree *ut = zbtCreate();
+        zbtElem **held = zmalloc(sizeof(zbtElem *) * M);
+        srand(4242);
+        for (int i = 0; i < M; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "up:%06d", i);
+            sds s = sdsnew(buf);
+            /* Dense scores, so a small delta really can cross a neighbour. */
+            held[i] = zbtInsert(ut, (double)(i / 2), s);
+            sdsfree(s);
+        }
+        zbtDebugVerify(ut);
+
+        static const double deltas[] = {0.25, -0.25, 1, -1, 3, -3, 40, -40,
+                                        5000, -5000};
+        int nd = (int)(sizeof(deltas) / sizeof(deltas[0]));
+        for (int round = 0; round < 6; round++) {
+            for (int i = 0; i < M; i++) {
+                zbtElem *e = held[rand() % M];
+                double want = e->score + deltas[rand() % nd];
+                zbtUpdateScore(ut, e, want);
+                serverAssert(e->score == want);
+                /* The element must remain findable at its new score, which
+                 * only holds if every separator on the path is accurate. */
+                serverAssert(zbtGetRank(ut, want, zbtGetEle(e)) != 0);
+                serverAssert(zbtRankByElem(ut, e) ==
+                             zbtGetRank(ut, want, zbtGetEle(e)));
+            }
+            zbtDebugVerify(ut);
+            serverAssert(ut->length == (unsigned long)M);
+        }
+
+        /* Every member is still reachable, and the order is intact. */
+        for (int i = 0; i < M; i++)
+            serverAssert(zbtGetRank(ut, held[i]->score,
+                                    zbtGetEle(held[i])) != 0);
+        zbtIter uit;
+        unsigned long uc = 0;
+        zbtElem *uprev = NULL;
+        for (zbtElem *e = zbtFirst(ut, &uit); e; e = zbtIterNext(&uit)) {
+            if (uprev)
+                serverAssert(zbtCompare(uprev->score, zbtGetEle(uprev), e) < 0);
+            uprev = e;
+            uc++;
+        }
+        serverAssert(uc == (unsigned long)M);
+        zfree(held);
+        zbtFree(ut);
+        test_cond("Score update in place and across leaves", 1);
+    }
 
     /* --- Random-window range deletion ---
      * Windows of every shape (whole leaves, partial leading/trailing leaves,
