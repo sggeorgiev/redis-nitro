@@ -406,10 +406,24 @@ static void zbtSplitLeaf(zbtree *t, zbtLeaf *lf) {
     zbtInsertChild(t, (zbtInner *)lf->n.parent, (zbtNode *)lf, (zbtNode *)r);
 }
 
-/* Place 'e' at slot 'idx' of leaf 'lf', which must be where it belongs in
- * sorted order, and account for it. Splits the leaf if that pushed it over the
- * fan-out, otherwise republishes the leaf upwards. */
-static void zbtInsertIntoLeaf(zbtree *t, zbtLeaf *lf, int idx, zbtElem *e) {
+/* Insert an already-allocated element. The caller must guarantee the member
+ * is not already present. Ownership of 'e' transfers to the tree.
+ *
+ * Ascending insertion deliberately gets no special case here. Short-circuiting
+ * the descent by comparing against the cached tail leaf first was tried and
+ * showed no measurable gain on a monotonic ZADD load: the rightmost
+ * root-to-leaf path is the most cache-resident part of the tree, so descending
+ * it is already close to free, and skipping it saves a few dozen instructions
+ * out of the several thousand a ZADD spends on protocol, dict and allocation.
+ * Every non-appending insert would still pay for the failed check. */
+void zbtInsertElem(zbtree *t, zbtElem *e) {
+    double score = e->score;
+    sds ele = zbtGetEle(e);
+    zbtLeaf *lf = zbtFindLeaf(t, score, ele);
+    int found;
+    int idx = zbtLeafSearch(lf, score, ele, &found);
+    serverAssert(!found);
+
     memmove(&lf->elems[idx + 1], &lf->elems[idx],
             ((int)lf->n.count - idx) * sizeof(zbtElem *));
     lf->elems[idx] = e;
@@ -421,32 +435,6 @@ static void zbtInsertIntoLeaf(zbtree *t, zbtLeaf *lf, int idx, zbtElem *e) {
         zbtSplitLeaf(t, lf);
     else
         zbtUpdateToRoot(t, (zbtNode *)lf);
-}
-
-/* Insert an already-allocated element. The caller must guarantee the member
- * is not already present. Ownership of 'e' transfers to the tree. */
-void zbtInsertElem(zbtree *t, zbtElem *e) {
-    double score = e->score;
-    sds ele = zbtGetEle(e);
-
-    /* Appending past the current maximum is the shape a growing sorted set
-     * takes when scores are timestamps or monotonic counters, and t->tail
-     * already names the leaf it belongs in. One comparison against that leaf's
-     * last element replaces the whole descent; the memmove below degenerates
-     * to nothing, since the slot is the leaf's end. */
-    zbtLeaf *tl = (zbtLeaf *)t->tail;
-    if (tl->n.count > 0 &&
-        zbtCompare(score, ele, tl->elems[tl->n.count - 1]) > 0)
-    {
-        zbtInsertIntoLeaf(t, tl, (int)tl->n.count, e);
-        return;
-    }
-
-    zbtLeaf *lf = zbtFindLeaf(t, score, ele);
-    int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
-    serverAssert(!found);
-    zbtInsertIntoLeaf(t, lf, idx, e);
 }
 
 zbtElem *zbtInsert(zbtree *t, double score, sds ele) {
@@ -1953,10 +1941,11 @@ int zbtreeTest(int argc, char **argv, int flags) {
     }
     test_cond("Bulk build + range delete", 1);
 
-    /* --- Ascending insertion (tail-append fast path) ---
-     * Strictly increasing scores take the append path for every insert;
-     * interleaving descending and random keys forces it to decline and fall
-     * back to a descent, including right at the tail leaf's boundary. */
+    /* --- Ascending insertion ---
+     * A monotonic load (timestamp-like scores) only ever extends the tree at
+     * its high end, which keeps every insert on the rightmost path and splits
+     * only the tail leaf. Ties at the maximum score, then descending and
+     * interior keys, mix the other cases back in. */
     {
         const int M = 6000;
         zbtree *at = zbtCreate();
@@ -2006,7 +1995,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
         }
         serverAssert(ac == at->length);
         zbtFree(at);
-        test_cond("Ascending insert appends at the tail", 1);
+        test_cond("Ascending insert keeps order at the tail", 1);
     }
 
     /* --- Score updates ---
