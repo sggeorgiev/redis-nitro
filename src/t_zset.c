@@ -1991,6 +1991,13 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
      * duplicated elements ASAP. */
     qsort(src+1,setnum-1,sizeof(zsetopsrc),zuiCompareByRevCardinality);
 
+    /* Survivors are staged and moved into the tree in one bottom-up build;
+     * each one is a distinct member of src[0], so its length is the bound.
+     * When src[0] is a sorted set they are produced in tree order, and the
+     * build then needs no sorting at all. */
+    unsigned long nstaged = 0, cap = zuiLength(&src[0]);
+    zbtElem **elems = zmalloc(sizeof(zbtElem *) * cap);
+
     memset(&zval, 0, sizeof(zval));
     zuiInitIterator(&src[0]);
     while (zuiNext(&src[0],&zval)) {
@@ -2012,14 +2019,20 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
 
         if (!exists) {
             tmp = zuiNewSdsFromValue(&zval);
-            znode = zbtInsert(dstzset->tree,zval.score,tmp);
+            znode = zbtCreateElem(zval.score, tmp);
             dictAdd(dstzset->dict, znode, NULL);
+            elems[nstaged++] = znode;
             if (sdslen(tmp) > *maxelelen) *maxelelen = sdslen(tmp);
             (*totelelen) += sdslen(tmp);
-            sdsfree(tmp); /* zbtInsert copied it, we can free our copy */
+            sdsfree(tmp); /* zbtCreateElem copied it, we can free our copy */
         }
     }
     zuiClearIterator(&src[0]);
+
+    serverAssert(nstaged <= cap);
+    zbtSortElems(elems, nstaged);
+    zbtBuildFromSorted(dstzset->tree, elems, nstaged);
+    zfree(elems);
 }
 
 
@@ -2040,31 +2053,51 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
      * size, but this doesn't change the algorithm complexity since K < L, and
      * O(2L) is the same as O(L). */
     int j;
-    int cardinality = 0;
+    int cardinality;
     zsetopval zval;
     zbtElem *znode;
     sds tmp;
 
-    for (j = 0; j < setnum; j++) {
+    /* Fill the result with the first set, staged into a single bottom-up tree
+     * build. The removals below need a tree to delete from, and the fill is
+     * complete before the first of them runs. When the first input is a sorted
+     * set the elements arrive in tree order and the build needs no sorting. */
+    unsigned long nstaged = 0, cap = zuiLength(&src[0]);
+    if (cap) {
+        zbtElem **elems = zmalloc(sizeof(zbtElem *) * cap);
+
+        memset(&zval, 0, sizeof(zval));
+        zuiInitIterator(&src[0]);
+        while (zuiNext(&src[0],&zval)) {
+            tmp = zuiNewSdsFromValue(&zval);
+            znode = zbtCreateElem(zval.score, tmp);
+            dictAdd(dstzset->dict, znode, NULL);
+            elems[nstaged++] = znode;
+            sdsfree(tmp); /* zbtCreateElem copied it, we can free our copy */
+        }
+        zuiClearIterator(&src[0]);
+
+        serverAssert(nstaged <= cap);
+        zbtSortElems(elems, nstaged);
+        zbtBuildFromSorted(dstzset->tree, elems, nstaged);
+        zfree(elems);
+    }
+    cardinality = (int)nstaged;
+
+    /* Remove from the result every element found in any of the other sets,
+     * stopping as soon as nothing is left to remove. */
+    for (j = 1; j < setnum && cardinality; j++) {
         if (zuiLength(&src[j]) == 0) continue;
 
         memset(&zval, 0, sizeof(zval));
         zuiInitIterator(&src[j]);
         while (zuiNext(&src[j],&zval)) {
-            if (j == 0) {
-                tmp = zuiNewSdsFromValue(&zval);
-                znode = zbtInsert(dstzset->tree,zval.score,tmp);
-                dictAdd(dstzset->dict, znode, NULL);
-                cardinality++;
-                sdsfree(tmp); /* zbtInsert copied it, we can free our copy */
-            } else {
-                dictPauseAutoResize(dstzset->dict);
-                tmp = zuiSdsFromValue(&zval);
-                if (zsetRemoveFromSkiplist(dstzset, tmp)) {
-                    cardinality--;
-                }
-                dictResumeAutoResize(dstzset->dict);
+            dictPauseAutoResize(dstzset->dict);
+            tmp = zuiSdsFromValue(&zval);
+            if (zsetRemoveFromSkiplist(dstzset, tmp)) {
+                cardinality--;
             }
+            dictResumeAutoResize(dstzset->dict);
 
             /* Exit if result set is empty as any additional removal
                 * of elements will have no effect. */
@@ -2074,8 +2107,6 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
             }
         }
         zuiClearIterator(&src[j]);
-
-        if (cardinality == 0) break;
     }
 
     /* Resize dict if needed after removing multiple elements */
@@ -2289,6 +2320,15 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     if (op == SET_OP_INTER) {
         /* Skip everything if the smallest input is empty. */
         if (zuiLength(&src[0]) > 0) {
+            /* Result elements are staged here and moved into the destination
+             * tree in one bottom-up build. Every result comes from a distinct
+             * member of src[0], so its length bounds the count. Nothing is
+             * staged for ZINTERCARD, which only counts. */
+            zbtElem **elems = NULL;
+            unsigned long nstaged = 0, cap = zuiLength(&src[0]);
+            if (!cardinality_only)
+                elems = zmalloc(sizeof(zbtElem *) * cap);
+
             /* Precondition: as src[0] is non-empty and the inputs are ordered
              * by size, all src[i > 0] are non-empty too. */
             zuiInitIterator(&src[0]);
@@ -2324,14 +2364,22 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     }
                 } else if (j == setnum) {
                     tmp = zuiNewSdsFromValue(&zval);
-                    znode = zbtInsert(dstzset->tree,score,tmp);
+                    znode = zbtCreateElem(score, tmp);
                     dictAdd(dstzset->dict, znode, NULL);
+                    elems[nstaged++] = znode;
                     totelelen += sdslen(tmp);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
-                    sdsfree(tmp); /* zbtInsert copied it, we can free our copy */
+                    sdsfree(tmp); /* zbtCreateElem copied it, we can free our copy */
                 }
             }
             zuiClearIterator(&src[0]);
+
+            if (elems) {
+                serverAssert(nstaged <= cap);
+                zbtSortElems(elems, nstaged);
+                zbtBuildFromSorted(dstzset->tree, elems, nstaged);
+                zfree(elems);
+            }
         }
     } else if (op == SET_OP_UNION) {
         dictIterator di;
@@ -2387,15 +2435,26 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zuiClearIterator(&src[i]);
         }
 
-        /* Step 2: Done filling dict with elements and updating scores. Now
-         * insert them all into the B+ tree. */
-        dictInitIterator(&di, dstzset->dict);
+        /* Step 2: the dict now holds every result element with its final
+         * score. Sort them and build the tree bottom-up, which is O(K) and
+         * lands every element in place; inserting them one by one would pay a
+         * root-to-leaf descent each, in dict hash order, so on top of the
+         * descents almost every insert would fall in the middle of a leaf. */
+        unsigned long resultlen = dictSize(dstzset->dict);
+        if (resultlen) {
+            zbtElem **elems = zmalloc(sizeof(zbtElem *) * resultlen);
+            unsigned long cnt = 0;
 
-        while((de = dictNext(&di)) != NULL) {
-            zbtElem *elem = dictGetKey(de);
-            zbtInsertElem(dstzset->tree, elem);
+            dictInitIterator(&di, dstzset->dict);
+            while((de = dictNext(&di)) != NULL)
+                elems[cnt++] = dictGetKey(de);
+            dictResetIterator(&di);
+            serverAssert(cnt == resultlen);
+
+            zbtSortElems(elems, resultlen);
+            zbtBuildFromSorted(dstzset->tree, elems, resultlen);
+            zfree(elems);
         }
-        dictResetIterator(&di);
     } else if (op == SET_OP_DIFF) {
         zdiff(src, setnum, dstzset, &maxelelen, &totelelen);
     } else {

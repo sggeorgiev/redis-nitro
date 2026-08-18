@@ -408,6 +408,41 @@ zbtElem *zbtInsert(zbtree *t, double score, sds ele) {
     return e;
 }
 
+/* qsort() comparator ordering an array of zbtElem* by (score, member). */
+int zbtElemPtrCompare(const void *a, const void *b) {
+    zbtElem *ea = *(zbtElem *const *)a;
+    zbtElem *eb = *(zbtElem *const *)b;
+    return zbtCompare(ea->score, zbtGetEle(ea), eb);
+}
+
+/* Put 'elems[0..n)' into the strictly ascending order zbtBuildFromSorted()
+ * requires. Already ascending input is left alone and fully descending input
+ * is reversed, both of which are common (a range walk, or an RDB zset, which
+ * Redis writes in descending order); anything else is sorted. Members must be
+ * unique, which makes the resulting order strict. */
+void zbtSortElems(zbtElem **elems, unsigned long n) {
+    if (n < 2) return;
+
+    int ascending = 1, descending = 1;
+    for (unsigned long i = 1; i < n; i++) {
+        int c = zbtCompare(elems[i - 1]->score, zbtGetEle(elems[i - 1]), elems[i]);
+        if (c >= 0) ascending = 0;
+        if (c <= 0) descending = 0;
+        if (!ascending && !descending) break;
+    }
+
+    if (ascending) return;
+    if (descending) {
+        for (unsigned long i = 0, j = n - 1; i < j; i++, j--) {
+            zbtElem *tmp = elems[i];
+            elems[i] = elems[j];
+            elems[j] = tmp;
+        }
+        return;
+    }
+    qsort(elems, n, sizeof(zbtElem *), zbtElemPtrCompare);
+}
+
 /* Build a packed, balanced tree over 'elems[0..n)' in O(n). The elements must
  * already be strictly ascending by (score, member) and ownership of each one
  * transfers to the tree. 't' must be freshly created and empty. This is much

@@ -3807,6 +3807,8 @@ zbtElem *zbtCreateElem(double score, sds ele);
 zbtElem *zbtCreateElemBuf(double score, const char *buf, size_t len);
 void zbtFreeElem(zbtElem *e);
 void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n);
+void zbtSortElems(zbtElem **elems, unsigned long n);
+int zbtElemPtrCompare(const void *a, const void *b);
 zbtElem *zbtInsert(zbtree *t, double score, sds ele);
 void zbtInsertElem(zbtree *t, zbtElem *e);
 void zbtDeleteElem(zbtree *t, zbtElem *e);

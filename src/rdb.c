@@ -2884,14 +2884,6 @@ static void rdbDiscardTemplateFields(rdbTmplFields *out) {
     out->fields_lp = NULL;
 }
 
-/* qsort() comparator ordering an array of zbtElem* by (score, member), used to
- * normalize arbitrary RDB zset input before the bottom-up tree build. */
-static int zbtElemPtrCompare(const void *a, const void *b) {
-    zbtElem *ea = *(zbtElem *const *)a;
-    zbtElem *eb = *(zbtElem *const *)b;
-    return zbtCompare(ea->score, zbtGetEle(ea), eb);
-}
-
 /* Load a Redis object of the specified type from the specified file.
  * On success a newly allocated object is returned, otherwise NULL.
  *
@@ -3120,24 +3112,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             return NULL;
         }
 
-        /* zbtBuildFromSorted() requires strictly ascending input. Redis writes
-         * zsets to the RDB in descending order, so detect and reverse that fast
-         * path; otherwise sort arbitrary (but valid, dup-free) input. */
-        if (loaded > 1) {
-            int ascending = 1, descending = 1;
-            for (uint64_t i = 1; i < loaded; i++) {
-                int c = zbtCompare(elems[i-1]->score, zbtGetEle(elems[i-1]), elems[i]);
-                if (c >= 0) ascending = 0;
-                if (c <= 0) descending = 0;
-            }
-            if (descending) {
-                for (uint64_t i = 0, j = loaded - 1; i < j; i++, j--) {
-                    zbtElem *tmp = elems[i]; elems[i] = elems[j]; elems[j] = tmp;
-                }
-            } else if (!ascending) {
-                qsort(elems, loaded, sizeof(zbtElem *), zbtElemPtrCompare);
-            }
-        }
+        /* Normalize the arbitrary (but valid, dup-free) RDB order into the
+         * strictly ascending input the bottom-up build requires. */
+        zbtSortElems(elems, loaded);
         zbtBuildFromSorted(zs->tree, elems, loaded);
         zfree(elems);
 
