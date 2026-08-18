@@ -809,13 +809,20 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         int i;
         size_t maxelelen = 0, totelelen = 0;
 
+        zbtElem **elems = NULL;
+
         if (returned_items) {
             zobj = createZsetObject();
             zs = zobj->ptr;
+            /* The results are staged and moved into the tree in one bottom-up
+             * build, which is much cheaper than a descent per point. They come
+             * from a single sorted set, so the members are unique and the
+             * resulting order is strict. */
+            elems = zmalloc(sizeof(zbtElem *) * returned_items);
+            dictExpand(zs->dict, returned_items);
         }
 
         for (i = 0; i < returned_items; i++) {
-            zbtElem *znode;
             geoPoint *gp = ga->array+i;
             gp->dist /= shape.conversion; /* Fix according to unit. */
             double score = storedist ? gp->dist : gp->score;
@@ -823,13 +830,17 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
 
             if (maxelelen < elelen) maxelelen = elelen;
             totelelen += elelen;
-            znode = zbtInsert(zs->tree,score,gp->member);
-            serverAssert(dictAdd(zs->dict, znode, NULL) == DICT_OK);
-            sdsfree(gp->member); /* zbtInsert copies the sds, so free the original */
+            elems[i] = zbtCreateElem(score, gp->member);
+            serverAssert(dictAdd(zs->dict, elems[i], NULL) == DICT_OK);
+            sdsfree(gp->member); /* zbtCreateElem copies the sds */
             gp->member = NULL;
         }
 
         if (returned_items) {
+            zbtSortElems(elems, returned_items);
+            zbtBuildFromSorted(zs->tree, elems, returned_items);
+            zfree(elems);
+
             zsetConvertToListpackIfNeeded(zobj,maxelelen,totelelen);
             setKey(c,c->db,storekey,&zobj,0);
             notifyKeyspaceEvent(NOTIFY_ZSET,flags & GEOSEARCH ? "geosearchstore" : "georadiusstore",storekey,
