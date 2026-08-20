@@ -39,11 +39,19 @@
 #define ZBT_INNER_MIN  (ZBT_INNER_MAX/2)
 
 /* Common node header. Both leaf and inner nodes start with it so that a
- * zbtNode* can be inspected polymorphically. */
+ * zbtNode* can be inspected polymorphically.
+ *
+ * 'level' is the node's height above the leaves and never changes once the
+ * node is allocated (a split makes a same-level sibling; a taller tree gets a
+ * brand-new root). Leaves are level 0, their parents level 1, and so on. It is
+ * what sizes an inner node's csize[] slots (see zbtCsizeWidth). count/isleaf
+ * are bytes so level fits in the same 16-byte header without extra padding. */
 struct zbtNode {
     struct zbtNode *parent;
-    uint32_t count;   /* used slots: elems (leaf) or children (inner) */
-    uint32_t isleaf;
+    uint8_t count;    /* used slots: elems (leaf) or children (inner), max 65 */
+    uint8_t isleaf;
+    uint8_t level;    /* 0 = leaf; inner: 1 = parent of leaves */
+    uint8_t unused;
 };
 
 typedef struct zbtLeaf {
@@ -52,12 +60,75 @@ typedef struct zbtLeaf {
     zbtElem *elems[ZBT_LEAF_MAX + 1];
 } zbtLeaf;
 
+/* csize[] is a trailing flexible array whose slot width is chosen at allocation
+ * time from the node's level (1/2/4/8 bytes), because a child subtree at level
+ * L holds at most ZBT_INNER_MAX^L elements. It must stay last; sep[] cannot sit
+ * after a variable-width array. The fixed prefix (header + child[] + sep[]) is
+ * a multiple of 8, so every csize slot is naturally aligned. */
 typedef struct zbtInner {
     zbtNode n;
     struct zbtNode *child[ZBT_INNER_MAX + 1];
-    unsigned long csize[ZBT_INNER_MAX + 1]; /* subtree element count of child[i] */
     zbtElem *sep[ZBT_INNER_MAX + 1];        /* minimum element of child[i] */
+    unsigned char csize[];                  /* subtree element count of child[i] */
 } zbtInner;
+
+static_assert(offsetof(zbtInner, csize) % 8 == 0,
+              "zbtInner.csize must be 8-byte aligned for widened slot access");
+
+/* Bytes per csize slot for an inner node at the given level. A single child of
+ * a level-L node roots a subtree of at most ZBT_INNER_MAX^L (== 64^L) elements:
+ *   L=1 -> 64            (1 byte)
+ *   L=2 -> 4096          (2 bytes)
+ *   L=3..5 -> up to 64^5 ~ 1.07e9 < 2^32   (4 bytes)
+ *   L>=6 -> 64^6 exceeds 2^32              (8 bytes) */
+static inline unsigned zbtCsizeWidth(int level) {
+    if (level <= 1) return 1;
+    if (level == 2) return 2;
+    if (level <= 5) return 4;
+    return 8;
+}
+
+/* Byte size of an inner node whose csize[] is sized for 'level'. */
+static inline size_t zbtInnerSize(int level) {
+    return offsetof(zbtInner, csize) +
+           (size_t)(ZBT_INNER_MAX + 1) * zbtCsizeWidth(level);
+}
+
+static inline unsigned long zbtGetCsize(const zbtInner *in, int i) {
+    const void *p = in->csize + (size_t)i * zbtCsizeWidth(in->n.level);
+    switch (zbtCsizeWidth(in->n.level)) {
+    case 1:  return *(const uint8_t *)p;
+    case 2:  return *(const uint16_t *)p;
+    case 4:  return *(const uint32_t *)p;
+    default: return *(const uint64_t *)p;
+    }
+}
+
+static inline void zbtSetCsize(zbtInner *in, int i, unsigned long v) {
+    void *p = in->csize + (size_t)i * zbtCsizeWidth(in->n.level);
+    switch (zbtCsizeWidth(in->n.level)) {
+    case 1:  debugServerAssert(v <= UINT8_MAX);  *(uint8_t *)p  = (uint8_t)v;  break;
+    case 2:  debugServerAssert(v <= UINT16_MAX); *(uint16_t *)p = (uint16_t)v; break;
+    case 4:  debugServerAssert(v <= UINT32_MAX); *(uint32_t *)p = (uint32_t)v; break;
+    default:                                     *(uint64_t *)p = (uint64_t)v; break;
+    }
+}
+
+/* memmove of 'n' csize slots within one node (slot shifts on insert/remove). */
+static inline void zbtMoveCsize(zbtInner *in, int dst, int src, int n) {
+    unsigned w = zbtCsizeWidth(in->n.level);
+    memmove(in->csize + (size_t)dst * w, in->csize + (size_t)src * w,
+            (size_t)n * w);
+}
+
+/* Copy 'n' csize slots between two nodes at the same level (split/merge). */
+static inline void zbtCopyCsize(zbtInner *dst, int di, const zbtInner *src,
+                                int si, int n) {
+    unsigned w = zbtCsizeWidth(dst->n.level);
+    debugServerAssert(dst->n.level == src->n.level);
+    memcpy(dst->csize + (size_t)di * w, src->csize + (size_t)si * w,
+           (size_t)n * w);
+}
 
 /*-----------------------------------------------------------------------------
  * Element allocation
@@ -129,17 +200,22 @@ static zbtLeaf *zbtNewLeaf(zbtree *t) {
     lf->n.parent = NULL;
     lf->n.count = 0;
     lf->n.isleaf = 1;
+    lf->n.level = 0;
     lf->prev = lf->next = NULL;
     t->alloc_size += usable;
     return lf;
 }
 
-static zbtInner *zbtNewInner(zbtree *t) {
+/* Allocate an inner node at 'level' (1 = parent of leaves). The csize[] slot
+ * width, and hence the allocation size, is fixed by the level for the life of
+ * the node. */
+static zbtInner *zbtNewInner(zbtree *t, int level) {
     size_t usable;
-    zbtInner *in = zmalloc_usable(sizeof(*in), &usable);
+    zbtInner *in = zmalloc_usable(zbtInnerSize(level), &usable);
     in->n.parent = NULL;
     in->n.count = 0;
     in->n.isleaf = 0;
+    in->n.level = (uint8_t)level;
     t->alloc_size += usable;
     return in;
 }
@@ -206,7 +282,7 @@ static unsigned long zbtSubtreeSize(zbtNode *n) {
     if (n->isleaf) return n->count;
     zbtInner *in = (zbtInner *)n;
     unsigned long s = 0;
-    for (uint32_t i = 0; i < in->n.count; i++) s += in->csize[i];
+    for (uint32_t i = 0; i < in->n.count; i++) s += zbtGetCsize(in, i);
     return s;
 }
 
@@ -265,7 +341,7 @@ static void zbtUpdateToRoot(zbtree *t, zbtNode *n) {
     while (n->parent) {
         zbtInner *p = (zbtInner *)n->parent;
         int idx = zbtChildIdx(p, n);
-        unsigned long oldsize = p->csize[idx];
+        unsigned long oldsize = zbtGetCsize(p, idx);
         unsigned long newsize;
 
         if (have_delta) {
@@ -280,7 +356,7 @@ static void zbtUpdateToRoot(zbtree *t, zbtNode *n) {
 
         zbtElem *newsep = zbtNodeMin(n);
         if (newsize == oldsize && newsep == p->sep[idx]) return;
-        p->csize[idx] = newsize;
+        zbtSetCsize(p, idx, newsize);
         p->sep[idx] = newsep;
         n = (zbtNode *)p;
     }
@@ -296,12 +372,14 @@ static void zbtSplitInner(zbtree *t, zbtInner *in);
  * If 'p' is NULL, 'left' is the current root and a new root is created. */
 static void zbtInsertChild(zbtree *t, zbtInner *p, zbtNode *left, zbtNode *right) {
     if (p == NULL) {
-        zbtInner *root = zbtNewInner(t);
+        /* New root sits one level above whatever 'left' was (a leaf is
+         * level 0, so the first inner root is level 1). */
+        zbtInner *root = zbtNewInner(t, left->level + 1);
         root->n.count = 2;
         root->child[0] = left;  left->parent = (zbtNode *)root;
         root->child[1] = right; right->parent = (zbtNode *)root;
-        root->csize[0] = zbtSubtreeSize(left);  root->sep[0] = zbtNodeMin(left);
-        root->csize[1] = zbtSubtreeSize(right); root->sep[1] = zbtNodeMin(right);
+        zbtSetCsize(root, 0, zbtSubtreeSize(left));  root->sep[0] = zbtNodeMin(left);
+        zbtSetCsize(root, 1, zbtSubtreeSize(right)); root->sep[1] = zbtNodeMin(right);
         t->root = (zbtNode *)root;
         return;
     }
@@ -310,14 +388,14 @@ static void zbtInsertChild(zbtree *t, zbtInner *p, zbtNode *left, zbtNode *right
     int at = li + 1;
     int tail = (int)p->n.count - at;
     memmove(&p->child[at + 1], &p->child[at], tail * sizeof(zbtNode *));
-    memmove(&p->csize[at + 1], &p->csize[at], tail * sizeof(unsigned long));
+    zbtMoveCsize(p, at + 1, at, tail);
     memmove(&p->sep[at + 1], &p->sep[at], tail * sizeof(zbtElem *));
     p->child[at] = right;
     right->parent = (zbtNode *)p;
     p->n.count++;
 
-    p->csize[li] = zbtSubtreeSize(left);  p->sep[li] = zbtNodeMin(left);
-    p->csize[at] = zbtSubtreeSize(right); p->sep[at] = zbtNodeMin(right);
+    zbtSetCsize(p, li, zbtSubtreeSize(left));  p->sep[li] = zbtNodeMin(left);
+    zbtSetCsize(p, at, zbtSubtreeSize(right)); p->sep[at] = zbtNodeMin(right);
 
     if (p->n.count > ZBT_INNER_MAX)
         zbtSplitInner(t, p);
@@ -326,12 +404,12 @@ static void zbtInsertChild(zbtree *t, zbtInner *p, zbtNode *left, zbtNode *right
 }
 
 static void zbtSplitInner(zbtree *t, zbtInner *in) {
-    zbtInner *r = zbtNewInner(t);
+    zbtInner *r = zbtNewInner(t, in->n.level);
     int total = (int)in->n.count; /* == ZBT_INNER_MAX + 1 */
     int keep = total / 2;
     int move = total - keep;
     memcpy(r->child, &in->child[keep], move * sizeof(zbtNode *));
-    memcpy(r->csize, &in->csize[keep], move * sizeof(unsigned long));
+    zbtCopyCsize(r, 0, in, keep, move);
     memcpy(r->sep, &in->sep[keep], move * sizeof(zbtElem *));
     r->n.count = move;
     in->n.count = keep;
@@ -452,8 +530,10 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
     prev->next = NULL;
     t->tail = (zbtNode *)prev;
 
-    /* Build inner levels bottom-up until a single root remains. */
+    /* Build inner levels bottom-up until a single root remains. The parents of
+     * the leaves are level 1; each pass up the tree is one level taller. */
     unsigned long count = nleaves;
+    int lvl = 1;
     while (count > 1) {
         unsigned long nparents = (count + ZBT_INNER_MAX - 1) / ZBT_INNER_MAX;
         unsigned long pbase = count / nparents;
@@ -461,13 +541,13 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
         zbtNode **parents = zmalloc(sizeof(zbtNode *) * nparents);
         unsigned long ci = 0;
         for (unsigned long p = 0; p < nparents; p++) {
-            zbtInner *in = zbtNewInner(t);
+            zbtInner *in = zbtNewInner(t, lvl);
             unsigned long nch = pbase + (p < prem ? 1 : 0);
             in->n.count = (uint32_t)nch;
             for (unsigned long k = 0; k < nch; k++) {
                 zbtNode *c = level[ci++];
                 in->child[k] = c;
-                in->csize[k] = zbtSubtreeSize(c);
+                zbtSetCsize(in, (int)k, zbtSubtreeSize(c));
                 in->sep[k] = zbtNodeMin(c);
                 c->parent = (zbtNode *)in;
             }
@@ -476,6 +556,7 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
         zfree(level);
         level = parents;
         count = nparents;
+        lvl++;
     }
 
     t->root = level[0];
@@ -497,7 +578,7 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in);
 static void zbtRemoveChild(zbtInner *p, int pos) {
     int tail = (int)p->n.count - pos - 1;
     memmove(&p->child[pos], &p->child[pos + 1], tail * sizeof(zbtNode *));
-    memmove(&p->csize[pos], &p->csize[pos + 1], tail * sizeof(unsigned long));
+    zbtMoveCsize(p, pos, pos + 1, tail);
     memmove(&p->sep[pos], &p->sep[pos + 1], tail * sizeof(zbtElem *));
     p->n.count--;
 }
@@ -505,7 +586,7 @@ static void zbtRemoveChild(zbtInner *p, int pos) {
 /* Called when inner node 'p' became the single-child root, or a subtree
  * shrank: fix up parent slots or collapse the root as needed. */
 static void zbtFixupInnerAfterShrink(zbtree *t, zbtInner *p, int slot) {
-    p->csize[slot] = zbtSubtreeSize(p->child[slot]);
+    zbtSetCsize(p, slot, zbtSubtreeSize(p->child[slot]));
     p->sep[slot] = zbtNodeMin(p->child[slot]);
     if (p->n.parent && p->n.count < ZBT_INNER_MIN) {
         zbtRebalanceInner(t, p);
@@ -533,17 +614,17 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
         zbtInner *L = (zbtInner *)p->child[idx - 1];
         if (L->n.count > ZBT_INNER_MIN) {
             memmove(&in->child[1], &in->child[0], in->n.count * sizeof(zbtNode *));
-            memmove(&in->csize[1], &in->csize[0], in->n.count * sizeof(unsigned long));
+            zbtMoveCsize(in, 1, 0, in->n.count);
             memmove(&in->sep[1], &in->sep[0], in->n.count * sizeof(zbtElem *));
             int last = (int)L->n.count - 1;
             in->child[0] = L->child[last];
-            in->csize[0] = L->csize[last];
+            zbtSetCsize(in, 0, zbtGetCsize(L, last));
             in->sep[0] = L->sep[last];
             in->child[0]->parent = (zbtNode *)in;
             in->n.count++;
             L->n.count--;
-            p->csize[idx - 1] = zbtSubtreeSize((zbtNode *)L); p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
-            p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   p->sep[idx] = zbtNodeMin((zbtNode *)in);
+            zbtSetCsize(p, idx - 1, zbtSubtreeSize((zbtNode *)L)); p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
+            zbtSetCsize(p, idx, zbtSubtreeSize((zbtNode *)in));   p->sep[idx] = zbtNodeMin((zbtNode *)in);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -553,13 +634,13 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
         zbtInner *R = (zbtInner *)p->child[idx + 1];
         if (R->n.count > ZBT_INNER_MIN) {
             in->child[in->n.count] = R->child[0];
-            in->csize[in->n.count] = R->csize[0];
+            zbtSetCsize(in, in->n.count, zbtGetCsize(R, 0));
             in->sep[in->n.count] = R->sep[0];
             in->child[in->n.count]->parent = (zbtNode *)in;
             in->n.count++;
             zbtRemoveChild(R, 0);
-            p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   p->sep[idx] = zbtNodeMin((zbtNode *)in);
-            p->csize[idx + 1] = zbtSubtreeSize((zbtNode *)R); p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
+            zbtSetCsize(p, idx, zbtSubtreeSize((zbtNode *)in));   p->sep[idx] = zbtNodeMin((zbtNode *)in);
+            zbtSetCsize(p, idx + 1, zbtSubtreeSize((zbtNode *)R)); p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -573,7 +654,7 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
     serverAssert(a->n.count + b->n.count <= ZBT_INNER_MAX);
     for (uint32_t i = 0; i < b->n.count; i++) {
         a->child[a->n.count] = b->child[i];
-        a->csize[a->n.count] = b->csize[i];
+        zbtSetCsize(a, a->n.count, zbtGetCsize(b, i));
         a->sep[a->n.count] = b->sep[i];
         b->child[i]->parent = (zbtNode *)a;
         a->n.count++;
@@ -616,8 +697,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
             else memcpy(&lf->elems[0], src, deficit * sizeof(zbtElem *));
             L->n.count -= (uint32_t)deficit;
             lf->n.count += (uint32_t)deficit;
-            p->csize[idx - 1] = L->n.count; p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
-            p->csize[idx] = lf->n.count;    p->sep[idx] = zbtNodeMin((zbtNode *)lf);
+            zbtSetCsize(p, idx - 1, L->n.count); p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
+            zbtSetCsize(p, idx, lf->n.count);    p->sep[idx] = zbtNodeMin((zbtNode *)lf);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -633,8 +714,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
                     ((int)R->n.count - deficit) * sizeof(zbtElem *));
             lf->n.count += (uint32_t)deficit;
             R->n.count -= (uint32_t)deficit;
-            p->csize[idx] = lf->n.count;     p->sep[idx] = zbtNodeMin((zbtNode *)lf);
-            p->csize[idx + 1] = R->n.count;  p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
+            zbtSetCsize(p, idx, lf->n.count);     p->sep[idx] = zbtNodeMin((zbtNode *)lf);
+            zbtSetCsize(p, idx + 1, R->n.count);  p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
         }
@@ -721,7 +802,7 @@ unsigned long zbtRankByElem(zbtree *t, zbtElem *e) {
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
         int ci = zbtInnerChildIdx(in, score, ele);
-        for (int i = 0; i < ci; i++) rank += in->csize[i];
+        for (int i = 0; i < ci; i++) rank += zbtGetCsize(in, i);
         n = in->child[ci];
     }
     zbtLeaf *lf = (zbtLeaf *)n;
@@ -738,7 +819,7 @@ unsigned long zbtGetRank(zbtree *t, double score, sds ele) {
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
         int ci = zbtInnerChildIdx(in, score, ele);
-        for (int i = 0; i < ci; i++) rank += in->csize[i];
+        for (int i = 0; i < ci; i++) rank += zbtGetCsize(in, i);
         n = in->child[ci];
     }
     zbtLeaf *lf = (zbtLeaf *)n;
@@ -757,7 +838,8 @@ zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it) {
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
         uint32_t i = 0;
-        while (i < in->n.count && r >= in->csize[i]) { r -= in->csize[i]; i++; }
+        unsigned long cs;
+        while (i < in->n.count && r >= (cs = zbtGetCsize(in, i))) { r -= cs; i++; }
         n = in->child[i];
     }
     zbtLeaf *lf = (zbtLeaf *)n;
@@ -852,7 +934,7 @@ static unsigned long zbtCountBefore(zbtree *t, zbtBeforeFn before, void *arg) {
         zbtInner *in = (zbtInner *)n;
         int i = 0;
         while (i < (int)in->n.count - 1 && before(in->sep[i + 1], arg)) {
-            cnt += in->csize[i];
+            cnt += zbtGetCsize(in, i);
             i++;
         }
         n = in->child[i];
@@ -1159,6 +1241,7 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
                                    int *leafdepth) {
     if (n->isleaf) {
         zbtLeaf *lf = (zbtLeaf *)n;
+        serverAssert(n->level == 0);
         /* The head and tail leaves are exempt: zbtSplitLeaf() starts one of
          * them with a single element so sorted insertion can leave the leaf on
          * the other side of the split full. */
@@ -1178,12 +1261,20 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
     if (n->parent) serverAssert(n->count >= ZBT_INNER_MIN);
     serverAssert(n->count >= 2 || !n->parent);
     serverAssert(n->count <= ZBT_INNER_MAX);
+    serverAssert(n->level >= 1);
     unsigned long total = 0;
     for (uint32_t i = 0; i < n->count; i++) {
-        serverAssert(in->child[i]->parent == n);
-        serverAssert(zbtNodeMinDescend(in->child[i]) == in->sep[i]);
-        unsigned long cs = zbtVerifyNode(t, in->child[i], depth + 1, leafdepth);
-        serverAssert(cs == in->csize[i]);
+        zbtNode *c = in->child[i];
+        serverAssert(c->parent == n);
+        /* Height is uniform: a level-1 node parents leaves, every taller node
+         * parents inner nodes exactly one level shorter. This is what makes the
+         * per-node csize width (chosen from level) sound. */
+        serverAssert(c->isleaf ? (n->level == 1) : (c->level == n->level - 1));
+        serverAssert(zbtNodeMinDescend(c) == in->sep[i]);
+        unsigned long cs = zbtVerifyNode(t, c, depth + 1, leafdepth);
+        serverAssert(cs == zbtGetCsize(in, i));
+        serverAssert(cs <= (zbtCsizeWidth(n->level) >= 8 ? ULONG_MAX
+                            : ((1UL << (8 * zbtCsizeWidth(n->level))) - 1)));
         total += cs;
     }
     return total;
