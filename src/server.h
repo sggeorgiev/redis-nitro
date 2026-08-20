@@ -1803,11 +1803,13 @@ struct sharedObjectsStruct {
 };
 
 /* ZSETs use an order-statistic B+ tree (see zbtree.c) as the large encoding,
- * paired with a dict mapping member -> element for O(1) score lookup. */
+ * paired with a second B+ tree ordered by member only for member -> element
+ * lookup. Both trees point at the same element objects; the score tree owns
+ * them, the member tree borrows them. */
 
 /* A single sorted-set element. The member SDS is embedded in the same
  * allocation right after this header, mirroring the old skiplist node layout
- * so the dict can store zbtElem* as keys.
+ * so both trees can store zbtElem* in their leaves.
  *
  * data[0] holds the offset from the element start to the embedded member data,
  * followed by the sds header and the member bytes. The offset has to be stored
@@ -1837,12 +1839,22 @@ static inline sds zbtGetEle(const zbtElem *e) {
 /* B+ tree node is opaque outside zbtree.c. */
 typedef struct zbtNode zbtNode;
 
+/* A zbtree can be ordered two ways. The score tree keys on (score, member) and
+ * owns its elements; the member tree keys on the member bytes only and borrows
+ * the very same element objects (its leaves hold pointers, not copies). */
+typedef enum {
+    ZBT_ORDER_SCORE = 0,    /* (score, member) - owning */
+    ZBT_ORDER_MEMBER = 1,   /* member only - borrowing */
+} zbtOrder;
+
 typedef struct zbtree {
     zbtNode *root;
     zbtNode *head;          /* leftmost leaf (minimum) */
     zbtNode *tail;          /* rightmost leaf (maximum) */
     unsigned long length;
     size_t alloc_size;      /* total tracked memory used by the tree */
+    int order;              /* zbtOrder: comparison key of this tree */
+    int owns_elems;         /* 1 => frees elements and counts their memory */
     /* Active-defrag incremental node relocation bookmark. When node
      * relocation is split across multiple time-bounded steps, this records
      * the (score, member) of the first element of the next leaf to relocate,
@@ -1859,8 +1871,8 @@ typedef struct zbtIter {
 } zbtIter;
 
 typedef struct zset {
-    dict *dict;
-    zbtree *tree;
+    zbtree *tree;    /* ordered by (score, member); owns the elements */
+    zbtree *mtree;   /* ordered by member only; borrows the element pointers */
 } zset;
 
 typedef struct clientBufferLimitsConfig {
@@ -3238,7 +3250,6 @@ extern dictType objectKeyNoValueDictType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern dictType setDictType;
 extern dictType BenchmarkDictType;
-extern dictType zsetDictType;
 extern dictType dbDictType;
 extern double R_Zero, R_PosInf, R_NegInf, R_Nan;
 extern dictType hashDictType;
@@ -3823,7 +3834,7 @@ typedef struct {
 #define ERROR_COMMAND_FAILED (1<<1) /* Indicate to update the command failed stats */
 
 /* B+ tree backend for large sorted sets (see zbtree.c). */
-zbtree *zbtCreate(void);
+zbtree *zbtCreate(int order);
 void zbtFree(zbtree *t);
 size_t zbtAllocSize(const zbtree *t);
 zbtElem *zbtCreateElem(double score, sds ele);
@@ -3833,9 +3844,14 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n);
 zbtElem *zbtInsert(zbtree *t, double score, sds ele);
 void zbtInsertElem(zbtree *t, zbtElem *e);
 void zbtDeleteElem(zbtree *t, zbtElem *e);
+void zbtRemoveElem(zbtree *t, zbtElem *e);
+zbtElem *zbtFindMember(zbtree *mt, sds ele);
+uint64_t zbtPrefix8(sds member);
+zbtElem *zbtSeekPrefix8(zbtree *mt, uint64_t prefix, zbtIter *it);
 void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore);
 int zbtCompare(double score, sds ele, const zbtElem *e);
-const void *zbtGetEleForDict(const void *elem);
+int zbtElemPtrCompare(const void *a, const void *b);
+int zbtElemPtrCompareMember(const void *a, const void *b);
 unsigned long zbtRankByElem(zbtree *t, zbtElem *e);
 unsigned long zbtGetRank(zbtree *t, double score, sds ele);
 zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it);
@@ -3847,12 +3863,15 @@ zbtElem *zbtNext(zbtree *t, zbtElem *e);
 zbtElem *zbtPrev(zbtree *t, zbtElem *e);
 zbtElem *zbtNthInRange(zbtree *t, zrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
 zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start, unsigned int end, dict *d);
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, zbtree *mtree);
+unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, zbtree *mtree);
+unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start, unsigned int end, zbtree *mtree);
 void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe);
+void zbtDismissNodes(zbtree *t);
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *));
 int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budget);
+int zbtVisitElemsIncremental(zbtree *t, unsigned int budget,
+                             void (*visit)(void *, zbtElem *), void *privdata);
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score);
 double zzlGetScore(unsigned char *sptr);
 void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
@@ -3861,6 +3880,11 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range);
 unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range);
 unsigned long zsetLength(const robj *zobj);
 size_t zsetAllocSize(const robj *o);
+void zsetBuildMemberIndex(zbtree *mtree, zbtElem **elems, unsigned long n);
+/* Per-element callback for zsetScanBtree(). */
+typedef void (*zsetScanElemCB)(void *privdata, sds member, double score);
+uint64_t zsetScanBtree(robj *o, uint64_t cursor, unsigned long count,
+                       zsetScanElemCB cb, void *privdata);
 void zsetConvert(robj *zobj, int encoding);
 void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen);
 int zsetScore(robj *zobj, sds member, double *score);

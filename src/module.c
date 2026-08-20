@@ -12342,6 +12342,16 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
     if (value) decrRefCount(value);
 }
 
+/* zsetScanBtree() callback for RM_ScanKey over a B+ tree encoded sorted set. */
+static void moduleZsetScanKeyCallback(void *privdata, sds member, double score) {
+    ScanKeyCBData *data = privdata;
+    robj *field = createStringObject(member, sdslen(member));
+    robj *value = createStringObjectFromLongDouble(score, 0);
+    data->fn(data->key, field, value, data->user_data);
+    decrRefCount(field);
+    decrRefCount(value);
+}
+
 /* Scan api that allows a module to scan the elements in a hash, set or sorted set key
  *
  * Callback for scan implementation.
@@ -12384,7 +12394,12 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
  * It is also possible to restart an existing cursor using RM_ScanCursorRestart.
  *
  * NOTE: The scan may return an element more than once and you must not  modify
- * the key within the callback. */
+ * the key within the callback.
+ *
+ * NOTE: For a B+ tree encoded sorted set the number of elements reported per
+ * call is not bounded: members are grouped by their first 8 bytes and a whole
+ * group is always emitted at once, so a set whose members share an 8-byte
+ * prefix is reported in a single call. */
 int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleScanKeyCB fn, void *privdata) {
     if (key == NULL || key->kv == NULL) {
         errno = EINVAL;
@@ -12399,8 +12414,7 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
         if (kv->encoding == OBJ_ENCODING_HT)
             ht = kv->ptr;
     } else if (kv->type == OBJ_ZSET) {
-        if (kv->encoding == OBJ_ENCODING_BTREE)
-            ht = ((zset *)kv->ptr)->dict;
+        /* A B+ tree encoded ZSET is scanned via its member tree below. */
     } else {
         errno = EINVAL;
         return 0;
@@ -12413,6 +12427,15 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
     if (ht) {
         ScanKeyCBData data = { key, privdata, fn };
         cursor->cursor = dictScan(ht, cursor->cursor, moduleScanKeyCallback, &data);
+        if (cursor->cursor == 0) {
+            cursor->done = 1;
+            ret = 0;
+        }
+    } else if (kv->type == OBJ_ZSET && kv->encoding == OBJ_ENCODING_BTREE) {
+        /* Emit one prefix8 group per call (see zsetScanBtree). */
+        ScanKeyCBData data = { key, privdata, fn };
+        cursor->cursor = zsetScanBtree(kv, cursor->cursor, 1,
+                                       moduleZsetScanKeyCallback, &data);
         if (cursor->cursor == 0) {
             cursor->done = 1;
             ret = 0;

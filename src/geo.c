@@ -824,7 +824,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             if (maxelelen < elelen) maxelelen = elelen;
             totelelen += elelen;
             znode = zbtInsert(zs->tree,score,gp->member);
-            serverAssert(dictAdd(zs->dict, znode, NULL) == DICT_OK);
+            zbtInsertElem(zs->mtree, znode);
             sdsfree(gp->member); /* zbtInsert copies the sds, so free the original */
             gp->member = NULL;
         }

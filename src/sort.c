@@ -350,7 +350,7 @@ void sortCommandGeneric(client *c, int readonly) {
     switch(sortval->type) {
     case OBJ_LIST: vectorlen = listTypeLength(sortval); break;
     case OBJ_SET: vectorlen =  setTypeSize(sortval); break;
-    case OBJ_ZSET: vectorlen = dictSize(((zset*)sortval->ptr)->dict); break;
+    case OBJ_ZSET: vectorlen = ((zset*)sortval->ptr)->tree->length; break;
     default: vectorlen = 0; serverPanic("Bad SORT type"); /* Avoid GCC warning */
     }
 
@@ -454,7 +454,7 @@ void sortCommandGeneric(client *c, int readonly) {
 
         /* Check if starting point is trivial, before doing log(N) lookup. */
         if (desc) {
-            long zsetlen = dictSize(((zset*)sortval->ptr)->dict);
+            long zsetlen = t->length;
             ln = zbtElemByRank(t, start > 0 ? (unsigned long)(zsetlen-start) : t->length, &it);
         } else {
             ln = zbtElemByRank(t, start > 0 ? (unsigned long)(start+1) : 1, &it);
@@ -473,22 +473,19 @@ void sortCommandGeneric(client *c, int readonly) {
         end -= start;
         start = 0;
     } else if (sortval->type == OBJ_ZSET) {
-        dict *set = ((zset*)sortval->ptr)->dict;
-        dictIterator di;
-        dictEntry *setele;
+        zbtree *t = ((zset*)sortval->ptr)->tree;
+        zbtIter it;
         sds sdsele;
 
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(sortval);
-        dictInitIterator(&di, set);
-        while((setele = dictNext(&di)) != NULL) {
-            sdsele = zbtGetEle(dictGetKey(setele));
+        for (zbtElem *ln = zbtFirst(t, &it); ln; ln = zbtIterNext(&it)) {
+            sdsele = zbtGetEle(ln);
             vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
         }
-        dictResetIterator(&di);
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), sortval, oldsize, kvobjAllocSize(sortval));
     } else {

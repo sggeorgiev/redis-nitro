@@ -204,12 +204,11 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             }
         } else if (o->encoding == OBJ_ENCODING_BTREE) {
             zset *zs = o->ptr;
-            dictIterator di;
-            dictEntry *de;
+            zbtIter it;
 
-            dictInitIterator(&di, zs->dict);
-            while((de = dictNext(&di)) != NULL) {
-                zbtElem *znode = dictGetKey(de);
+            for (zbtElem *znode = zbtFirst(zs->tree, &it); znode;
+                 znode = zbtIterNext(&it))
+            {
                 sds sdsele = zbtGetEle(znode);
                 const int len = fpconv_dtoa(znode->score, buf);
                 buf[len] = '\0';
@@ -218,7 +217,6 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
                 mixDigest(eledigest,buf,strlen(buf));
                 xorDigest(digest,eledigest,20);
             }
-            dictResetIterator(&di);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -1051,14 +1049,10 @@ NULL
         if ((o = kvobjCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
                 == NULL) return;
 
-        /* Get the hash table reference from the object, if possible. */
+        /* Get the hash table reference from the object, if possible. The
+         * B+ tree encoding has no hash table to report (it indexes members
+         * with a second tree), so it falls through to the error below. */
         switch (o->encoding) {
-        case OBJ_ENCODING_BTREE:
-            {
-                zset *zs = o->ptr;
-                ht = zs->dict;
-            }
-            break;
         case OBJ_ENCODING_HT:
             ht = o->ptr;
             break;

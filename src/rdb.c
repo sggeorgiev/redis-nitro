@@ -2884,14 +2884,6 @@ static void rdbDiscardTemplateFields(rdbTmplFields *out) {
     out->fields_lp = NULL;
 }
 
-/* qsort() comparator ordering an array of zbtElem* by (score, member), used to
- * normalize arbitrary RDB zset input before the bottom-up tree build. */
-static int zbtElemPtrCompare(const void *a, const void *b) {
-    zbtElem *ea = *(zbtElem *const *)a;
-    zbtElem *eb = *(zbtElem *const *)b;
-    return zbtCompare(ea->score, zbtGetEle(ea), eb);
-}
-
 /* Load a Redis object of the specified type from the specified file.
  * On success a newly allocated object is returned, otherwise NULL.
  *
@@ -3059,19 +3051,23 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         o = createZsetObject();
         zs = o->ptr;
 
-        if (zsetlen > DICT_HT_INITIAL_SIZE && dictTryExpand(zs->dict,zsetlen) != DICT_OK) {
-            rdbReportCorruptRDB("OOM in dictTryExpand %llu", (unsigned long long)zsetlen);
+        /* Load every element into a detached buffer. The trees are built
+         * bottom-up in a single O(N) pass once every element is in hand; the
+         * buffered elements are owned by us until zbtBuildFromSorted() takes
+         * them into the score tree.
+         *
+         * 'zsetlen' comes straight from the payload, so the buffer size has to
+         * be checked for overflow and the allocation allowed to fail instead of
+         * panicking: a corrupt or hostile length must not be able to hand us a
+         * short buffer to write past. */
+        uint64_t total = zsetlen;
+        zbtElem **elems = total > SIZE_MAX / sizeof(zbtElem *) ?
+                          NULL : ztrymalloc(sizeof(zbtElem *) * total);
+        if (elems == NULL) {
+            rdbReportCorruptRDB("zset length %llu too large", (unsigned long long)total);
             decrRefCount(o);
             return NULL;
         }
-
-        /* Load every element into a detached buffer, checking membership
-         * uniqueness *before* handing ownership to the tree. The tree is then
-         * built bottom-up in a single O(N) pass. The dict is populated as we go
-         * (its key destructor is NULL, so the buffered elements below are still
-         * owned by us until zbtBuildFromSorted() takes them). */
-        uint64_t total = zsetlen;
-        zbtElem **elems = zmalloc(sizeof(zbtElem *) * total);
         uint64_t loaded = 0;
         while(zsetlen--) {
             sds sdsele;
@@ -3105,11 +3101,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
             znode = zbtCreateElem(score, sdsele);
             sdsfree(sdsele); /* zbtCreateElem copies the sds into the element. */
-            if (dictAdd(zs->dict, znode, NULL) != DICT_OK) {
-                rdbReportCorruptRDB("Duplicate zset fields detected");
-                zbtFreeElem(znode);
-                goto zseterr;
-            }
             elems[loaded++] = znode;
             continue;
 
@@ -3118,6 +3109,30 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             zfree(elems);
             decrRefCount(o);
             return NULL;
+        }
+
+        /* Build a member-sorted copy for the member index. Adjacent equal
+         * members after this sort are duplicates, which the old member dict
+         * used to reject via dictAdd(). */
+        zbtElem **bymember = ztrymalloc(sizeof(zbtElem *) * loaded);
+        if (bymember == NULL) {
+            rdbReportCorruptRDB("zset length %llu too large", (unsigned long long)loaded);
+            for (uint64_t k = 0; k < loaded; k++) zbtFreeElem(elems[k]);
+            zfree(elems);
+            decrRefCount(o);
+            return NULL;
+        }
+        memcpy(bymember, elems, sizeof(zbtElem *) * loaded);
+        qsort(bymember, loaded, sizeof(zbtElem *), zbtElemPtrCompareMember);
+        for (uint64_t i = 1; i < loaded; i++) {
+            if (sdscmp(zbtGetEle(bymember[i-1]), zbtGetEle(bymember[i])) == 0) {
+                rdbReportCorruptRDB("Duplicate zset fields detected");
+                zfree(bymember);
+                for (uint64_t k = 0; k < loaded; k++) zbtFreeElem(elems[k]);
+                zfree(elems);
+                decrRefCount(o);
+                return NULL;
+            }
         }
 
         /* zbtBuildFromSorted() requires strictly ascending input. Redis writes
@@ -3139,7 +3154,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             }
         }
         zbtBuildFromSorted(zs->tree, elems, loaded);
+        zbtBuildFromSorted(zs->mtree, bymember, loaded);
         zfree(elems);
+        zfree(bymember);
 
         /* Convert *after* loading, since sorted sets are not stored ordered. */
         if (zsetLength(o) <= server.zset_max_listpack_entries &&

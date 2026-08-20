@@ -1779,6 +1779,23 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     if (val && !data->no_values) vecPush(keys, val);
 }
 
+/* Callback data and function for the B+ tree ZSCAN path (zsetScanBtree). */
+typedef struct {
+    vec *keys;
+    sds pattern;   /* NULL when no MATCH pattern */
+} zsetScanReplyData;
+
+static void zsetScanReplyCB(void *privdata, sds member, double score) {
+    zsetScanReplyData *d = privdata;
+    if (d->pattern &&
+        !stringmatchlen(d->pattern, sdslen(d->pattern), member, sdslen(member), 0))
+        return;
+    char buf[MAX_LONG_DOUBLE_CHARS];
+    int len = ld2string(buf, sizeof(buf), score, LD_STR_AUTO);
+    vecPush(d->keys, sdsdup(member));
+    vecPush(d->keys, sdsnewlen(buf, len));
+}
+
 /* Try to parse a SCAN cursor stored at object 'o':
  * if the cursor is valid, store it as unsigned integer into *cursor and
  * returns C_OK. Otherwise return C_ERR and send an error to the
@@ -1932,10 +1949,9 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         ht = o->ptr;
     } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HT) {
         ht = o->ptr;
-    } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
-        zset *zs = o->ptr;
-        ht = zs->dict;
     }
+    /* A B+ tree encoded ZSET is scanned via its member tree with a prefix8
+     * cursor (see the OBJ_ZSET branch below), not through a hash table. */
 
     vec keys;
     void *keys_stack[256];
@@ -1991,6 +2007,13 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
                 cursor = dictScan(ht, cursor, scanCallback, &data);
             }
         } while (cursor && maxiterations-- && data.sampled < count);
+    } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
+        /* B+ tree ZSET: walk the member tree with a prefix8 cursor, emitting
+         * (member, score) pairs into 'keys'. Falls through to Step 3. COUNT is
+         * a lower bound only: a whole prefix8 group is always emitted at once,
+         * so members sharing their first 8 bytes come back in one reply. */
+        zsetScanReplyData zdata = { .keys = &keys, .pattern = use_pattern ? pat : NULL };
+        cursor = zsetScanBtree(o, cursor, count, zsetScanReplyCB, &zdata);
     } else if (o->type == OBJ_SET) {
         unsigned long array_reply_len = 0;
         void *replylen = NULL;

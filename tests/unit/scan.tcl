@@ -348,6 +348,74 @@ proc test_scan {type} {
         }
     }
 
+    test "{$type} ZSCAN btree with a shared 8-byte prefix" {
+        # "session:" is exactly 8 bytes, so every member collapses into one
+        # prefix8 group. The cursor must still complete and report each
+        # member exactly once, even if that means a single large reply.
+        r del zset
+        set count 1000
+        set elements {}
+        for {set j 0} {$j < $count} {incr j} {
+            lappend elements $j "session:[format %08d $j]"
+        }
+        r zadd zset {*}$elements
+        assert_encoding btree zset
+
+        set cur 0
+        set keys {}
+        set iters 0
+        while 1 {
+            set res [r zscan zset $cur COUNT 100]
+            set cur [lindex $res 0]
+            foreach {k v} [lindex $res 1] { lappend keys $k }
+            incr iters
+            if {$cur == 0} break
+            assert {$iters < 100000}
+        }
+        set keys [lsort -unique $keys]
+        assert_equal $count [llength $keys]
+    }
+
+    test "{$type} ZSCAN btree full iteration under deletes" {
+        # Members 0..99 are never removed and must all be reported. Members
+        # >= 100 may be deleted mid-scan; the cursor must not skip survivors.
+        r del zset
+        set numele [expr {200 + [randomInt 800]}]
+        set elements {}
+        for {set j 0} {$j < $numele} {incr j} {
+            lappend elements $j "k:[format %08d $j]"
+        }
+        r zadd zset {*}$elements
+        assert_encoding btree zset
+
+        set toremove {}
+        for {set j 100} {$j < $numele} {incr j} {
+            lappend toremove "k:[format %08d $j]"
+        }
+
+        unset -nocomplain found
+        array set found {}
+        set cursor 0
+        set iteration 0
+        set del_iteration [expr {1 + [randomInt 5]}]
+        while {!($cursor == 0 && $iteration != 0)} {
+            set res [r zscan zset $cursor COUNT 50]
+            set cursor [lindex $res 0]
+            foreach {k v} [lindex $res 1] { set found($k) 1 }
+            incr iteration
+            if {$iteration == $del_iteration} {
+                r zrem zset {*}$toremove
+            }
+            assert {$iteration < 100000}
+        }
+        for {set j 0} {$j < 100} {incr j} {
+            set want "k:[format %08d $j]"
+            if {![info exists found($want)]} {
+                fail "ZSCAN element missing $want"
+            }
+        }
+    }
+
     test "{$type} SCAN guarantees check under write load" {
         r flushdb
         populate 100

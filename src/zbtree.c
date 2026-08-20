@@ -3,12 +3,17 @@
  *
  * Design goals (see the ZSET encoding notes in server.h):
  *   - Elements are ordered by (score, member) exactly like the old skiplist.
- *   - Each member is a single heap object (zbtElem) with an embedded SDS, so
- *     the ZSET dict can keep mapping member -> zbtElem* for O(1) score lookup.
+ *   - Each member is a single heap object (zbtElem) with an embedded SDS. A
+ *     ZSET keeps two trees over the same objects: the score tree (this file's
+ *     original ordering) owns them, and a second member-ordered tree borrows
+ *     the pointers so member -> element lookup is O(log N) with no hash table.
  *   - Leaves are packed arrays of zbtElem pointers, doubly linked so range
  *     scans walk contiguous memory instead of chasing skiplist pointers.
  *   - Internal nodes carry per-child subtree sizes, giving O(log N) rank and
  *     rank-based access (ZRANK / ZRANGE by index / ZREMRANGEBYRANK).
+ *
+ * A tree's 'order' field selects the comparison key; the member tree also has
+ * owns_elems == 0, so it never frees an element or counts its memory.
  *
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
@@ -113,10 +118,31 @@ int zbtCompare(double score, sds ele, const zbtElem *e) {
     return sdscmp(ele, zbtGetEle(e));
 }
 
-/* dict keyFromStoredKey callback: recover the member SDS from a stored
- * zbtElem*. */
-const void *zbtGetEleForDict(const void *elem) {
-    return zbtGetEle((const zbtElem *)elem);
+/* qsort() comparators over an array of zbtElem*, one per tree ordering. Used
+ * to normalize input for zbtBuildFromSorted(): by (score, member) for the score
+ * tree, by member alone for the member tree (where an equal pair means a
+ * duplicate member). */
+int zbtElemPtrCompare(const void *a, const void *b) {
+    zbtElem *ea = *(zbtElem *const *)a;
+    zbtElem *eb = *(zbtElem *const *)b;
+    return zbtCompare(ea->score, zbtGetEle(ea), eb);
+}
+
+int zbtElemPtrCompareMember(const void *a, const void *b) {
+    zbtElem *ea = *(zbtElem *const *)a;
+    zbtElem *eb = *(zbtElem *const *)b;
+    return sdscmp(zbtGetEle(ea), zbtGetEle(eb));
+}
+
+/* Compare {score, ele} with element 'e' using tree 't's ordering. The member
+ * tree ignores the score entirely (members are unique, so the member is a
+ * total order); the score tree keys on (score, member). 't->order' is a
+ * per-tree constant, so the branch is perfectly predicted. */
+static inline int zbtCmp(const zbtree *t, double score, sds ele,
+                         const zbtElem *e) {
+    if (e == NULL) return -1;
+    if (t->order == ZBT_ORDER_MEMBER) return sdscmp(ele, zbtGetEle(e));
+    return zbtCompare(score, ele, e);
 }
 
 /*-----------------------------------------------------------------------------
@@ -150,11 +176,13 @@ static void zbtFreeNodeShallow(zbtree *t, zbtNode *n) {
     t->alloc_size -= usable;
 }
 
-zbtree *zbtCreate(void) {
+zbtree *zbtCreate(int order) {
     size_t usable;
     zbtree *t = zmalloc_usable(sizeof(*t), &usable);
     t->length = 0;
     t->alloc_size = usable;
+    t->order = order;
+    t->owns_elems = (order == ZBT_ORDER_SCORE);
     t->root = NULL;
     t->defrag_resume = NULL;
     t->defrag_resume_score = 0;
@@ -167,9 +195,13 @@ zbtree *zbtCreate(void) {
 static void zbtFreeSubtree(zbtree *t, zbtNode *n) {
     if (n->isleaf) {
         zbtLeaf *lf = (zbtLeaf *)n;
-        for (uint32_t i = 0; i < n->count; i++) {
-            t->alloc_size -= zmalloc_usable_size(lf->elems[i]);
-            zbtFreeElem(lf->elems[i]);
+        /* Only the owning (score) tree frees elements and tracks their size;
+         * the member tree borrows the very same objects. */
+        if (t->owns_elems) {
+            for (uint32_t i = 0; i < n->count; i++) {
+                t->alloc_size -= zmalloc_usable_size(lf->elems[i]);
+                zbtFreeElem(lf->elems[i]);
+            }
         }
     } else {
         zbtInner *in = (zbtInner *)n;
@@ -217,10 +249,27 @@ static int zbtChildIdx(zbtInner *p, zbtNode *c) {
     serverPanic("zbtree: child not found in parent");
 }
 
-/* Choose the child of inner node 'in' whose key range contains (score,ele). */
-static int zbtInnerChildIdx(zbtInner *in, double score, sds ele) {
+/* Choose the child of inner node 'in' whose key range contains (score,ele):
+ * the last child whose separator (minimum) is <= the key.
+ *
+ * The score tree keeps the linear scan the fan-out was tuned for (sequential,
+ * cache-friendly doubles). The member tree instead binary-searches, because
+ * each comparison is an sdscmp against a random heap address and a linear scan
+ * over up to ZBT_INNER_MAX separators would chase far too many of them. */
+static int zbtInnerChildIdx(const zbtree *t, zbtInner *in, double score, sds ele) {
+    if (t->order == ZBT_ORDER_MEMBER) {
+        /* sep[0] is the subtree minimum, hence always <= the key; search the
+         * rest for the last separator that is still <= the member. */
+        int lo = 1, hi = (int)in->n.count;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (sdscmp(zbtGetEle(in->sep[mid]), ele) <= 0) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo - 1;
+    }
     int i = (int)in->n.count - 1;
-    while (i > 0 && zbtCompare(score, ele, in->sep[i]) < 0) i--;
+    while (i > 0 && zbtCmp(t, score, ele, in->sep[i]) < 0) i--;
     return i;
 }
 
@@ -229,17 +278,30 @@ static zbtLeaf *zbtFindLeaf(zbtree *t, double score, sds ele) {
     zbtNode *n = t->root;
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
-        n = in->child[zbtInnerChildIdx(in, score, ele)];
+        n = in->child[zbtInnerChildIdx(t, in, score, ele)];
     }
     return (zbtLeaf *)n;
 }
 
 /* Locate (score,ele) inside a leaf. Sets *found and returns the index where
- * the element is (if found) or where it should be inserted. */
-static int zbtLeafSearch(zbtLeaf *lf, double score, sds ele, int *found) {
+ * the element is (if found) or where it should be inserted. Member order uses
+ * binary search for the reason given on zbtInnerChildIdx(). */
+static int zbtLeafSearch(const zbtree *t, zbtLeaf *lf, double score, sds ele,
+                         int *found) {
+    if (t->order == ZBT_ORDER_MEMBER) {
+        int lo = 0, hi = (int)lf->n.count;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            int c = sdscmp(ele, zbtGetEle(lf->elems[mid]));
+            if (c == 0) { *found = 1; return mid; }
+            if (c < 0) hi = mid; else lo = mid + 1;
+        }
+        *found = 0;
+        return lo;
+    }
     uint32_t i;
     for (i = 0; i < lf->n.count; i++) {
-        int c = zbtCompare(score, ele, lf->elems[i]);
+        int c = zbtCmp(t, score, ele, lf->elems[i]);
         if (c == 0) { *found = 1; return (int)i; }
         if (c < 0) { *found = 0; return (int)i; }
     }
@@ -383,7 +445,7 @@ void zbtInsertElem(zbtree *t, zbtElem *e) {
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = zbtFindLeaf(t, score, ele);
     int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
+    int idx = zbtLeafSearch(t, lf, score, ele, &found);
     serverAssert(!found);
 
     /* Landing at either end of an end leaf means the tree is growing in sorted
@@ -399,7 +461,7 @@ void zbtInsertElem(zbtree *t, zbtElem *e) {
     lf->elems[idx] = e;
     lf->n.count++;
     t->length++;
-    t->alloc_size += zmalloc_usable_size(e);
+    if (t->owns_elems) t->alloc_size += zmalloc_usable_size(e);
 
     if (lf->n.count > ZBT_LEAF_MAX)
         zbtSplitLeaf(t, lf, bias);
@@ -414,10 +476,11 @@ zbtElem *zbtInsert(zbtree *t, double score, sds ele) {
 }
 
 /* Build a packed, balanced tree over 'elems[0..n)' in O(n). The elements must
- * already be strictly ascending by (score, member) and ownership of each one
- * transfers to the tree. 't' must be freshly created and empty. This is much
- * cheaper than n independent zbtInsert() calls (used by RDB load, COPY and
- * listpack->tree conversion, where the source order is already known). */
+ * already be strictly ascending in 't's own ordering, and 't' must be freshly
+ * created and empty. An owning (score) tree takes ownership of each element; a
+ * borrowing (member) tree only records the pointers. This is much cheaper than
+ * n independent zbtInsert() calls (used by RDB load, COPY and listpack->tree
+ * conversion, where the source order is already known). */
 void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
     if (n == 0) return;
     serverAssert(t->length == 0);
@@ -483,8 +546,9 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
     zfree(level);
 
     t->length = n;
-    for (unsigned long i = 0; i < n; i++)
-        t->alloc_size += zmalloc_usable_size(elems[i]);
+    if (t->owns_elems)
+        for (unsigned long i = 0; i < n; i++)
+            t->alloc_size += zmalloc_usable_size(elems[i]);
 }
 
 /*-----------------------------------------------------------------------------
@@ -658,22 +722,23 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     zbtFixupInnerAfterShrink(t, p, ai);
 }
 
-/* Remove element 'e' from the tree and free it. The caller is responsible for
- * removing it from the ZSET dict first (the dict has no key destructor). */
-void zbtDeleteElem(zbtree *t, zbtElem *e) {
+/* Unlink element 'e' from its leaf and rebalance, without freeing it. Shared
+ * by zbtDeleteElem() (which then frees), zbtRemoveElem() (member tree, never
+ * frees) and zbtUpdateScore() (which reinserts the same object). Element-size
+ * accounting is applied only for an owning tree. */
+static void zbtDetachElem(zbtree *t, zbtElem *e) {
     double score = e->score;
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = zbtFindLeaf(t, score, ele);
     int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
+    int idx = zbtLeafSearch(t, lf, score, ele, &found);
     serverAssert(found && lf->elems[idx] == e);
 
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
     lf->n.count--;
     t->length--;
-    t->alloc_size -= zmalloc_usable_size(e);
-    zbtFreeElem(e);
+    if (t->owns_elems) t->alloc_size -= zmalloc_usable_size(e);
 
     if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
         zbtRebalanceLeaf(t, lf);
@@ -681,29 +746,25 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
         zbtUpdateToRoot(t, (zbtNode *)lf);
 }
 
+/* Remove element 'e' from the (owning score) tree and free it. The caller must
+ * remove it from the member tree first (that tree borrows the same object, and
+ * the member SDS lives inside the element allocation being freed here). */
+void zbtDeleteElem(zbtree *t, zbtElem *e) {
+    zbtDetachElem(t, e);
+    zbtFreeElem(e);
+}
+
+/* Remove element 'e' from a borrowing (member) tree without freeing it. */
+void zbtRemoveElem(zbtree *t, zbtElem *e) {
+    serverAssert(!t->owns_elems);
+    zbtDetachElem(t, e);
+}
+
 /* Move an existing element to reflect a new score. The element object is
- * reused so the ZSET dict entry does not need updating. */
+ * reused, so the member tree (keyed on the unchanged member) needs no update:
+ * only this score tree's position changes. */
 void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
-    /* Remove and reinsert. We must remove from the dict? No: the dict maps
-     * member -> elem and the member is unchanged, so only the tree position
-     * changes. Detach the element object, reinsert it with the new score. */
-    double score = e->score;
-    sds ele = zbtGetEle(e);
-    zbtLeaf *lf = zbtFindLeaf(t, score, ele);
-    int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
-    serverAssert(found && lf->elems[idx] == e);
-
-    memmove(&lf->elems[idx], &lf->elems[idx + 1],
-            ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
-    lf->n.count--;
-    t->length--;
-    t->alloc_size -= zmalloc_usable_size(e);
-    if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
-        zbtRebalanceLeaf(t, lf);
-    else
-        zbtUpdateToRoot(t, (zbtNode *)lf);
-
+    zbtDetachElem(t, e);
     e->score = newscore;
     zbtInsertElem(t, e);
 }
@@ -720,13 +781,13 @@ unsigned long zbtRankByElem(zbtree *t, zbtElem *e) {
     zbtNode *n = t->root;
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
-        int ci = zbtInnerChildIdx(in, score, ele);
+        int ci = zbtInnerChildIdx(t, in, score, ele);
         for (int i = 0; i < ci; i++) rank += in->csize[i];
         n = in->child[ci];
     }
     zbtLeaf *lf = (zbtLeaf *)n;
     int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
+    int idx = zbtLeafSearch(t, lf, score, ele, &found);
     serverAssert(found);
     return rank + (unsigned long)idx + 1;
 }
@@ -737,13 +798,13 @@ unsigned long zbtGetRank(zbtree *t, double score, sds ele) {
     zbtNode *n = t->root;
     while (!n->isleaf) {
         zbtInner *in = (zbtInner *)n;
-        int ci = zbtInnerChildIdx(in, score, ele);
+        int ci = zbtInnerChildIdx(t, in, score, ele);
         for (int i = 0; i < ci; i++) rank += in->csize[i];
         n = in->child[ci];
     }
     zbtLeaf *lf = (zbtLeaf *)n;
     int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
+    int idx = zbtLeafSearch(t, lf, score, ele, &found);
     if (!found) return 0;
     return rank + (unsigned long)idx + 1;
 }
@@ -816,7 +877,7 @@ zbtElem *zbtIterPrev(zbtIter *it) {
 static int zbtSeek(zbtree *t, double score, sds ele, zbtIter *it) {
     zbtLeaf *lf = zbtFindLeaf(t, score, ele);
     int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
+    int idx = zbtLeafSearch(t, lf, score, ele, &found);
     it->leaf = (zbtNode *)lf;
     it->idx = idx;
     return found;
@@ -920,18 +981,64 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
 }
 
 /*-----------------------------------------------------------------------------
- * Range deletion (also removes the members from the ZSET dict)
+ * Member index (the member-ordered tree)
+ *----------------------------------------------------------------------------*/
+
+/* Find the element whose member equals 'ele', or NULL. O(log N). */
+zbtElem *zbtFindMember(zbtree *mt, sds ele) {
+    if (mt->length == 0) return NULL;
+    zbtLeaf *lf = zbtFindLeaf(mt, 0, ele); /* score ignored in member order */
+    int found;
+    int idx = zbtLeafSearch(mt, lf, 0, ele, &found);
+    if (!found) return NULL;
+    return lf->elems[idx];
+}
+
+/* The first 8 bytes of a member as a big-endian, zero-padded 64-bit integer.
+ * This is monotone non-decreasing along member (lexicographic) order, so it is
+ * usable as a ZSCAN cursor: {member : prefix8(member) >= cursor} is always a
+ * suffix of the ordering. */
+uint64_t zbtPrefix8(sds member) {
+    size_t len = sdslen(member);
+    uint64_t p = 0;
+    for (int i = 0; i < 8; i++) {
+        p <<= 8;
+        if ((size_t)i < len) p |= (unsigned char)member[i];
+    }
+    return p;
+}
+
+static int beforePrefixLt(const zbtElem *e, void *arg) {
+    return zbtPrefix8(zbtGetEle((zbtElem *)e)) < *(uint64_t *)arg;
+}
+
+/* Position 'it' on the first element whose member has prefix8 >= 'prefix' and
+ * return it, or NULL when every member sorts before that prefix. Used to
+ * resume a ZSCAN from a saved cursor. */
+zbtElem *zbtSeekPrefix8(zbtree *mt, uint64_t prefix, zbtIter *it) {
+    if (mt->length == 0) return NULL;
+    unsigned long before = zbtCountBefore(mt, beforePrefixLt, &prefix);
+    if (before >= mt->length) return NULL;
+    return zbtElemByRank(mt, before + 1, it);
+}
+
+/*-----------------------------------------------------------------------------
+ * Range deletion (also removes the members from the member tree)
  *----------------------------------------------------------------------------*/
 
 /* Delete every element whose 1-based rank falls in [first, last] (inclusive),
- * removing each member from the companion dict 'd' as well.
+ * unlinking each member from the companion member tree 'mtree' as well.
  *
- * Instead of locating and rebalancing once per element (O(K log N)), this
- * removes a whole leaf slice per structural pass: at most one O(log N) rank
- * lookup and one rebalance per touched leaf, giving O(K + (K/leaf) * log N). */
+ * Instead of locating and rebalancing once per element (O(K log N)) on the
+ * score tree, this removes a whole leaf slice per structural pass: at most one
+ * O(log N) rank lookup and one rebalance per touched leaf on 't'. The member
+ * tree, being keyed on member rather than rank, still costs one O(log N)
+ * unlink per element. */
 static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
-                                        unsigned long last, dict *d) {
+                                        unsigned long last, zbtree *mtree) {
     unsigned long removed = 0;
+    /* This frees the elements outright, so 't' has to be the owning tree. */
+    serverAssert(t->owns_elems && !mtree->owns_elems);
     if (last > t->length) last = t->length;
 
     while (first <= last) {
@@ -948,7 +1055,9 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
 
         for (int k = 0; k < take; k++) {
             zbtElem *el = lf->elems[idx + k];
-            dictDelete(d, zbtGetEle(el));
+            /* Unlink from the member tree before freeing: the member SDS lives
+             * inside 'el', which zbtFreeElem() is about to release. */
+            zbtRemoveElem(mtree, el);
             t->alloc_size -= zmalloc_usable_size(el);
             zbtFreeElem(el);
         }
@@ -970,7 +1079,7 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
     return removed;
 }
 
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, zbtree *mtree) {
     if (t->length == 0) return 0;
     double minv = range->min, maxv = range->max;
     unsigned long before = range->minex ?
@@ -980,22 +1089,22 @@ unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
         zbtCountBefore(t, beforeScoreLt, &maxv) :
         zbtCountBefore(t, beforeScoreLe, &maxv);
     if (before >= upto) return 0;
-    return zbtDeleteRankRange(t, before + 1, upto, d);
+    return zbtDeleteRankRange(t, before + 1, upto, mtree);
 }
 
-unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d) {
+unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, zbtree *mtree) {
     if (t->length == 0) return 0;
     unsigned long before = zbtCountBefore(t, beforeNotGteMin, range);
     unsigned long upto = zbtCountBefore(t, beforeLteMax, range);
     if (before >= upto) return 0;
-    return zbtDeleteRankRange(t, before + 1, upto, d);
+    return zbtDeleteRankRange(t, before + 1, upto, mtree);
 }
 
 /* Delete elements whose 1-based rank is in [start, end] (inclusive). */
 unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start,
-                                   unsigned int end, dict *d) {
+                                   unsigned int end, zbtree *mtree) {
     if (t->length == 0 || start > end) return 0;
-    return zbtDeleteRankRange(t, start, end, d);
+    return zbtDeleteRankRange(t, start, end, mtree);
 }
 
 /*-----------------------------------------------------------------------------
@@ -1007,7 +1116,7 @@ unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start,
 void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe) {
     zbtLeaf *lf = zbtFindLeaf(t, newe->score, zbtGetEle(newe));
     int found;
-    int idx = zbtLeafSearch(lf, newe->score, zbtGetEle(newe), &found);
+    int idx = zbtLeafSearch(t, lf, newe->score, zbtGetEle(newe), &found);
     serverAssert(found && lf->elems[idx] == olde);
     lf->elems[idx] = newe;
     zbtUpdateToRoot(t, (zbtNode *)lf);
@@ -1043,7 +1152,8 @@ static void zbtCollectLeaves(zbtree *t, zbtNode *n, zbtLeaf **prev) {
 
 /* Relocate every tree node using the provided defrag allocator, then rebuild
  * the leaf sibling chain and head/tail pointers. Element objects are handled
- * separately by the caller (via the ZSET dict scan + zbtReplaceElem). */
+ * separately by the caller (walking one tree and calling zbtReplaceElem() on
+ * both). */
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *)) {
     t->root = zbtDefragNode(t->root, fn);
     t->root->parent = NULL;
@@ -1051,6 +1161,22 @@ void zbtDefragNodes(zbtree *t, void *(*fn)(void *)) {
     zbtCollectLeaves(t, t->root, &prev);
     if (prev) prev->next = NULL;
     t->tail = (zbtNode *)prev;
+}
+
+/* Hint the kernel to reclaim the pages backing every node of the tree (not the
+ * elements), mirroring dismissDictBucketsMemory() for the old member dict. Used
+ * during fork so the child does not keep the auxiliary index resident. */
+static void zbtDismissNode(zbtNode *n) {
+    dismissMemory(n, 0);
+    if (!n->isleaf) {
+        zbtInner *in = (zbtInner *)n;
+        for (uint32_t i = 0; i < in->n.count; i++)
+            zbtDismissNode(in->child[i]);
+    }
+}
+
+void zbtDismissNodes(zbtree *t) {
+    zbtDismissNode(t->root);
 }
 
 /* Relocate a single leaf (if the allocator decides to move it) and repair all
@@ -1139,6 +1265,55 @@ int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budge
     return 0;
 }
 
+/* Visit up to 'budget' elements in this tree's order, calling visit(privdata,e)
+ * on each. The visitor may relocate the element (fixing every tree's leaf slot
+ * via zbtReplaceElem()) but must not otherwise structurally modify the tree.
+ * The resume position is stored as the (score, member) key of the next element
+ * in the tree's own bookmark, so it survives inserts/deletes between calls.
+ * Returns 1 if more elements remain (bookmark saved), 0 when the whole tree has
+ * been visited. Used by the zset element defrag phase. */
+int zbtVisitElemsIncremental(zbtree *t, unsigned int budget,
+                             void (*visit)(void *, zbtElem *), void *privdata) {
+    zbtIter it;
+    zbtElem *e;
+    if (t->defrag_resume) {
+        zbtLeaf *lf = zbtFindLeaf(t, t->defrag_resume_score, t->defrag_resume);
+        int found;
+        int idx = zbtLeafSearch(t, lf, t->defrag_resume_score, t->defrag_resume,
+                                &found);
+        it.leaf = (zbtNode *)lf;
+        it.idx = idx;
+        /* The bookmarked element may have been deleted between slices; idx then
+         * points at the next survivor. */
+        e = (idx < (int)lf->n.count) ? lf->elems[idx] : zbtIterNext(&it);
+    } else {
+        e = zbtFirst(t, &it);
+    }
+
+    unsigned int work = 0;
+    while (e) {
+        /* visit() may relocate 'e'; the leaf slot 'it' points at then holds the
+         * replacement, so the iterator stays valid across the call. */
+        visit(privdata, e);
+        work++;
+        zbtElem *next = zbtIterNext(&it);
+        if (work >= budget) {
+            if (next) {
+                sds m = sdsdup(zbtGetEle(next));
+                if (t->defrag_resume) sdsfree(t->defrag_resume);
+                t->defrag_resume = m;
+                t->defrag_resume_score = next->score;
+                return 1;
+            }
+            break;
+        }
+        e = next;
+    }
+
+    if (t->defrag_resume) { sdsfree(t->defrag_resume); t->defrag_resume = NULL; }
+    return 0;
+}
+
 /*-----------------------------------------------------------------------------
  * Debugging / test verification
  *----------------------------------------------------------------------------*/
@@ -1170,7 +1345,7 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
         else serverAssert(*leafdepth == depth); /* all leaves same depth */
         for (uint32_t i = 1; i < n->count; i++) {
             zbtElem *a = lf->elems[i - 1], *b = lf->elems[i];
-            serverAssert(zbtCompare(a->score, zbtGetEle(a), b) < 0);
+            serverAssert(zbtCmp(t, a->score, zbtGetEle(a), b) < 0);
         }
         return n->count;
     }
@@ -1205,7 +1380,7 @@ void zbtDebugVerify(zbtree *t) {
         for (uint32_t i = 0; i < lf->n.count; i++) {
             if (prev_elem) {
                 zbtElem *cur = lf->elems[i];
-                serverAssert(zbtCompare(prev_elem->score, zbtGetEle(prev_elem), cur) < 0);
+                serverAssert(zbtCmp(t, prev_elem->score, zbtGetEle(prev_elem), cur) < 0);
             }
             prev_elem = lf->elems[i];
             chain++;
@@ -1235,7 +1410,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
     printf("Testing B+ tree operations with structure verification\n");
 
     const int N = 2000;
-    zbtree *t = zbtCreate();
+    zbtree *t = zbtCreate(ZBT_ORDER_SCORE);
 
     typedef struct {
         double score;
@@ -1321,7 +1496,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
                                 ZBT_LEAF_MAX * ZBT_INNER_MAX + 3, 5000};
     for (int trial = 0; trial < (int)(sizeof(sizes) / sizeof(sizes[0])); trial++) {
         int M = sizes[trial];
-        dict *d = dictCreate(&zsetDictType);
+        zbtree *mt = zbtCreate(ZBT_ORDER_MEMBER);
         zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
         for (int i = 0; i < M; i++) {
             char buf[32];
@@ -1330,37 +1505,41 @@ int zbtreeTest(int argc, char **argv, int flags) {
             arr[i] = zbtCreateElem((double)i, s);
             sdsfree(s);
         }
-        zbtree *bt = zbtCreate();
+        zbtree *bt = zbtCreate(ZBT_ORDER_SCORE);
         zbtBuildFromSorted(bt, arr, M);
         for (int i = 0; i < M; i++)
-            serverAssert(dictAdd(d, arr[i], NULL) == DICT_OK);
+            zbtInsertElem(mt, arr[i]);
         zfree(arr);
         zbtDebugVerify(bt);
+        zbtDebugVerify(mt);
         serverAssert(bt->length == (unsigned long)M);
         serverAssert(zbtElemByRank(bt, 1, NULL)->score == 0);
         serverAssert(zbtElemByRank(bt, M, NULL)->score == (double)(M - 1));
 
         if (M >= 10) {
-            /* Remove a middle window and confirm dict/tree stay in sync. */
+            /* Remove a middle window and confirm both trees stay in sync. */
             unsigned long lo = M / 4 + 1, hi = M / 2;
             unsigned long want = hi - lo + 1;
-            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, d);
+            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, mt);
             zbtDebugVerify(bt);
+            zbtDebugVerify(mt);
             serverAssert(got == want);
             serverAssert(bt->length == (unsigned long)M - want);
-            serverAssert(dictSize(d) == bt->length);
+            serverAssert(mt->length == bt->length);
             /* Score suffix removal. */
             zrangespec rs = {.min = (double)(M * 3 / 4), .max = 1.0 / 0.0,
                              .minex = 0, .maxex = 0};
-            zbtDeleteRangeByScore(bt, &rs, d);
+            zbtDeleteRangeByScore(bt, &rs, mt);
             zbtDebugVerify(bt);
-            serverAssert(dictSize(d) == bt->length);
+            zbtDebugVerify(mt);
+            serverAssert(mt->length == bt->length);
         }
         /* Remove everything that is left. */
-        zbtDeleteRangeByRank(bt, 1, bt->length, d);
+        zbtDeleteRangeByRank(bt, 1, bt->length, mt);
         zbtDebugVerify(bt);
-        serverAssert(bt->length == 0 && dictSize(d) == 0);
-        dictRelease(d);
+        zbtDebugVerify(mt);
+        serverAssert(bt->length == 0 && mt->length == 0);
+        zbtFree(mt);
         zbtFree(bt);
     }
     test_cond("Bulk build + range delete", 1);
@@ -1368,7 +1547,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
     /* --- Random-window range deletion, checking occupancy --- */
     {
         const int M = 20000;
-        dict *d = dictCreate(&zsetDictType);
+        zbtree *mt = zbtCreate(ZBT_ORDER_MEMBER);
         zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
         for (int i = 0; i < M; i++) {
             char buf[32];
@@ -1377,10 +1556,10 @@ int zbtreeTest(int argc, char **argv, int flags) {
             arr[i] = zbtCreateElem((double)i, sd);
             sdsfree(sd);
         }
-        zbtree *bt = zbtCreate();
+        zbtree *bt = zbtCreate(ZBT_ORDER_SCORE);
         zbtBuildFromSorted(bt, arr, M);
         for (int i = 0; i < M; i++)
-            serverAssert(dictAdd(d, arr[i], NULL) == DICT_OK);
+            zbtInsertElem(mt, arr[i]);
         zfree(arr);
 
         /* Delete windows wide enough to empty whole leaves, from positions
@@ -1396,19 +1575,20 @@ int zbtreeTest(int argc, char **argv, int flags) {
             unsigned long hi = lo + span;
             if (hi > bt->length) hi = bt->length;
             unsigned long before = bt->length;
-            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, d);
+            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, mt);
             zbtDebugVerify(bt);
+            zbtDebugVerify(mt);
             serverAssert(got == hi - lo + 1);
             serverAssert(bt->length == before - got);
-            serverAssert(dictSize(d) == bt->length);
+            serverAssert(mt->length == bt->length);
             /* Ranks stay dense and ordered after every window removal. */
             serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, 1, NULL)) == 1);
             serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, bt->length, NULL))
                          == bt->length);
         }
-        zbtDeleteRangeByRank(bt, 1, bt->length, d);
-        serverAssert(bt->length == 0 && dictSize(d) == 0);
-        dictRelease(d);
+        zbtDeleteRangeByRank(bt, 1, bt->length, mt);
+        serverAssert(bt->length == 0 && mt->length == 0);
+        zbtFree(mt);
         zbtFree(bt);
     }
     test_cond("Random-window range delete keeps occupancy", 1);
@@ -1416,7 +1596,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
     /* --- Sorted insertion packs leaves, in both directions --- */
     for (int desc = 0; desc < 2; desc++) {
         const int M = 20000;
-        zbtree *at = zbtCreate();
+        zbtree *at = zbtCreate(ZBT_ORDER_SCORE);
         for (int k = 0; k < M; k++) {
             int i = desc ? M - 1 - k : k;   /* descending inserts prepend */
             char buf[32];
@@ -1467,7 +1647,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
             arr[i] = zbtCreateElem((double)i, s);
             sdsfree(s);
         }
-        zbtree *bt = zbtCreate();
+        zbtree *bt = zbtCreate(ZBT_ORDER_SCORE);
         zbtBuildFromSorted(bt, arr, M);
         zfree(arr);
         zbtDebugVerify(bt);
@@ -1493,6 +1673,160 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(c == (unsigned long)M);
         zbtFree(bt);
         test_cond("Incremental node defrag", 1);
+    }
+
+    /* --- Member-ordered tree: randomized insert/find/remove vs reference --- */
+    {
+        const int M = 5000;
+        zbtree *st = zbtCreate(ZBT_ORDER_SCORE);   /* owns the elements */
+        zbtree *mt = zbtCreate(ZBT_ORDER_MEMBER);  /* borrows them */
+
+        typedef struct { sds ele; zbtElem *elem; int present; } Ref;
+        Ref *ref = zmalloc(sizeof(Ref) * M);
+        srand(9876);
+        for (int i = 0; i < M; i++) {
+            char buf[40];
+            /* Random member bytes so member order != insertion order. */
+            snprintf(buf, sizeof(buf), "m:%08d:%08d", rand() % 100000000,
+                     rand() % 100000000);
+            sds s = sdsnew(buf);
+            zbtElem *e = zbtInsert(st, (double)i, s);
+            sdsfree(s);
+            zbtInsertElem(mt, e);
+            ref[i].ele = zbtGetEle(e);
+            ref[i].elem = e;
+            ref[i].present = 1;
+            if (i % 211 == 0) { zbtDebugVerify(st); zbtDebugVerify(mt); }
+        }
+        zbtDebugVerify(st);
+        zbtDebugVerify(mt);
+        serverAssert(mt->length == (unsigned long)M);
+
+        /* Every inserted member must be found and map to its own element. */
+        for (int i = 0; i < M; i++) {
+            zbtElem *f = zbtFindMember(mt, ref[i].ele);
+            serverAssert(f == ref[i].elem);
+        }
+        /* An absent member returns NULL. */
+        {
+            sds miss = sdsnew("no-such-member-zzzzzzzzzzzzzz");
+            serverAssert(zbtFindMember(mt, miss) == NULL);
+            sdsfree(miss);
+        }
+
+        /* Remove half from the member tree (borrowing, so no free), then the
+         * score tree (owning, frees). zbtFindMember must reflect removals. */
+        for (int i = 0; i < M; i += 2) {
+            zbtRemoveElem(mt, ref[i].elem);
+            ref[i].present = 0;
+            if (i % 307 == 0) zbtDebugVerify(mt);
+        }
+        zbtDebugVerify(mt);
+        serverAssert(mt->length == (unsigned long)(M - (M + 1) / 2));
+        for (int i = 0; i < M; i++) {
+            zbtElem *f = zbtFindMember(mt, ref[i].ele);
+            if (ref[i].present) serverAssert(f == ref[i].elem);
+            else serverAssert(f == NULL);
+        }
+        zfree(ref);
+        zbtFree(mt);   /* borrower: must not touch the elements */
+        zbtFree(st);   /* owner: frees the elements */
+        test_cond("Member order find/remove vs reference", 1);
+    }
+
+    /* --- Borrowed-element teardown: member tree frees no elements --- */
+    {
+        const int M = 1000;
+        zbtree *st = zbtCreate(ZBT_ORDER_SCORE);
+        zbtree *mt = zbtCreate(ZBT_ORDER_MEMBER);
+        for (int i = 0; i < M; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "bt:%08d", i);
+            sds s = sdsnew(buf);
+            zbtElem *e = zbtInsert(st, (double)i, s);
+            sdsfree(s);
+            zbtInsertElem(mt, e);
+        }
+        /* Member tree accounts for nodes only, never element payload. */
+        serverAssert(!mt->owns_elems);
+        serverAssert(st->owns_elems);
+
+        /* Free the borrower first. Elements must survive: walk the score tree
+         * and confirm every member sds is still intact and addressable. */
+        zbtFree(mt);
+        zbtDebugVerify(st);
+        zbtIter it;
+        zbtElem *e = zbtFirst(st, &it);
+        unsigned long seen = 0;
+        while (e) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "bt:%08lu", (unsigned long)e->score);
+            serverAssert(strcmp(zbtGetEle(e), buf) == 0);
+            seen++;
+            e = zbtIterNext(&it);
+        }
+        serverAssert(seen == (unsigned long)M);
+        zbtFree(st);
+        test_cond("Borrowed tree teardown frees no elements", 1);
+    }
+
+    /* --- zbtSeekPrefix8 boundaries --- */
+    {
+        zbtree *st = zbtCreate(ZBT_ORDER_SCORE);
+        zbtree *mt = zbtCreate(ZBT_ORDER_MEMBER);
+        /* Members grouped by an 8-byte shared prefix. "aaaaaaaa" and
+         * "bbbbbbbb" are exactly 8 bytes, so each is a distinct prefix8. */
+        const char *groups[] = {"aaaaaaaa", "bbbbbbbb", "cccccccc"};
+        const int NG = 3, PER = 50;
+        for (int g = 0; g < NG; g++) {
+            for (int j = 0; j < PER; j++) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%s:%03d", groups[g], j);
+                sds s = sdsnew(buf);
+                zbtElem *e = zbtInsert(st, (double)(g * PER + j), s);
+                sdsfree(s);
+                zbtInsertElem(mt, e);
+            }
+        }
+        zbtDebugVerify(mt);
+
+        zbtIter it;
+        /* Seeking a prefix below everything lands on the very first member. */
+        zbtElem *first = zbtFirst(mt, &it);
+        zbtIter it2;
+        zbtElem *r = zbtSeekPrefix8(mt, 0, &it2);
+        serverAssert(r == first);
+
+        /* Seeking exactly a group's prefix lands on that group's first member. */
+        for (int g = 0; g < NG; g++) {
+            sds key = sdsnew(groups[g]);
+            uint64_t p = zbtPrefix8(key);
+            sdsfree(key);
+            zbtElem *hit = zbtSeekPrefix8(mt, p, &it2);
+            serverAssert(hit != NULL);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%s:%03d", groups[g], 0);
+            serverAssert(strcmp(zbtGetEle(hit), buf) == 0);
+        }
+
+        /* prefix8 strictly above the largest member yields NULL (end). */
+        serverAssert(zbtSeekPrefix8(mt, ~(uint64_t)0, &it2) == NULL);
+
+        /* Emitting forward from a mid-group prefix and finishing the group
+         * covers exactly the suffix of the ordering, no gaps or repeats. */
+        {
+            sds key = sdsnew(groups[1]);
+            uint64_t p = zbtPrefix8(key);
+            sdsfree(key);
+            zbtElem *cur = zbtSeekPrefix8(mt, p, &it2);
+            unsigned long tail = 0;
+            while (cur) { tail++; cur = zbtIterNext(&it2); }
+            serverAssert(tail == (unsigned long)(PER * (NG - 1)));
+        }
+
+        zbtFree(mt);
+        zbtFree(st);
+        test_cond("zbtSeekPrefix8 boundaries", 1);
     }
 
     return 0;
