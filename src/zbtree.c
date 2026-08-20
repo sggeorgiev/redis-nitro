@@ -39,18 +39,45 @@
 #define ZBT_INNER_MIN  (ZBT_INNER_MAX/2)
 
 /* Common node header. Both leaf and inner nodes start with it so that a
- * zbtNode* can be inspected polymorphically. */
+ * zbtNode* can be inspected polymorphically. 'cap' is only meaningful for
+ * leaves (see zbtLeaf); it shares the 16-byte header that isleaf/count already
+ * occupy, so tracking it costs no extra memory. */
 struct zbtNode {
     struct zbtNode *parent;
     uint32_t count;   /* used slots: elems (leaf) or children (inner) */
-    uint32_t isleaf;
+    uint8_t isleaf;
+    uint8_t cap;      /* leaf only: allocated elems[] slots (see zbtNewLeaf) */
 };
 
+/* Leaves carry a variable number of element-pointer slots. Reserving the full
+ * ZBT_LEAF_MAX + 1 slots up front rounds every leaf up to the 640-byte jemalloc
+ * class regardless of how full it is, which strands memory in leaves left
+ * half-full by interior inserts or deletions. Instead elems[] is a trailing
+ * flexible member: zbtNewLeaf()/zbtLeafResize() request only the bytes the
+ * contents need and record the capacity jemalloc actually returned
+ * (zbtLeafCapFor), letting the allocator's own size classes act as the growth
+ * ladder. 'n.cap' caches that capacity so the hot insert path avoids
+ * re-deriving it. */
 typedef struct zbtLeaf {
     zbtNode n;
     struct zbtLeaf *prev, *next;         /* sibling leaves (sorted order) */
-    zbtElem *elems[ZBT_LEAF_MAX + 1];
+    zbtElem *elems[];
 } zbtLeaf;
+
+static_assert(offsetof(zbtLeaf, elems) % 8 == 0,
+              "zbtLeaf.elems must be 8-byte aligned");
+
+/* Capacity, in element slots, implied by a leaf allocation of 'usable' bytes.
+ * Clamped to ZBT_LEAF_MAX + 1, the temporary overflow slot the split paths
+ * rely on before a full leaf is divided. */
+static inline uint8_t zbtLeafCapFor(size_t usable) {
+    size_t cap = (usable - offsetof(zbtLeaf, elems)) / sizeof(zbtElem *);
+    return (uint8_t)(cap > ZBT_LEAF_MAX + 1 ? ZBT_LEAF_MAX + 1 : cap);
+}
+
+/* Slots a fresh empty leaf starts with. Kept small so the placeholder root of
+ * an empty or tiny tree is cheap; it grows on demand as elements arrive. */
+#define ZBT_LEAF_CAP_INIT 4
 
 typedef struct zbtInner {
     zbtNode n;
@@ -123,12 +150,18 @@ const void *zbtGetEleForDict(const void *elem) {
  * Node allocation / tree lifecycle
  *----------------------------------------------------------------------------*/
 
-static zbtLeaf *zbtNewLeaf(zbtree *t) {
+/* Allocate a leaf with room for at least 'cap' element slots. The request is
+ * rounded up to a jemalloc size class, and the capacity actually obtained is
+ * cached in n.cap so inserts can tell when the leaf is full without re-deriving
+ * it. */
+static zbtLeaf *zbtNewLeaf(zbtree *t, unsigned cap) {
     size_t usable;
-    zbtLeaf *lf = zmalloc_usable(sizeof(*lf), &usable);
+    size_t want = offsetof(zbtLeaf, elems) + (size_t)cap * sizeof(zbtElem *);
+    zbtLeaf *lf = zmalloc_usable(want, &usable);
     lf->n.parent = NULL;
     lf->n.count = 0;
     lf->n.isleaf = 1;
+    lf->n.cap = zbtLeafCapFor(usable);
     lf->prev = lf->next = NULL;
     t->alloc_size += usable;
     return lf;
@@ -140,6 +173,7 @@ static zbtInner *zbtNewInner(zbtree *t) {
     in->n.parent = NULL;
     in->n.count = 0;
     in->n.isleaf = 0;
+    in->n.cap = 0;   /* unused for inner nodes; keep it deterministic */
     t->alloc_size += usable;
     return in;
 }
@@ -158,7 +192,7 @@ zbtree *zbtCreate(void) {
     t->root = NULL;
     t->defrag_resume = NULL;
     t->defrag_resume_score = 0;
-    zbtLeaf *lf = zbtNewLeaf(t);
+    zbtLeaf *lf = zbtNewLeaf(t, ZBT_LEAF_CAP_INIT);
     t->root = (zbtNode *)lf;
     t->head = t->tail = (zbtNode *)lf;
     return t;
@@ -287,6 +321,52 @@ static void zbtUpdateToRoot(zbtree *t, zbtNode *n) {
 }
 
 /*-----------------------------------------------------------------------------
+ * Variable leaf capacity
+ *----------------------------------------------------------------------------*/
+
+/* Repair every external reference to a leaf whose allocation moved from
+ * 'oldlf' to 'nl': the parent's child slot (or the tree root), the sibling
+ * links and the head/tail pointers. Only pointer values are inspected -- the
+ * old block is never dereferenced -- so 'oldlf' may already be freed, which is
+ * exactly what a post-realloc fixup needs. */
+static void zbtLeafFixupRefs(zbtree *t, zbtLeaf *oldlf, zbtLeaf *nl) {
+    if (nl->n.parent) {
+        zbtInner *p = (zbtInner *)nl->n.parent;
+        p->child[zbtChildIdx(p, (zbtNode *)oldlf)] = (zbtNode *)nl;
+    } else {
+        t->root = (zbtNode *)nl;
+    }
+    if (nl->prev) nl->prev->next = nl; else t->head = (zbtNode *)nl;
+    if (nl->next) nl->next->prev = nl; else t->tail = (zbtNode *)nl;
+}
+
+/* Resize leaf 'lf' so its allocation holds at least 'mincap' element slots.
+ * jemalloc rounds the request up to a size class, and that class determines the
+ * leaf's new capacity. Returns the possibly-moved leaf with every reference
+ * repaired and t->alloc_size kept in step with the real allocation delta. */
+static zbtLeaf *zbtLeafResize(zbtree *t, zbtLeaf *lf, unsigned mincap) {
+    size_t want = offsetof(zbtLeaf, elems) + (size_t)mincap * sizeof(zbtElem *);
+    size_t newusable, oldusable;
+    zbtLeaf *nl = zrealloc_usable(lf, want, &newusable, &oldusable);
+    t->alloc_size += newusable - oldusable;
+    nl->n.cap = zbtLeafCapFor(newusable);
+    if (nl != lf) zbtLeafFixupRefs(t, lf, nl);
+    return nl;
+}
+
+/* Release capacity from a leaf whose occupancy has dropped to half or less, so
+ * a set that grew large and then shrank does not keep oversized leaves. The
+ * hysteresis (only at or below half the capacity) keeps ordinary
+ * single-element deletes from reallocating on every call. */
+static zbtLeaf *zbtLeafMaybeShrink(zbtree *t, zbtLeaf *lf) {
+    if (lf->n.cap > ZBT_LEAF_MIN && lf->n.count <= lf->n.cap / 2) {
+        unsigned want = lf->n.count ? lf->n.count : 1;
+        lf = zbtLeafResize(t, lf, want);
+    }
+    return lf;
+}
+
+/*-----------------------------------------------------------------------------
  * Insertion
  *----------------------------------------------------------------------------*/
 
@@ -357,12 +437,16 @@ static void zbtSplitInner(zbtree *t, zbtInner *in) {
  * cover a short end leaf's deficit, and rebalancing only merges when the pair
  * totals below 2 * ZBT_LEAF_MIN, so it can never overfill a leaf. */
 static void zbtSplitLeaf(zbtree *t, zbtLeaf *lf, int bias) {
-    zbtLeaf *r = zbtNewLeaf(t);
     int total = (int)lf->n.count; /* == ZBT_LEAF_MAX + 1 */
     int keep = total / 2;
     if (bias == ZBT_SPLIT_APPEND) keep = total - 1;
     else if (bias == ZBT_SPLIT_PREPEND) keep = 1;
     int move = total - keep;
+
+    /* Size the new sibling to exactly what it receives. A sorted-insertion
+     * split peels off a single element, so the fresh end leaf starts tiny and
+     * grows a rung at a time as the run continues. */
+    zbtLeaf *r = zbtNewLeaf(t, (unsigned)move);
     memcpy(r->elems, &lf->elems[keep], move * sizeof(zbtElem *));
     r->n.count = move;
     lf->n.count = keep;
@@ -372,6 +456,14 @@ static void zbtSplitLeaf(zbtree *t, zbtLeaf *lf, int bias) {
     if (lf->next) lf->next->prev = r;
     else t->tail = (zbtNode *)r;
     lf->next = r;
+
+    /* An even split halves 'lf'; release the now-unused tail of its
+     * allocation, which is where the interior-insert waste accumulates. The
+     * append/prepend biases leave 'lf' near-full, where an exact-fit realloc
+     * would map to the same size class, so skip them to avoid pointless churn.
+     * zbtLeafResize() repairs r->prev and the parent slot if 'lf' moves. */
+    if (keep <= ZBT_LEAF_MAX - ZBT_LEAF_MAX / 4)
+        lf = zbtLeafResize(t, lf, (unsigned)keep);
 
     zbtInsertChild(t, (zbtInner *)lf->n.parent, (zbtNode *)lf, (zbtNode *)r);
 }
@@ -393,6 +485,12 @@ void zbtInsertElem(zbtree *t, zbtElem *e) {
     int bias = ZBT_SPLIT_EVEN;
     if (lf->next == NULL && idx == (int)lf->n.count) bias = ZBT_SPLIT_APPEND;
     else if (lf->prev == NULL && idx == 0) bias = ZBT_SPLIT_PREPEND;
+
+    /* Grow one size class when full. This may reach ZBT_LEAF_MAX + 1 (the
+     * overflow slot), after which the insert below tips the leaf over and it is
+     * split. 'lf' is local, so the possibly-new pointer stays contained. */
+    if (lf->n.count == lf->n.cap)
+        lf = zbtLeafResize(t, lf, (unsigned)lf->n.count + 1);
 
     memmove(&lf->elems[idx + 1], &lf->elems[idx],
             ((int)lf->n.count - idx) * sizeof(zbtElem *));
@@ -438,8 +536,11 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
     unsigned long pos = 0;
     zbtLeaf *prev = NULL;
     for (unsigned long i = 0; i < nleaves; i++) {
-        zbtLeaf *lf = zbtNewLeaf(t);
         unsigned long cnt = base + (i < rem ? 1 : 0);
+        /* Exact-fit each leaf: a bulk build spreads elements evenly, so most
+         * leaves sit around ZBT_LEAF_MAX/2 and a fixed 65-slot allocation would
+         * waste roughly 40% on small and medium sets. */
+        zbtLeaf *lf = zbtNewLeaf(t, (unsigned)cnt);
         memcpy(lf->elems, &elems[pos], cnt * sizeof(zbtElem *));
         lf->n.count = (uint32_t)cnt;
         pos += cnt;
@@ -607,6 +708,11 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     if (idx > 0) {
         zbtLeaf *L = (zbtLeaf *)p->child[idx - 1];
         if ((int)L->n.count - deficit >= ZBT_LEAF_MIN) {
+            /* 'lf' may have shrunk on an earlier delete; make room for the
+             * borrowed elements. Growing it leaves 'p'/'idx'/'L' valid (the
+             * parent slot is repaired in place). */
+            if ((int)lf->n.count + deficit > (int)lf->n.cap)
+                lf = zbtLeafResize(t, lf, (unsigned)lf->n.count + deficit);
             zbtElem **src = &L->elems[(int)L->n.count - deficit];
             memmove(&lf->elems[deficit], &lf->elems[0],
                     lf->n.count * sizeof(zbtElem *));
@@ -626,6 +732,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     if (idx < (int)p->n.count - 1) {
         zbtLeaf *R = (zbtLeaf *)p->child[idx + 1];
         if ((int)R->n.count - deficit >= ZBT_LEAF_MIN) {
+            if ((int)lf->n.count + deficit > (int)lf->n.cap)
+                lf = zbtLeafResize(t, lf, (unsigned)lf->n.count + deficit);
             if (deficit == 1) lf->elems[lf->n.count] = R->elems[0];
             else memcpy(&lf->elems[lf->n.count], &R->elems[0],
                         deficit * sizeof(zbtElem *));
@@ -648,6 +756,10 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     if (idx > 0) { a = (zbtLeaf *)p->child[idx - 1]; b = lf; ai = idx - 1; }
     else { a = lf; b = (zbtLeaf *)p->child[idx + 1]; ai = idx; }
     serverAssert(a->n.count + b->n.count <= ZBT_LEAF_MAX);
+    /* Grow the survivor to hold both leaves before copying; either may have
+     * shrunk below the combined size on earlier deletes. */
+    if ((int)a->n.count + (int)b->n.count > (int)a->n.cap)
+        a = zbtLeafResize(t, a, a->n.count + b->n.count);
     memcpy(&a->elems[a->n.count], b->elems, b->n.count * sizeof(zbtElem *));
     a->n.count += b->n.count;
     a->next = b->next;
@@ -675,10 +787,12 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
     t->alloc_size -= zmalloc_usable_size(e);
     zbtFreeElem(e);
 
-    if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
+    if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN) {
         zbtRebalanceLeaf(t, lf);
-    else
+    } else {
+        lf = zbtLeafMaybeShrink(t, lf);
         zbtUpdateToRoot(t, (zbtNode *)lf);
+    }
 }
 
 /* Move an existing element to reflect a new score. The element object is
@@ -699,10 +813,12 @@ void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     lf->n.count--;
     t->length--;
     t->alloc_size -= zmalloc_usable_size(e);
-    if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
+    if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN) {
         zbtRebalanceLeaf(t, lf);
-    else
+    } else {
+        lf = zbtLeafMaybeShrink(t, lf);
         zbtUpdateToRoot(t, (zbtNode *)lf);
+    }
 
     e->score = newscore;
     zbtInsertElem(t, e);
@@ -962,10 +1078,12 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
          * remaining window from the top. */
         last -= take;
 
-        if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN)
+        if (lf->n.parent && lf->n.count < ZBT_LEAF_MIN) {
             zbtRebalanceLeaf(t, lf);
-        else
+        } else {
+            lf = zbtLeafMaybeShrink(t, lf);
             zbtUpdateToRoot(t, (zbtNode *)lf);
+        }
     }
     return removed;
 }
@@ -1059,14 +1177,7 @@ void zbtDefragNodes(zbtree *t, void *(*fn)(void *)) {
 static zbtLeaf *zbtDefragRelocLeaf(zbtree *t, zbtLeaf *lf, void *(*fn)(void *)) {
     zbtLeaf *nl = fn(lf);
     if (!nl) return lf;
-    if (nl->n.parent) {
-        zbtInner *p = (zbtInner *)nl->n.parent;
-        p->child[zbtChildIdx(p, (zbtNode *)lf)] = (zbtNode *)nl;
-    } else {
-        t->root = (zbtNode *)nl;
-    }
-    if (nl->prev) nl->prev->next = nl; else t->head = (zbtNode *)nl;
-    if (nl->next) nl->next->prev = nl; else t->tail = (zbtNode *)nl;
+    zbtLeafFixupRefs(t, lf, nl);
     return nl;
 }
 
@@ -1166,6 +1277,9 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
             serverAssert(n->count >= ZBT_LEAF_MIN);
         if (n->parent) serverAssert(n->count >= 1);
         serverAssert(n->count <= ZBT_LEAF_MAX);
+        /* Capacity tracks the actual allocation and always covers the count. */
+        serverAssert(n->count <= n->cap && n->cap <= ZBT_LEAF_MAX + 1);
+        serverAssert(n->cap == zbtLeafCapFor(zmalloc_usable_size(lf)));
         if (*leafdepth == -1) *leafdepth = depth;
         else serverAssert(*leafdepth == depth); /* all leaves same depth */
         for (uint32_t i = 1; i < n->count; i++) {
@@ -1493,6 +1607,48 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(c == (unsigned long)M);
         zbtFree(bt);
         test_cond("Incremental node defrag", 1);
+    }
+
+    /* --- Variable leaf capacity: grow, shrink, regrow --- */
+    {
+        const int M = 4000;
+        zbtree *bt = zbtCreate();
+        /* Grow a single leaf from ZBT_LEAF_CAP_INIT all the way up through
+         * splits, exercising zbtLeafResize() on the insert path. */
+        for (int i = 0; i < M; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "vc:%08d", i);
+            sds s = sdsnew(buf);
+            zbtInsert(bt, (double)i, s);
+            sdsfree(s);
+            if (i % 251 == 0) zbtDebugVerify(bt);
+        }
+        zbtDebugVerify(bt);
+        serverAssert(bt->length == (unsigned long)M);
+        size_t grown = zbtAllocSize(bt);
+
+        /* Drain most of the tree from the front so leaves shrink and merge. */
+        for (int i = 0; i < M - 100; i++) {
+            zbtDeleteElem(bt, zbtElemByRank(bt, 1, NULL));
+            if (i % 257 == 0) zbtDebugVerify(bt);
+        }
+        zbtDebugVerify(bt);
+        serverAssert(bt->length == 100);
+        serverAssert(zbtAllocSize(bt) < grown); /* released leaf capacity */
+
+        /* Regrow and confirm structure and capacities stay consistent. */
+        for (int i = M; i < M + 3000; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "vc:%08d", i);
+            sds s = sdsnew(buf);
+            zbtInsert(bt, (double)i, s);
+            sdsfree(s);
+            if (i % 263 == 0) zbtDebugVerify(bt);
+        }
+        zbtDebugVerify(bt);
+        serverAssert(bt->length == 3100);
+        zbtFree(bt);
+        test_cond("Variable leaf capacity grow/shrink/regrow", 1);
     }
 
     return 0;
