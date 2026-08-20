@@ -63,12 +63,12 @@ typedef struct zbtLeaf {
 /* csize[] is a trailing flexible array whose slot width is chosen at allocation
  * time from the node's level (1/2/4/8 bytes), because a child subtree at level
  * L holds at most ZBT_INNER_MAX^L elements. It must stay last; sep[] cannot sit
- * after a variable-width array. The fixed prefix (header + child[] + sep[]) is
+ * after a variable-width array. The fixed prefix (header + sep[] + child[]) is
  * a multiple of 8, so every csize slot is naturally aligned. */
 typedef struct zbtInner {
     zbtNode n;
-    struct zbtNode *child[ZBT_INNER_MAX + 1];
     zbtElem *sep[ZBT_INNER_MAX + 1];        /* minimum element of child[i] */
+    struct zbtNode *child[ZBT_INNER_MAX + 1];
     unsigned char csize[];                  /* subtree element count of child[i] */
 } zbtInner;
 
