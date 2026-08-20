@@ -1805,19 +1805,27 @@ struct sharedObjectsStruct {
 /* ZSETs use an order-statistic B+ tree (see zbtree.c) as the large encoding,
  * paired with a dict mapping member -> element for O(1) score lookup. */
 
+/* B+ tree node is opaque outside zbtree.c. */
+typedef struct zbtNode zbtNode;
+
 /* A single sorted-set element. The member SDS is embedded in the same
  * allocation right after this header, mirroring the old skiplist node layout
  * so the dict can store zbtElem* as keys.
+ *
+ * 'leaf' points at the leaf holding this element, so a caller that already has
+ * the element (the dict lookup that starts ZRANK, ZREM, ZINCRBY) can reach its
+ * position without descending the tree from the root.
  *
  * data[0] holds the offset from the element start to the embedded member data,
  * followed by the sds header and the member bytes. The offset has to be stored
  * because the sds header size depends on the sds type, so the member data does
  * not sit at a fixed distance from the element start. It is kept outside the
- * struct rather than as a trailing field because any field after 'score' would
- * force the struct up to 16 bytes of alignment padding, which for short
- * members costs a whole jemalloc size class per element. */
+ * struct rather than as a trailing field because any field of pointer width
+ * would force the struct up to the next 8-byte multiple of padding, which for
+ * short members costs a whole jemalloc size class per element. */
 typedef struct zbtElem {
     double score;
+    zbtNode *leaf;
     char data[];
 } zbtElem;
 
@@ -1833,9 +1841,6 @@ static inline void zbtSetOffset(zbtElem *e, uint8_t off) {
 static inline sds zbtGetEle(const zbtElem *e) {
     return (sds)((char *)e + zbtGetOffset(e));
 }
-
-/* B+ tree node is opaque outside zbtree.c. */
-typedef struct zbtNode zbtNode;
 
 typedef struct zbtree {
     zbtNode *root;
