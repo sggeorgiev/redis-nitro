@@ -1802,7 +1802,7 @@ struct sharedObjectsStruct {
     sds minstring, maxstring;
 };
 
-/* ZSETs use an order-statistic B+ tree (see zbtree.c) as the large encoding,
+/* ZSETs use an order-statistic T-tree (see zbtree.c) as the large encoding,
  * paired with a dict mapping member -> element for O(1) score lookup. */
 
 /* A single sorted-set element. The member SDS is embedded in the same

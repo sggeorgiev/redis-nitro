@@ -198,7 +198,7 @@ struct RedisModuleKey {
             uint32_t start;        /* Start pos for positional ranges. */
             uint32_t end;          /* End pos for positional ranges. */
             void *current;         /* Zset iterator current node. */
-            zbtIter it;            /* B+ tree position for O(1) stepping
+            zbtIter it;            /* T-tree position for O(1) stepping
                                        (valid only for OBJ_ENCODING_BTREE). */
             int er;                /* Zset iterator end reached flag
                                        (true if end was reached). */

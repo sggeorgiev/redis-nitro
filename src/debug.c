@@ -1350,7 +1350,7 @@ void serverLogObjectDebugInfo(const robj *o) {
     } else if (o->type == OBJ_ZSET) {
         serverLog(LL_WARNING,"Sorted set size: %d", (int) zsetLength(o));
         if (o->encoding == OBJ_ENCODING_BTREE)
-            serverLog(LL_WARNING,"B+ tree length: %lu", ((const zset*)o->ptr)->tree->length);
+            serverLog(LL_WARNING,"T-tree length: %lu", ((const zset*)o->ptr)->tree->length);
     } else if (o->type == OBJ_STREAM) {
         serverLog(LL_WARNING,"Stream size: %d", (int) streamLength(o));
 #ifdef ENABLE_GCRA
