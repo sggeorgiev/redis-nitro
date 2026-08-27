@@ -2146,6 +2146,14 @@ static void zdiff(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen,
  * 'cardinality_only' is currently only applicable when 'op' is SET_OP_INTER.
  * Work for SINTERCARD, only return the cardinality with minimum processing and memory overheads.
  */
+/* qsort comparator over zbtElem* (by score, then member), used to sort the
+ * aggregated union elements ascending before a bulk bottom-up tree build. */
+static int zunionElemPtrCmp(const void *a, const void *b) {
+    zbtElem *ea = *(zbtElem *const *)a;
+    zbtElem *eb = *(zbtElem *const *)b;
+    return zbtCompare(ea->score, zbtGetEle(ea), eb);
+}
+
 void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, int op,
                                    int cardinality_only) {
     int i, j;
@@ -2388,14 +2396,23 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         }
 
         /* Step 2: Done filling dict with elements and updating scores. Now
-         * insert them all into the B+ tree. */
-        dictInitIterator(&di, dstzset->dict);
-
-        while((de = dictNext(&di)) != NULL) {
-            zbtElem *elem = dictGetKey(de);
-            zbtInsertElem(dstzset->tree, elem);
+         * insert them all into the tree. The dict already de-duplicated and
+         * fixed every score, so collect the elements, sort them once and hand
+         * them to the O(N) bottom-up builder instead of doing N independent
+         * top-down inserts (each a descent plus rebalance). */
+        unsigned long ecnt = dictSize(dstzset->dict);
+        if (ecnt > 0) {
+            zbtElem **elems = zmalloc(ecnt * sizeof(zbtElem *));
+            unsigned long ei = 0;
+            dictInitIterator(&di, dstzset->dict);
+            while((de = dictNext(&di)) != NULL)
+                elems[ei++] = dictGetKey(de);
+            dictResetIterator(&di);
+            serverAssert(ei == ecnt);
+            qsort(elems, ecnt, sizeof(zbtElem *), zunionElemPtrCmp);
+            zbtBuildFromSorted(dstzset->tree, elems, ecnt);
+            zfree(elems);
         }
-        dictResetIterator(&di);
     } else if (op == SET_OP_DIFF) {
         zdiff(src, setnum, dstzset, &maxelelen, &totelelen);
     } else {
