@@ -43,11 +43,22 @@
 #define ZBT_INNER_MIN  (ZBT_INNER_MAX/2)
 
 /* Common node header. Both leaf and inner nodes start with it so that a
- * zbtNode* can be inspected polymorphically. */
+ * zbtNode* can be inspected polymorphically.
+ *
+ * same_score/prefix_len are a compare hint for the large-tied-member case
+ * (e.g. a ZSET where every score is equal and the members share a long common
+ * prefix). When same_score is set, every element in the subtree has the same
+ * score and shares the first prefix_len member bytes, so a search can settle
+ * the score once and skip that many bytes instead of running a full sdscmp per
+ * slot. The hint is derived purely from the subtree's min and max elements
+ * (LCP of a sorted range is the LCP of its endpoints); it is never required for
+ * correctness, so a stale-but-shorter prefix_len is always safe. */
 struct zbtNode {
     struct zbtNode *parent;
-    uint32_t count;   /* used slots: elems (leaf) or children (inner) */
-    uint32_t isleaf;
+    uint32_t count;        /* used slots: elems (leaf) or children (inner) */
+    uint16_t prefix_len;   /* shared member-byte count when same_score, else 0 */
+    uint8_t  isleaf;
+    uint8_t  same_score;   /* 1 iff every element in the subtree has one score */
 };
 
 typedef struct zbtLeaf {
@@ -137,7 +148,9 @@ static zbtLeaf *zbtNewLeaf(zbtree *t) {
     zbtLeaf *lf = zmalloc_usable(sizeof(*lf), &usable);
     lf->n.parent = NULL;
     lf->n.count = 0;
+    lf->n.prefix_len = 0;
     lf->n.isleaf = 1;
+    lf->n.same_score = 1;
     lf->prev = lf->next = NULL;
     t->alloc_size += usable;
     return lf;
@@ -148,7 +161,9 @@ static zbtInner *zbtNewInner(zbtree *t) {
     zbtInner *in = zmalloc_usable(sizeof(*in), &usable);
     in->n.parent = NULL;
     in->n.count = 0;
+    in->n.prefix_len = 0;
     in->n.isleaf = 0;
+    in->n.same_score = 1;
     t->alloc_size += usable;
     return in;
 }
@@ -219,6 +234,66 @@ static unsigned long zbtSubtreeSize(zbtNode *n) {
     return s;
 }
 
+/* Maximum element of a subtree rooted at 'n' (assumes non-empty). Unlike the
+ * minimum there is no cached separator for it, so we descend the rightmost
+ * child. Height is tiny and this is only used on the write path. */
+static zbtElem *zbtNodeMax(zbtNode *n) {
+    while (!n->isleaf) {
+        zbtInner *in = (zbtInner *)n;
+        n = in->child[in->n.count - 1];
+    }
+    zbtLeaf *lf = (zbtLeaf *)n;
+    return lf->elems[lf->n.count - 1];
+}
+
+/* Length of the longest common prefix of two member strings, capped at
+ * UINT16_MAX so it fits the node header. A cap only shortens the skip, which
+ * stays correct. */
+static uint16_t zbtMemberLcp(sds a, sds b) {
+    size_t la = sdslen(a), lb = sdslen(b);
+    size_t n = la < lb ? la : lb;
+    if (n > UINT16_MAX) n = UINT16_MAX;
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) i++;
+    return (uint16_t)i;
+}
+
+/* Recompute the same_score/prefix_len hint for 'n' from its endpoint elements.
+ * Called whenever a node's membership or endpoints change. */
+static void zbtRefreshPrefix(zbtNode *n) {
+    if (n->count == 0) { n->same_score = 1; n->prefix_len = 0; return; }
+    zbtElem *mn = zbtNodeMin(n);
+    zbtElem *mx = zbtNodeMax(n);
+    if (mn->score != mx->score) { n->same_score = 0; n->prefix_len = 0; return; }
+    n->same_score = 1;
+    n->prefix_len = zbtMemberLcp(zbtGetEle(mn), zbtGetEle(mx));
+}
+
+/* Compare a query member against a node's minimum member, looking only at the
+ * first 'plen' shared bytes. Because every element in the node shares those
+ * bytes, a mismatch inside them places the query entirely left (<0) or right
+ * (>0) of the whole node. Returns 0 when the query matches the full prefix
+ * (and is at least 'plen' bytes long), meaning the caller must scan suffixes. */
+static int zbtPrefixCmpMin(sds ele, size_t qlen, sds mele, uint16_t plen) {
+    size_t n = qlen < plen ? qlen : plen;
+    int c = memcmp(ele, mele, n);
+    if (c != 0) return c;
+    if (qlen < plen) return -1;  /* query is a strict prefix, hence smaller */
+    return 0;
+}
+
+/* Compare a query member against element 'e' knowing both share the first 'off'
+ * member bytes and have the same score. Only the suffix past 'off' matters. */
+static int zbtCmpSuffix(sds ele, size_t qlen, const zbtElem *e, size_t off) {
+    sds me = zbtGetEle(e);
+    size_t melen = sdslen(me);
+    size_t a = qlen - off, b = melen - off;
+    size_t n = a < b ? a : b;
+    int c = memcmp(ele + off, me + off, n);
+    if (c != 0) return c;
+    return (a > b) - (a < b);
+}
+
 /* Index of child 'c' inside inner node 'p'. */
 static int zbtChildIdx(zbtInner *p, zbtNode *c) {
     for (uint32_t i = 0; i < p->n.count; i++)
@@ -228,6 +303,21 @@ static int zbtChildIdx(zbtInner *p, zbtNode *c) {
 
 /* Choose the child of inner node 'in' whose key range contains (score,ele). */
 static int zbtInnerChildIdx(zbtInner *in, double score, sds ele) {
+    if (in->n.same_score) {
+        zbtElem *mn = in->sep[0];
+        /* Whole node shares one score: a differing query score lands entirely
+         * on one side without touching a single member byte. */
+        if (score != mn->score)
+            return (score < mn->score) ? 0 : (int)in->n.count - 1;
+        /* Same score: settle the shared prefix once against the minimum. */
+        uint16_t plen = in->n.prefix_len;
+        size_t qlen = sdslen(ele);
+        int pc = zbtPrefixCmpMin(ele, qlen, zbtGetEle(mn), plen);
+        if (pc != 0) return (pc < 0) ? 0 : (int)in->n.count - 1;
+        int i = (int)in->n.count - 1;
+        while (i > 0 && zbtCmpSuffix(ele, qlen, in->sep[i], plen) < 0) i--;
+        return i;
+    }
     int i = (int)in->n.count - 1;
     while (i > 0 && zbtCompare(score, ele, in->sep[i]) < 0) i--;
     return i;
@@ -247,6 +337,24 @@ static zbtLeaf *zbtFindLeaf(zbtree *t, double score, sds ele) {
  * the element is (if found) or where it should be inserted. */
 static int zbtLeafSearch(zbtLeaf *lf, double score, sds ele, int *found) {
     uint32_t i;
+    if (lf->n.same_score && lf->n.count > 0) {
+        zbtElem *mn = lf->elems[0];
+        if (score != mn->score) {
+            *found = 0;
+            return (score < mn->score) ? 0 : (int)lf->n.count;
+        }
+        uint16_t plen = lf->n.prefix_len;
+        size_t qlen = sdslen(ele);
+        int pc = zbtPrefixCmpMin(ele, qlen, zbtGetEle(mn), plen);
+        if (pc != 0) { *found = 0; return (pc < 0) ? 0 : (int)lf->n.count; }
+        for (i = 0; i < lf->n.count; i++) {
+            int c = zbtCmpSuffix(ele, qlen, lf->elems[i], plen);
+            if (c == 0) { *found = 1; return (int)i; }
+            if (c < 0) { *found = 0; return (int)i; }
+        }
+        *found = 0;
+        return (int)lf->n.count;
+    }
     for (i = 0; i < lf->n.count; i++) {
         int c = zbtCompare(score, ele, lf->elems[i]);
         if (c == 0) { *found = 1; return (int)i; }
@@ -271,6 +379,10 @@ static void zbtUpdateToRoot(zbtree *t, zbtNode *n) {
     long delta = 0;
     int have_delta = 0;
 
+    /* The starting node's endpoints may have moved (insert/delete/replace), so
+     * refresh its prefix hint before propagating upward. */
+    zbtRefreshPrefix(n);
+
     while (n->parent) {
         zbtInner *p = (zbtInner *)n->parent;
         int idx = zbtChildIdx(p, n);
@@ -288,9 +400,16 @@ static void zbtUpdateToRoot(zbtree *t, zbtNode *n) {
         }
 
         zbtElem *newsep = zbtNodeMin(n);
-        if (newsize == oldsize && newsep == p->sep[idx]) return;
+        int unchanged = (newsize == oldsize && newsep == p->sep[idx]);
         p->csize[idx] = newsize;
         p->sep[idx] = newsep;
+        /* Refresh the parent too: its min (sep[0]) or max (last child) may have
+         * shifted with this child. When size and min are both unchanged the
+         * mutation was interior and never moves the parent's max either (borrows
+         * and defrag replacements keep the outer endpoints), so stopping here
+         * leaves every ancestor's hint valid. */
+        zbtRefreshPrefix((zbtNode *)p);
+        if (unchanged) return;
         n = (zbtNode *)p;
     }
 }
@@ -311,6 +430,7 @@ static void zbtInsertChild(zbtree *t, zbtInner *p, zbtNode *left, zbtNode *right
         root->child[1] = right; right->parent = (zbtNode *)root;
         root->csize[0] = zbtSubtreeSize(left);  root->sep[0] = zbtNodeMin(left);
         root->csize[1] = zbtSubtreeSize(right); root->sep[1] = zbtNodeMin(right);
+        zbtRefreshPrefix((zbtNode *)root);
         t->root = (zbtNode *)root;
         return;
     }
@@ -345,6 +465,8 @@ static void zbtSplitInner(zbtree *t, zbtInner *in) {
     r->n.count = move;
     in->n.count = keep;
     for (int i = 0; i < move; i++) r->child[i]->parent = (zbtNode *)r;
+    zbtRefreshPrefix((zbtNode *)in);
+    zbtRefreshPrefix((zbtNode *)r);
     zbtInsertChild(t, (zbtInner *)in->n.parent, (zbtNode *)in, (zbtNode *)r);
 }
 
@@ -382,6 +504,8 @@ static void zbtSplitLeaf(zbtree *t, zbtLeaf *lf, int bias) {
     else t->tail = (zbtNode *)r;
     lf->next = r;
 
+    zbtRefreshPrefix((zbtNode *)lf);
+    zbtRefreshPrefix((zbtNode *)r);
     zbtInsertChild(t, (zbtInner *)lf->n.parent, (zbtNode *)lf, (zbtNode *)r);
 }
 
@@ -452,6 +576,7 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
         memcpy(lf->elems, &elems[pos], cnt * sizeof(zbtElem *));
         lf->n.count = (uint32_t)cnt;
         pos += cnt;
+        zbtRefreshPrefix((zbtNode *)lf);
         lf->prev = prev;
         if (prev) prev->next = lf;
         else t->head = (zbtNode *)lf;
@@ -480,6 +605,7 @@ void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
                 in->sep[k] = zbtNodeMin(c);
                 c->parent = (zbtNode *)in;
             }
+            zbtRefreshPrefix((zbtNode *)in);
             parents[p] = (zbtNode *)in;
         }
         zfree(level);
@@ -551,6 +677,8 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
             in->child[0]->parent = (zbtNode *)in;
             in->n.count++;
             L->n.count--;
+            zbtRefreshPrefix((zbtNode *)L);
+            zbtRefreshPrefix((zbtNode *)in);
             p->csize[idx - 1] = zbtSubtreeSize((zbtNode *)L); p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
             p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   p->sep[idx] = zbtNodeMin((zbtNode *)in);
             zbtUpdateToRoot(t, (zbtNode *)p);
@@ -567,6 +695,8 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
             in->child[in->n.count]->parent = (zbtNode *)in;
             in->n.count++;
             zbtRemoveChild(R, 0);
+            zbtRefreshPrefix((zbtNode *)in);
+            zbtRefreshPrefix((zbtNode *)R);
             p->csize[idx] = zbtSubtreeSize((zbtNode *)in);   p->sep[idx] = zbtNodeMin((zbtNode *)in);
             p->csize[idx + 1] = zbtSubtreeSize((zbtNode *)R); p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
             zbtUpdateToRoot(t, (zbtNode *)p);
@@ -587,6 +717,7 @@ static void zbtRebalanceInner(zbtree *t, zbtInner *in) {
         b->child[i]->parent = (zbtNode *)a;
         a->n.count++;
     }
+    zbtRefreshPrefix((zbtNode *)a);
     zbtRemoveChild(p, ai + 1);
     zbtFreeNodeShallow(t, (zbtNode *)b);
     zbtFixupInnerAfterShrink(t, p, ai);
@@ -625,6 +756,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
             else memcpy(&lf->elems[0], src, deficit * sizeof(zbtElem *));
             L->n.count -= (uint32_t)deficit;
             lf->n.count += (uint32_t)deficit;
+            zbtRefreshPrefix((zbtNode *)L);
+            zbtRefreshPrefix((zbtNode *)lf);
             p->csize[idx - 1] = L->n.count; p->sep[idx - 1] = zbtNodeMin((zbtNode *)L);
             p->csize[idx] = lf->n.count;    p->sep[idx] = zbtNodeMin((zbtNode *)lf);
             zbtUpdateToRoot(t, (zbtNode *)p);
@@ -642,6 +775,8 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
                     ((int)R->n.count - deficit) * sizeof(zbtElem *));
             lf->n.count += (uint32_t)deficit;
             R->n.count -= (uint32_t)deficit;
+            zbtRefreshPrefix((zbtNode *)lf);
+            zbtRefreshPrefix((zbtNode *)R);
             p->csize[idx] = lf->n.count;     p->sep[idx] = zbtNodeMin((zbtNode *)lf);
             p->csize[idx + 1] = R->n.count;  p->sep[idx + 1] = zbtNodeMin((zbtNode *)R);
             zbtUpdateToRoot(t, (zbtNode *)p);
@@ -659,6 +794,7 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     serverAssert(a->n.count + b->n.count <= ZBT_LEAF_MAX);
     memcpy(&a->elems[a->n.count], b->elems, b->n.count * sizeof(zbtElem *));
     a->n.count += b->n.count;
+    zbtRefreshPrefix((zbtNode *)a);
     a->next = b->next;
     if (b->next) b->next->prev = a;
     else t->tail = (zbtNode *)a;
@@ -733,10 +869,13 @@ unsigned long zbtRankByElem(zbtree *t, zbtElem *e) {
         for (int i = 0; i < ci; i++) rank += in->csize[i];
         n = in->child[ci];
     }
+    /* We already hold the exact element pointer (the dict handed it to us), so
+     * the in-leaf lookup is pointer identity, not a member compare. This keeps
+     * ZRANK cheap even for large members with a long shared prefix. */
     zbtLeaf *lf = (zbtLeaf *)n;
-    int found;
-    int idx = zbtLeafSearch(lf, score, ele, &found);
-    serverAssert(found);
+    uint32_t idx = 0;
+    while (idx < lf->n.count && lf->elems[idx] != e) idx++;
+    serverAssert(idx < lf->n.count);
     return rank + (unsigned long)idx + 1;
 }
 
@@ -1164,6 +1303,24 @@ static zbtElem *zbtNodeMinDescend(zbtNode *n) {
     return ((zbtLeaf *)n)->elems[0];
 }
 
+/* Independently recompute the same_score/prefix_len hint from the subtree's
+ * actual endpoints and assert it matches what the node caches. */
+static void zbtVerifyPrefix(zbtNode *n) {
+    if (n->count == 0) {
+        serverAssert(n->same_score == 1 && n->prefix_len == 0);
+        return;
+    }
+    zbtElem *mn = zbtNodeMinDescend(n);
+    zbtElem *mx = zbtNodeMax(n);
+    if (mn->score == mx->score) {
+        serverAssert(n->same_score == 1);
+        serverAssert(n->prefix_len == zbtMemberLcp(zbtGetEle(mn), zbtGetEle(mx)));
+    } else {
+        serverAssert(n->same_score == 0);
+        serverAssert(n->prefix_len == 0);
+    }
+}
+
 static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
                                    int *leafdepth) {
     if (n->isleaf) {
@@ -1181,12 +1338,14 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
             zbtElem *a = lf->elems[i - 1], *b = lf->elems[i];
             serverAssert(zbtCompare(a->score, zbtGetEle(a), b) < 0);
         }
+        zbtVerifyPrefix(n);
         return n->count;
     }
     zbtInner *in = (zbtInner *)n;
     if (n->parent) serverAssert(n->count >= ZBT_INNER_MIN);
     serverAssert(n->count >= 2 || !n->parent);
     serverAssert(n->count <= ZBT_INNER_MAX);
+    zbtVerifyPrefix(n);
     unsigned long total = 0;
     for (uint32_t i = 0; i < n->count; i++) {
         serverAssert(in->child[i]->parent == n);
@@ -1502,6 +1661,97 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(c == (unsigned long)M);
         zbtFree(bt);
         test_cond("Incremental node defrag", 1);
+    }
+
+    /* --- Same-score long-shared-prefix hint --- */
+    {
+        const int M = 3000;
+        const int PLEN = 4000;   /* long shared member prefix, like 4K members */
+        char *buf = zmalloc(PLEN + 32);
+        memset(buf, 'y', PLEN);
+        zbtElem **es = zmalloc(sizeof(zbtElem *) * M);
+        zbtree *bt = zbtCreate();
+        for (int i = 0; i < M; i++) {
+            int sl = snprintf(buf + PLEN, 32, "%06d", i);
+            sds s = sdsnewlen(buf, PLEN + sl);
+            es[i] = zbtInsert(bt, 0.0, s);
+            sdsfree(s);
+        }
+        zbtDebugVerify(bt);
+        /* One score across the whole tree, and the cached prefix covers at
+         * least the shared filler. */
+        serverAssert(bt->root->same_score == 1);
+        serverAssert(bt->root->prefix_len >= PLEN);
+
+        /* Ranks round-trip for every member through all three entry points. */
+        for (int i = 0; i < M; i++) {
+            unsigned long r = zbtRankByElem(bt, es[i]);
+            serverAssert(r >= 1 && r <= (unsigned long)M);
+            serverAssert(zbtElemByRank(bt, r, NULL) == es[i]);
+            serverAssert(zbtGetRank(bt, 0.0, zbtGetEle(es[i])) == r);
+        }
+
+        /* A member sharing the prefix but with an absent suffix misses, and so
+         * does the correct member under a different score (whole-node score
+         * shortcut). */
+        int sl = snprintf(buf + PLEN, 32, "%06d", 999999);
+        sds miss = sdsnewlen(buf, PLEN + sl);
+        serverAssert(zbtGetRank(bt, 0.0, miss) == 0);
+        sdsfree(miss);
+        serverAssert(zbtGetRank(bt, 1.0, zbtGetEle(es[0])) == 0);
+
+        /* Adding one differently-scored member makes the tree mixed-score and
+         * drops the hint, without disturbing existing ranks. */
+        sl = snprintf(buf + PLEN, 32, "HI");
+        sds hi = sdsnewlen(buf, PLEN + sl);
+        zbtElem *ehi = zbtInsert(bt, 1.0, hi);
+        sdsfree(hi);
+        zbtDebugVerify(bt);
+        serverAssert(bt->root->same_score == 0);
+        serverAssert(bt->root->prefix_len == 0);
+        serverAssert(zbtRankByElem(bt, ehi) == bt->length);
+        for (int i = 0; i < M; i++) {
+            unsigned long r = zbtRankByElem(bt, es[i]);
+            serverAssert(zbtElemByRank(bt, r, NULL) == es[i]);
+        }
+
+        zfree(es);
+        zbtFree(bt);
+        zfree(buf);
+        test_cond("Same-score long-prefix hint", 1);
+    }
+
+    /* --- Shared prefix collapses when a divergent member arrives --- */
+    {
+        const int PLEN = 4000;
+        char *buf = zmalloc(PLEN + 32);
+        memset(buf, 'y', PLEN);
+        zbtree *ct = zbtCreate();
+        for (int i = 0; i < 200; i++) {
+            int sl = snprintf(buf + PLEN, 32, "%06d", i);
+            sds s = sdsnewlen(buf, PLEN + sl);
+            zbtInsert(ct, 0.0, s);
+            sdsfree(s);
+        }
+        zbtDebugVerify(ct);
+        serverAssert(ct->root->same_score == 1);
+        serverAssert(ct->root->prefix_len >= PLEN);
+
+        /* A new minimum that diverges at byte 0 (same score) shrinks the shared
+         * prefix all the way to nothing. */
+        sds low = sdsnewlen("a", 1);
+        zbtInsert(ct, 0.0, low);
+        sdsfree(low);
+        zbtDebugVerify(ct);
+        serverAssert(ct->root->same_score == 1);
+        serverAssert(ct->root->prefix_len == 0);
+
+        sds q = sdsnewlen("a", 1);
+        serverAssert(zbtGetRank(ct, 0.0, q) == 1);
+        sdsfree(q);
+        zbtFree(ct);
+        zfree(buf);
+        test_cond("Shared prefix collapses on divergent insert", 1);
     }
 
     return 0;
