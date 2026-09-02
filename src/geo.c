@@ -807,7 +807,6 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         robj *zobj;
         zset *zs;
         int i;
-        size_t maxelelen = 0, totelelen = 0;
 
         zbtElem **staged = NULL;
 
@@ -825,10 +824,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             geoPoint *gp = ga->array+i;
             gp->dist /= shape.conversion; /* Fix according to unit. */
             double score = storedist ? gp->dist : gp->score;
-            size_t elelen = sdslen(gp->member);
 
-            if (maxelelen < elelen) maxelelen = elelen;
-            totelelen += elelen;
             /* Detached element: results come out in match or distance order,
              * so the tree is packed in one pass below rather than reached
              * through one insert per result. */
@@ -844,7 +840,6 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             dictAddNonExistingBatch(zs->dict, (void **)staged, returned_items);
             zsetBuildTreeFromElems(zs,staged,returned_items);
             zfree(staged);
-            zsetConvertToListpackIfNeeded(zobj,maxelelen,totelelen);
             setKey(c,c->db,storekey,&zobj,0);
             notifyKeyspaceEvent(NOTIFY_ZSET,flags & GEOSEARCH ? "geosearchstore" : "georadiusstore",storekey,
                                 c->db->id);

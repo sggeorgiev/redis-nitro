@@ -3862,7 +3862,6 @@ unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range);
 unsigned long zsetLength(const robj *zobj);
 size_t zsetAllocSize(const robj *o);
 void zsetConvert(robj *zobj, int encoding);
-void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen);
 void zsetBuildTreeFromElems(zset *zs, zbtElem **elems, unsigned long n);
 void zsetBuildTreeFromDict(zset *zs);
 int zsetScore(robj *zobj, sds member, double *score);

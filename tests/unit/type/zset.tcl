@@ -97,15 +97,7 @@ start_server {tags {"zset"}} {
     }
 
     proc basics {encoding} {
-        set original_max_entries [lindex [r config get zset-max-ziplist-entries] 1]
-        set original_max_value [lindex [r config get zset-max-ziplist-value] 1]
-        if {$encoding == "listpack"} {
-            r config set zset-max-ziplist-entries 128
-            r config set zset-max-ziplist-value 64
-        } elseif {$encoding == "btree"} {
-            r config set zset-max-ziplist-entries 0
-            r config set zset-max-ziplist-value 0
-        } else {
+        if {$encoding != "btree"} {
             puts "Unknown sorted set encoding"
             exit
         }
@@ -1333,18 +1325,14 @@ start_server {tags {"zset"}} {
         }
     }
 
-        r config set zset-max-ziplist-entries $original_max_entries
-        r config set zset-max-ziplist-value $original_max_value
     }
 
-    basics listpack
     basics btree
 
+    # Sorted sets only ever use the btree encoding, so this is just a wrapper
+    # kept for readability at the call sites below.
     proc with_btree_encoding {body} {
-        set original_max [lindex [r config get zset-max-listpack-entries] 1]
-        r config set zset-max-listpack-entries 0
         uplevel 1 $body
-        r config set zset-max-listpack-entries $original_max
     }
 
     test "Large B-tree ZREMRANGEBYRANK removes an exact contiguous window" {
@@ -1765,21 +1753,11 @@ start_server {tags {"zset"}} {
     }
 
     proc stresses {encoding} {
-        set original_max_entries [lindex [r config get zset-max-ziplist-entries] 1]
-        set original_max_value [lindex [r config get zset-max-ziplist-value] 1]
-        if {$encoding == "listpack"} {
-            # Little extra to allow proper fuzzing in the sorting stresser
-            r config set zset-max-ziplist-entries 256
-            r config set zset-max-ziplist-value 64
-            set elements 128
-        } elseif {$encoding == "btree"} {
-            r config set zset-max-ziplist-entries 0
-            r config set zset-max-ziplist-value 0
-            if {$::accurate} {set elements 1000} else {set elements 100}
-        } else {
+        if {$encoding != "btree"} {
             puts "Unknown sorted set encoding"
             exit
         }
+        if {$::accurate} {set elements 1000} else {set elements 100}
 
         test "ZSCORE - $encoding" {
             r del zscoretest
@@ -2280,12 +2258,9 @@ start_server {tags {"zset"}} {
         }
     }
 
-        r config set zset-max-ziplist-entries $original_max_entries
-        r config set zset-max-ziplist-value $original_max_value
     }
 
     tags {"slow"} {
-        stresses listpack
         stresses btree
     }
 
@@ -2434,9 +2409,7 @@ start_server {tags {"zset"}} {
         $rd2 close
     } {0} {cluster:skip}
 
-    test {ZSET skiplist order consistency when elements are moved} {
-        set original_max [lindex [r config get zset-max-ziplist-entries] 1]
-        r config set zset-max-ziplist-entries 0
+    test {ZSET btree order consistency when elements are moved} {
         for {set times 0} {$times < 10} {incr times} {
             r del zset
             for {set j 0} {$j < 1000} {incr j} {
@@ -2457,7 +2430,6 @@ start_server {tags {"zset"}} {
                 set prev_score $score
             }
         }
-        r config set zset-max-ziplist-entries $original_max
     }
 
     test {ZRANGESTORE basic} {
@@ -2483,7 +2455,7 @@ start_server {tags {"zset"}} {
     test {ZRANGESTORE BYLEX} {
         set res [r zrangestore z3{t} z1{t} \[b \[c BYLEX]
         assert_equal $res 2
-        assert_encoding listpack z3{t}
+        assert_encoding btree z3{t}
         set res [r zrangestore z2{t} z1{t} \[b \[c BYLEX]
         assert_equal $res 2
         r zrange z2{t} 0 -1 withscores
@@ -2492,7 +2464,7 @@ start_server {tags {"zset"}} {
     test {ZRANGESTORE BYSCORE} {
         set res [r zrangestore z4{t} z1{t} 1 2 BYSCORE]
         assert_equal $res 2
-        assert_encoding listpack z4{t}
+        assert_encoding btree z4{t}
         set res [r zrangestore z2{t} z1{t} 1 2 BYSCORE]
         assert_equal $res 2
         r zrange z2{t} 0 -1 withscores
@@ -2556,27 +2528,21 @@ start_server {tags {"zset"}} {
         assert_match "*syntax*" $err
     }
 
-    test {ZRANGESTORE with zset-max-listpack-entries 0 #10767 case} {
-        set original_max [lindex [r config get zset-max-listpack-entries] 1]
-        r config set zset-max-listpack-entries 0
+    test {ZRANGESTORE with an unknown result length #10767 case} {
         r del z1{t} z2{t}
         r zadd z1{t} 1 a
         assert_encoding btree z1{t}
         assert_equal 1 [r zrangestore z2{t} z1{t} 0 -1]
         assert_encoding btree z2{t}
-        r config set zset-max-listpack-entries $original_max
     }
 
-    test {ZRANGESTORE with zset-max-listpack-entries 1 dst key should use skiplist encoding} {
-        set original_max [lindex [r config get zset-max-listpack-entries] 1]
-        r config set zset-max-listpack-entries 1
+    test {ZRANGESTORE dst key should use btree encoding} {
         r del z1{t} z2{t} z3{t}
         r zadd z1{t} 1 a 2 b
         assert_equal 1 [r zrangestore z2{t} z1{t} 0 0]
-        assert_encoding listpack z2{t}
+        assert_encoding btree z2{t}
         assert_equal 2 [r zrangestore z3{t} z1{t} 0 1]
         assert_encoding btree z3{t}
-        r config set zset-max-listpack-entries $original_max
     }
 
     test {ZRANGE invalid syntax} {
@@ -2612,11 +2578,9 @@ start_server {tags {"zset"}} {
         }
     }
 
-    foreach {type contents} "listpack {1 a 2 b 3 c} btree {1 a 2 b 3 [randstring 70 90 alpha]}" {
-        set original_max_value [lindex [r config get zset-max-ziplist-value] 1]
-        r config set zset-max-ziplist-value 10
+    foreach {type contents} "shortmembers {1 a 2 b 3 c} longmember {1 a 2 b 3 [randstring 70 90 alpha]}" {
         create_zset myzset $contents
-        assert_encoding $type myzset
+        assert_encoding btree myzset
 
         test "ZRANDMEMBER - $type" {
             unset -nocomplain myzset
@@ -2627,7 +2591,6 @@ start_server {tags {"zset"}} {
             }
             assert_equal [lsort [get_keys $contents]] [lsort [array names myzset]]
         }
-        r config set zset-max-ziplist-value $original_max_value
     }
 
     test "ZRANDMEMBER with RESP3" {
@@ -2671,13 +2634,11 @@ start_server {tags {"zset"}} {
     r readraw 0
 
     foreach {type contents} "
-        btree {1 a 2 b 3 c 4 d 5 e 6 f 7 g 7 h 9 i 10 [randstring 70 90 alpha]}
-        listpack {1 a 2 b 3 c 4 d 5 e 6 f 7 g 7 h 9 i 10 j} " {
+        longmember {1 a 2 b 3 c 4 d 5 e 6 f 7 g 7 h 9 i 10 [randstring 70 90 alpha]}
+        shortmembers {1 a 2 b 3 c 4 d 5 e 6 f 7 g 7 h 9 i 10 j} " {
         test "ZRANDMEMBER with <count> - $type" {
-            set original_max_value [lindex [r config get zset-max-ziplist-value] 1]
-            r config set zset-max-ziplist-value 10
             create_zset myzset $contents
-            assert_encoding $type myzset
+            assert_encoding btree myzset
 
             # create a dict for easy lookup
             set mydict [dict create {*}[r zrange myzset 0 -1 withscores]]
@@ -2804,14 +2765,13 @@ start_server {tags {"zset"}} {
                 assert_lessthan [chi_square_value $allkey] 40
             }
         }
-        r config set zset-max-ziplist-value $original_max_value
     }
 
     test {zset score double range} {
         set dblmax 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.00000000000000000
         r del zz
         r zadd zz $dblmax dblmax
-        assert_encoding listpack zz
+        assert_encoding btree zz
         r zscore zz dblmax
     } {1.7976931348623157e+308}
 
@@ -2822,7 +2782,6 @@ start_server {tags {"zset"}} {
             # Restore all default configurations before each round of testing.
             r config set set-max-intset-entries 512
             r config set set-max-listpack-entries 128
-            r config set zset-max-listpack-entries 128
 
             r del set_small{t} set_big{t}
 
@@ -2848,83 +2807,67 @@ start_server {tags {"zset"}} {
                 assert_encoding hashtable set_big{t}
             }
 
-            foreach zset_type {listpack btree} {
-                r del zset_small{t} zset_big{t}
+            r del zset_small{t} zset_big{t}
+            r zadd zset_small{t} 1 1 2 2 3 3
+            r zadd zset_big{t} 1 1 2 2 3 3 4 4 5 5
+            assert_encoding btree zset_small{t}
+            assert_encoding btree zset_big{t}
 
-                if {$zset_type == "listpack"} {
-                    r zadd zset_small{t} 1 1 2 2 3 3
-                    r zadd zset_big{t} 1 1 2 2 3 3 4 4 5 5
-                    assert_encoding listpack zset_small{t}
-                    assert_encoding listpack zset_big{t}
-                } elseif {$zset_type == "btree"} {
-                    r config set zset-max-listpack-entries 0
-                    r zadd zset_small{t} 1 1 2 2 3 3
-                    r zadd zset_big{t} 1 1 2 2 3 3 4 4 5 5
-                    assert_encoding btree zset_small{t}
-                    assert_encoding btree zset_big{t}
-                }
+            # Test one key is big and one key is small separately.
+            # The reason for this is because we will sort the sets from smallest to largest.
+            # So set one big key and one small key, then the test can cover more code paths.
+            foreach {small_or_big set_key zset_key} {
+                small set_small{t} zset_big{t}
+                big set_big{t} zset_small{t}
+            } {
+                # The result of these commands are not related to the order of the keys.
+                assert_equal {1 2 3 4 5} [lsort [r zunion 2 $set_key $zset_key]]
+                assert_equal {5} [r zunionstore zset_dest{t} 2 $set_key $zset_key]
+                assert_equal {1 2 3} [lsort [r zinter 2 $set_key $zset_key]]
+                assert_equal {3} [r zinterstore zset_dest{t} 2 $set_key $zset_key]
+                assert_equal {3} [r zintercard 2 $set_key $zset_key]
 
-                # Test one key is big and one key is small separately.
-                # The reason for this is because we will sort the sets from smallest to largest.
-                # So set one big key and one small key, then the test can cover more code paths.
-                foreach {small_or_big set_key zset_key} {
-                    small set_small{t} zset_big{t}
-                    big set_big{t} zset_small{t}
-                } {
-                    # The result of these commands are not related to the order of the keys.
-                    assert_equal {1 2 3 4 5} [lsort [r zunion 2 $set_key $zset_key]]
-                    assert_equal {5} [r zunionstore zset_dest{t} 2 $set_key $zset_key]
-                    assert_equal {1 2 3} [lsort [r zinter 2 $set_key $zset_key]]
-                    assert_equal {3} [r zinterstore zset_dest{t} 2 $set_key $zset_key]
-                    assert_equal {3} [r zintercard 2 $set_key $zset_key]
-
-                    # The result of sdiff is related to the order of the keys.
-                    if {$small_or_big == "small"} {
-                        assert_equal {} [r zdiff 2 $set_key $zset_key]
-                        assert_equal {0} [r zdiffstore zset_dest{t} 2 $set_key $zset_key]
-                    } else {
-                        assert_equal {4 5} [lsort [r zdiff 2 $set_key $zset_key]]
-                        assert_equal {2} [r zdiffstore zset_dest{t} 2 $set_key $zset_key]
-                    }
+                # The result of sdiff is related to the order of the keys.
+                if {$small_or_big == "small"} {
+                    assert_equal {} [r zdiff 2 $set_key $zset_key]
+                    assert_equal {0} [r zdiffstore zset_dest{t} 2 $set_key $zset_key]
+                } else {
+                    assert_equal {4 5} [lsort [r zdiff 2 $set_key $zset_key]]
+                    assert_equal {2} [r zdiffstore zset_dest{t} 2 $set_key $zset_key]
                 }
             }
         }
 
         r config set set-max-intset-entries 512
         r config set set-max-listpack-entries 128
-        r config set zset-max-listpack-entries 128
     }
 
     foreach type {single multiple single_multiple} {
-        test "ZADD overflows the maximum allowed elements in a listpack - $type" {
+        test "ZADD uses the btree encoding whatever the number of elements - $type" {
             r del myzset
 
-            set max_entries 64
-            set original_max [lindex [r config get zset-max-listpack-entries] 1]
-            r config set zset-max-listpack-entries $max_entries
+            set entries 64
 
             if {$type == "single"} {
                 # All are single zadd commands.
-                for {set i 0} {$i < $max_entries} {incr i} { r zadd myzset $i $i }
+                for {set i 0} {$i < $entries} {incr i} { r zadd myzset $i $i }
             } elseif {$type == "multiple"} {
                 # One zadd command to add all elements.
                 set args {}
-                for {set i 0} {$i < $max_entries * 2} {incr i} { lappend args $i }
+                for {set i 0} {$i < $entries * 2} {incr i} { lappend args $i }
                 r zadd myzset {*}$args
             } elseif {$type == "single_multiple"} {
                 # First one zadd adds an element (creates a key) and then one zadd adds all elements.
                 r zadd myzset 1 1
                 set args {}
-                for {set i 0} {$i < $max_entries * 2} {incr i} { lappend args $i }
+                for {set i 0} {$i < $entries * 2} {incr i} { lappend args $i }
                 r zadd myzset {*}$args
             }
 
-            assert_encoding listpack myzset
-            assert_equal $max_entries [r zcard myzset]
+            assert_encoding btree myzset
+            assert_equal $entries [r zcard myzset]
             assert_equal 1 [r zadd myzset 1 b]
             assert_encoding btree myzset
-
-            r config set zset-max-listpack-entries $original_max
         }
     }
 }

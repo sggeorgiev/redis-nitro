@@ -3050,7 +3050,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
     } else if (rdbtype == RDB_TYPE_ZSET_2 || rdbtype == RDB_TYPE_ZSET) {
         /* Read sorted set value. */
         uint64_t zsetlen;
-        size_t maxelelen = 0, totelelen = 0;
         zset *zs;
 
         if ((zsetlen = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
@@ -3099,10 +3098,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 goto zseterr;
             }
 
-            /* Don't care about integer-encoded strings. */
-            if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
-            totelelen += sdslen(sdsele);
-
             znode = zbtCreateElem(score, sdsele);
             sdsfree(sdsele); /* zbtCreateElem copies the sds into the element. */
             if (dictAdd(zs->dict, znode, NULL) != DICT_OK) {
@@ -3140,14 +3135,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         }
         zbtBuildFromSorted(zs->tree, elems, loaded);
         zfree(elems);
-
-        /* Convert *after* loading, since sorted sets are not stored ordered. */
-        if (zsetLength(o) <= server.zset_max_listpack_entries &&
-            maxelelen <= server.zset_max_listpack_value &&
-            lpSafeToAdd(NULL, totelelen))
-        {
-            zsetConvert(o, OBJ_ENCODING_LISTPACK);
-        }
     } else if (rdbtype == RDB_TYPE_HASH) {
         uint64_t len, original_len;
         int ret;
@@ -3803,10 +3790,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                         goto emptykey;
                     }
 
-                    if (zsetLength(o) > server.zset_max_listpack_entries)
-                        zsetConvert(o, OBJ_ENCODING_BTREE);
-                    else
-                        o->ptr = lpShrinkToFit(o->ptr);
+                    zsetConvert(o, OBJ_ENCODING_BTREE);
                     break;
                 }
             case RDB_TYPE_ZSET_LISTPACK:
@@ -3825,8 +3809,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     goto emptykey;
                 }
 
-                if (zsetLength(o) > server.zset_max_listpack_entries)
-                    zsetConvert(o, OBJ_ENCODING_BTREE);
+                zsetConvert(o, OBJ_ENCODING_BTREE);
                 break;
             case RDB_TYPE_HASH_ZIPLIST:
                 {

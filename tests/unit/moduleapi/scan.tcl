@@ -89,14 +89,13 @@ start_server {tags {"modules external:skip"}} {
         set res
     } {{fa hello} {fb 123} {fc world}}
 
-    test {Module scan zset listpack} {
+    test {Module scan zset} {
         r zadd zz 1 f1 2 f2
-        assert_encoding listpack zz
+        assert_encoding btree zz
         lsort [r scan.scan_key zz]
     } {{f1 1} {f2 2}}
 
-    test {Module scan zset skiplist} {
-        r config set zset-max-ziplist-entries 2
+    test {Module scan zset after growth} {
         r zadd zz 3 f3
         assert_encoding btree zz
         lsort [r scan.scan_key zz]

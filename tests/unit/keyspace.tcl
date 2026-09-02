@@ -294,10 +294,10 @@ foreach {type large} [array get largevalue] {
         }
     }
 
-    test {COPY basic usage for listpack sorted set} {
+    test {COPY basic usage for small sorted set} {
         r del zset1{t} newzset1{t}
         r zadd zset1{t} 123 foobar
-        assert_encoding listpack zset1{t}
+        assert_encoding btree zset1{t}
         r copy zset1{t} newzset1{t}
         set digest [debug_digest_value zset1{t}]
         assert_equal $digest [debug_digest_value newzset1{t}]
@@ -307,10 +307,8 @@ foreach {type large} [array get largevalue] {
         assert_equal $digest [debug_digest_value newzset1{t}]
     }
 
-     test {COPY basic usage for skiplist sorted set} {
+     test {COPY basic usage for large sorted set} {
         r del zset2{t} newzset2{t}
-        set original_max [lindex [r config get zset-max-ziplist-entries] 1]
-        r config set zset-max-ziplist-entries 0
         for {set j 0} {$j < 130} {incr j} {
             r zadd zset2{t} [randomInt 50] ele-[randomInt 10]
         }
@@ -322,7 +320,6 @@ foreach {type large} [array get largevalue] {
         assert_refcount 1 newzset2{t}
         r del zset2{t}
         assert_equal $digest [debug_digest_value newzset2{t}]
-        r config set zset-max-ziplist-entries $original_max
     }
 
     test {COPY basic usage for listpack hash} {

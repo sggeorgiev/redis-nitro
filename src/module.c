@@ -743,7 +743,7 @@ int moduleCreateEmptyKey(RedisModuleKey *key, int type) {
         obj = createListListpackObject();
         break;
     case REDISMODULE_KEYTYPE_ZSET:
-        obj = createZsetListpackObject();
+        obj = createZsetObject();
         break;
     case REDISMODULE_KEYTYPE_HASH:
         obj = createHashObject();

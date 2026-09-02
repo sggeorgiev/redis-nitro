@@ -987,14 +987,19 @@ test {corrupt payload: fuzzer findings - set with invalid length causes sscan to
     }
 }
 
-test {corrupt payload: zset listpack encoded with invalid length causes zscan to hang} {
+test {corrupt payload: zset listpack encoded with invalid length is repaired on load} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
         assert_equal {OK} [r restore _zset 0 "\x11\x16\x16\x00\x00\x00\x1a\x00\x81\x61\x02\x01\x01\x81\x62\x02\x02\x01\x81\x63\x02\x03\x01\xff\x0c\x00\x81\xa7\xcd\x31\x22\x6c\xef\xf7" replace]
-        assert_encoding listpack _zset
-        catch { r ZSCAN _zset 0 } err
+        # A listpack payload is always rebuilt into a btree on load. The rebuild
+        # walks the entries that are really there, so the bogus entry count in
+        # the listpack header is dropped instead of making ZSCAN hang.
+        assert_encoding btree _zset
+        assert_equal 3 [r zcard _zset]
+        assert_equal {a 1 b 2 c 3} [r ZRANGE _zset 0 -1 WITHSCORES]
+        r ZSCAN _zset 0
         assert_equal [count_log_message 0 "crashed by signal"] 0
-        assert_equal [count_log_message 0 "ASSERTION FAILED"] 1
+        assert_equal [count_log_message 0 "ASSERTION FAILED"] 0
     }
 }
 

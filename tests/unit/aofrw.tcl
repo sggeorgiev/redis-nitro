@@ -166,10 +166,9 @@ start_server {tags {"aofrw external:skip debug_defrag:skip"} overrides {aof-use-
     }
 
     foreach d {string int} {
-        foreach e {listpack btree} {
-            test "AOF rewrite of zset with $e encoding, $d data" {
+        foreach len {10 1000} {
+            test "AOF rewrite of zset with $len elements, $d data" {
                 r flushall
-                if {$e eq {listpack}} {set len 10} else {set len 1000}
                 for {set j 0} {$j < $len} {incr j} {
                     if {$d eq {string}} {
                         set data [randstring 0 16 alpha]
@@ -178,7 +177,7 @@ start_server {tags {"aofrw external:skip debug_defrag:skip"} overrides {aof-use-
                     }
                     r zadd key [expr rand()] $data
                 }
-                assert_equal [r object encoding key] $e
+                assert_equal [r object encoding key] btree
                 set d1 [debug_digest]
                 r bgrewriteaof
                 waitForBgrewriteaof r

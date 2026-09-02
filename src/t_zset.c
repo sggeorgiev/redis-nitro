@@ -662,37 +662,32 @@ size_t zsetAllocSize(const robj *o) {
 
 /* Factory method to return a zset.
  *
- * The size hint indicates approximately how many items will be added,
- * and the value len hint indicates the approximate individual size of the added elements,
- * they are used to determine the initial representation.
+ * Sorted sets are always encoded as a dict + B+ tree, so the size hint only
+ * presizes the member index. The value len hint is accepted for call-site
+ * symmetry with the other types and ignored.
  *
  * If the hints are not known, and underestimation or 0 is suitable. 
  * We should never pass a negative value because it will convert to a very large unsigned number. */
 robj *zsetTypeCreate(size_t size_hint, size_t val_len_hint) {
-    if (size_hint <= server.zset_max_listpack_entries &&
-        val_len_hint <= server.zset_max_listpack_value)
-    {
-        return createZsetListpackObject();
-    }
+    UNUSED(val_len_hint);
 
     robj *zobj = createZsetObject();
     zset *zs = zobj->ptr;
-    dictExpand(zs->dict, size_hint);
+    if (size_hint > DICT_HT_INITIAL_SIZE) dictExpand(zs->dict, size_hint);
     return zobj;
 }
 
-/* Check if the existing zset should be converted to another encoding based off the
- * the size hint. */
+/* Promote a listpack-encoded zset to the B+ tree encoding, presizing it for the
+ * elements that are about to be added. Only RDB and RESTORE payloads produced
+ * by older versions still carry the listpack encoding; everything created by
+ * this server is already a B+ tree. */
 void zsetTypeMaybeConvert(robj *zobj, size_t size_hint) {
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK &&
-        size_hint > server.zset_max_listpack_entries)
-    {
-        zsetConvertAndExpand(zobj, OBJ_ENCODING_BTREE, size_hint);
-    }
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK)
+        zsetConvertAndExpand(zobj, OBJ_ENCODING_BTREE, zsetLength(zobj) + size_hint);
 }
 
 /* Convert the zset to specified encoding. The zset dict (when converting
- * to a skiplist) is presized to hold the number of elements in the original
+ * to a B+ tree) is presized to hold the number of elements in the original
  * zset. */
 void zsetConvert(robj *zobj, int encoding) {
     zsetConvertAndExpand(zobj, encoding, zsetLength(zobj));
@@ -779,21 +774,6 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         zobj->encoding = OBJ_ENCODING_LISTPACK;
     } else {
         serverPanic("Unknown sorted set encoding");
-    }
-}
-
-/* Convert the sorted set object into a listpack if it is not already a listpack
- * and if the number of elements and the maximum element size and total elements size
- * are within the expected ranges. */
-void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen) {
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) return;
-    zset *zset = zobj->ptr;
-
-    if (zset->tree->length <= server.zset_max_listpack_entries &&
-        maxelelen <= server.zset_max_listpack_value &&
-        lpSafeToAdd(NULL, totelelen))
-    {
-        zsetConvert(zobj,OBJ_ENCODING_LISTPACK);
     }
 }
 
@@ -2526,7 +2506,6 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
 
     if (dstkey) {
         if (dstzset->tree->length) {
-            zsetConvertToListpackIfNeeded(dstobj, maxelelen, totelelen);
             setKey(c, c->db, dstkey, &dstobj, 0);
             addReplyLongLong(c, zsetLength(dstobj));
             notifyKeyspaceEvent(NOTIFY_ZSET,

@@ -308,15 +308,10 @@ proc test_scan {type} {
         }
     }
 
-    foreach enc {listpack btree} {
-        test "{$type} ZSCAN with encoding $enc" {
+    foreach count {30 1000} {
+        test "{$type} ZSCAN with $count elements" {
             # Create the Sorted Set
             r del zset
-            if {$enc eq {listpack}} {
-                set count 30
-            } else {
-                set count 1000
-            }
             set elements {}
             for {set j 0} {$j < $count} {incr j} {
                 lappend elements $j key:$j
@@ -324,7 +319,7 @@ proc test_scan {type} {
             r zadd zset {*}$elements
 
             # Verify that the encoding matches.
-            assert_encoding $enc zset
+            assert_encoding btree zset
 
             # Test ZSCAN
             set cur 0
@@ -425,27 +420,22 @@ proc test_scan {type} {
         assert {$first_score != 0}
     }
 
-    test "{$type} ZSCAN scores are formatted like ZSCORE, in every encoding" {
+    test "{$type} ZSCAN scores are formatted like ZSCORE" {
         # A score used to come back from ZSCAN in a different notation than
-        # ZSCORE reported for the same member, but only once the sorted set had
-        # outgrown the listpack encoding.
+        # ZSCORE reported for the same member.
         set scores {0.1 3.3333333333333335 1 -0 1e+100 9.8813129168249309e-323
                     0.3333333333333333 -1.5e-8 inf -inf}
-        foreach enc {listpack btree} {
-            r del mykey
-            r config set zset-max-listpack-entries [expr {$enc eq "listpack" ? 128 : 0}]
-            set i 0
-            foreach s $scores { r zadd mykey $s "m:[incr i]" }
-            assert_encoding $enc mykey
+        r del mykey
+        set i 0
+        foreach s $scores { r zadd mykey $s "m:[incr i]" }
+        assert_encoding btree mykey
 
-            unset -nocomplain scanned
-            array set scanned [lindex [r zscan mykey 0] 1]
-            assert_equal [llength $scores] [array size scanned]
-            foreach member [array names scanned] {
-                assert_equal [r zscore mykey $member] $scanned($member)
-            }
+        unset -nocomplain scanned
+        array set scanned [lindex [r zscan mykey 0] 1]
+        assert_equal [llength $scores] [array size scanned]
+        foreach member [array names scanned] {
+            assert_equal [r zscore mykey $member] $scanned($member)
         }
-        r config set zset-max-listpack-entries 128
     }
 
     test "{$type} SCAN regression test for issue #4906" {
