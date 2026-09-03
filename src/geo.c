@@ -815,8 +815,8 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             zobj = createZsetObject();
             zs = zobj->ptr;
             /* The result count is exact here, so sizing the member index once
-             * costs nothing and spares the inserts below every rehash. */
-            dictExpand(zs->dict,returned_items);
+             * costs nothing and spares the inserts below every resize. */
+            zmiExpand(zs->mi, returned_items);
             staged = zmalloc(sizeof(zbtElem *) * returned_items);
         }
 
@@ -841,7 +841,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         if (returned_items) {
             /* Geo results carry unique members, so index them in one
              * duplicate-scan-free batch. */
-            dictAddNonExistingBatch(zs->dict, (void **)staged, returned_items);
+            zmiAddBatch(zs->mi, staged, returned_items);
             zsetBuildTreeFromElems(zs,staged,returned_items);
             zfree(staged);
             zsetConvertToListpackIfNeeded(zobj,maxelelen,totelelen);

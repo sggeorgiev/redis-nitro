@@ -2358,12 +2358,11 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
         }
     } else if (o->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = o->ptr;
-        dictIterator di;
-        dictEntry *de;
+        zmiIterator it;
+        zbtElem *znode;
 
-        dictInitIterator(&di, zs->dict);
-        while((de = dictNext(&di)) != NULL) {
-            zbtElem *znode = dictGetKey(de);
+        zmiInitIterator(&it, zs->mi);
+        while ((znode = zmiNext(&it)) != NULL) {
             sds ele = zbtGetEle(znode);
             double score = znode->score;
 
@@ -2375,20 +2374,17 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
                     !rioWriteBulkString(r,"ZADD",4) ||
                     !rioWriteBulkObject(r,key)) 
                 {
-                    dictResetIterator(&di);
                     return 0;
                 }
             }
             if (!rioWriteBulkDouble(r,score) ||
                 !rioWriteBulkString(r,ele,sdslen(ele)))
             {
-                dictResetIterator(&di);
                 return 0;
             }
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }
-        dictResetIterator(&di);
     } else {
         serverPanic("Unknown sorted zset encoding");
     }

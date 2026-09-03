@@ -8020,6 +8020,7 @@ int __test_num = 0;
 typedef int redisTestProc(int argc, char **argv, int flags);
 int bitopsTest(int argc, char **argv, int flags);
 int zbtreeTest(int argc, char **argv, int flags);
+int zmindexTest(int argc, char **argv, int flags);
 int vectorTest(int argc, char **argv, int flags);
 struct redisTest {
     char *name;
@@ -8048,6 +8049,7 @@ struct redisTest {
     {"bitmap", bitopsTest},
     {"rax", raxTest},
     {"zset", zbtreeTest},
+    {"zmindex", zmindexTest},
     {"topk", chkTopKTest},
     {"fastfloat", fastFloatTest},
 };

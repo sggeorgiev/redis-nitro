@@ -3059,17 +3059,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         o = createZsetObject();
         zs = o->ptr;
 
-        if (zsetlen > DICT_HT_INITIAL_SIZE && dictTryExpand(zs->dict,zsetlen) != DICT_OK) {
-            rdbReportCorruptRDB("OOM in dictTryExpand %llu", (unsigned long long)zsetlen);
+        if (!zmiTryExpand(zs->mi, zsetlen)) {
+            rdbReportCorruptRDB("OOM in zmiTryExpand %llu", (unsigned long long)zsetlen);
             decrRefCount(o);
             return NULL;
         }
 
         /* Load every element into a detached buffer, checking membership
          * uniqueness *before* handing ownership to the tree. The tree is then
-         * built bottom-up in a single O(N) pass. The dict is populated as we go
-         * (its key destructor is NULL, so the buffered elements below are still
-         * owned by us until zbtBuildFromSorted() takes them). */
+         * built bottom-up in a single O(N) pass. The index is populated as we
+         * go (it does not own elements, so the buffered ones below are still
+         * ours until zbtBuildFromSorted() takes them). */
         uint64_t total = zsetlen;
         zbtElem **elems = zmalloc(sizeof(zbtElem *) * total);
         uint64_t loaded = 0;
@@ -3105,7 +3105,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
             znode = zbtCreateElem(score, sdsele);
             sdsfree(sdsele); /* zbtCreateElem copies the sds into the element. */
-            if (dictAdd(zs->dict, znode, NULL) != DICT_OK) {
+            if (!zmiAddUnique(zs->mi, znode)) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
                 zbtFreeElem(znode);
                 goto zseterr;

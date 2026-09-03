@@ -52,6 +52,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "entry.h"   /* Entry objects (field-value pairs with optional expiration) */
 #include "ebuckets.h" /* expiry data structure */
 #include "dict.h"    /* Hash tables */
+#include "zmindex.h" /* Sorted set member index */
 #include "kvstore.h" /* Slot-based hash table */
 #include "estore.h"  /* Expiration store */
 #include "adlist.h"  /* Linked lists */
@@ -1803,11 +1804,12 @@ struct sharedObjectsStruct {
 };
 
 /* ZSETs use an order-statistic B+ tree (see zbtree.c) as the large encoding,
- * paired with a dict mapping member -> element for O(1) score lookup. */
+ * paired with a compact member index (see zmindex.c) mapping member ->
+ * element for O(1) score lookup. */
 
 /* A single sorted-set element. The member SDS is embedded in the same
  * allocation right after this header, mirroring the old skiplist node layout
- * so the dict can store zbtElem* as keys.
+ * so the member index can store zbtElem* in its slots.
  *
  * data[0] holds the offset from the element start to the embedded member data,
  * followed by the sds header and the member bytes. The offset has to be stored
@@ -1859,7 +1861,7 @@ typedef struct zbtIter {
 } zbtIter;
 
 typedef struct zset {
-    dict *dict;
+    zmindex *mi;            /* member -> element, see zmindex.c */
     zbtree *tree;
 } zset;
 
@@ -3238,7 +3240,6 @@ extern dictType objectKeyNoValueDictType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern dictType setDictType;
 extern dictType BenchmarkDictType;
-extern dictType zsetDictType;
 extern dictType dbDictType;
 extern double R_Zero, R_PosInf, R_NegInf, R_Nan;
 extern dictType hashDictType;
@@ -3835,7 +3836,6 @@ void zbtInsertElem(zbtree *t, zbtElem *e);
 void zbtDeleteElem(zbtree *t, zbtElem *e);
 void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore);
 int zbtCompare(double score, sds ele, const zbtElem *e);
-const void *zbtGetEleForDict(const void *elem);
 unsigned long zbtRankByElem(zbtree *t, zbtElem *e);
 unsigned long zbtGetRank(zbtree *t, double score, sds ele);
 zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it);
@@ -3847,9 +3847,9 @@ zbtElem *zbtNext(zbtree *t, zbtElem *e);
 zbtElem *zbtPrev(zbtree *t, zbtElem *e);
 zbtElem *zbtNthInRange(zbtree *t, zrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
 zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start, unsigned int end, dict *d);
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, zmindex *mi);
+unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, zmindex *mi);
+unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start, unsigned int end, zmindex *mi);
 void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe);
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *));
 int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budget);
@@ -3864,7 +3864,7 @@ size_t zsetAllocSize(const robj *o);
 void zsetConvert(robj *zobj, int encoding);
 void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen);
 void zsetBuildTreeFromElems(zset *zs, zbtElem **elems, unsigned long n);
-void zsetBuildTreeFromDict(zset *zs);
+void zsetBuildTreeFromIndex(zset *zs);
 int zsetScore(robj *zobj, sds member, double *score);
 int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore);
 long zsetRank(robj *zobj, sds ele, int reverse, double *score);

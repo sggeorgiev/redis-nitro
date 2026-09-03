@@ -204,12 +204,11 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             }
         } else if (o->encoding == OBJ_ENCODING_BTREE) {
             zset *zs = o->ptr;
-            dictIterator di;
-            dictEntry *de;
+            zmiIterator it;
+            zbtElem *znode;
 
-            dictInitIterator(&di, zs->dict);
-            while((de = dictNext(&di)) != NULL) {
-                zbtElem *znode = dictGetKey(de);
+            zmiInitIterator(&it, zs->mi);
+            while ((znode = zmiNext(&it)) != NULL) {
                 sds sdsele = zbtGetEle(znode);
                 const int len = fpconv_dtoa(znode->score, buf);
                 buf[len] = '\0';
@@ -218,7 +217,6 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
                 mixDigest(eledigest,buf,strlen(buf));
                 xorDigest(digest,eledigest,20);
             }
-            dictResetIterator(&di);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -1043,6 +1041,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"htstats-key") && c->argc >= 3) {
         kvobj *o;
         dict *ht = NULL;
+        zmindex *mi = NULL;
         int full = 0;
 
         if (c->argc >= 4 && !strcasecmp(c->argv[3]->ptr,"full"))
@@ -1051,25 +1050,26 @@ NULL
         if ((o = kvobjCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
                 == NULL) return;
 
-        /* Get the hash table reference from the object, if possible. */
+        /* Get the hash table reference from the object, if possible. A large
+         * sorted set is indexed by a purpose-built table instead of a dict. */
         switch (o->encoding) {
         case OBJ_ENCODING_BTREE:
-            {
-                zset *zs = o->ptr;
-                ht = zs->dict;
-            }
+            mi = ((zset *)o->ptr)->mi;
             break;
         case OBJ_ENCODING_HT:
             ht = o->ptr;
             break;
         }
 
-        if (ht == NULL) {
+        if (ht == NULL && mi == NULL) {
             addReplyError(c,"The value stored at the specified key is not "
                             "represented using an hash table");
         } else {
             char buf[4096];
-            dictGetStats(buf,sizeof(buf),ht,full);
+            if (mi)
+                zmiGetStats(buf,sizeof(buf),mi,full);
+            else
+                dictGetStats(buf,sizeof(buf),ht,full);
             addReplyVerbatim(c,buf,strlen(buf),"txt");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"change-repl-id") && c->argc == 2) {

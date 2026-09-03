@@ -123,12 +123,6 @@ int zbtCompare(double score, sds ele, const zbtElem *e) {
     return sdscmp(ele, zbtGetEle(e));
 }
 
-/* dict keyFromStoredKey callback: recover the member SDS from a stored
- * zbtElem*. */
-const void *zbtGetEleForDict(const void *elem) {
-    return zbtGetEle((const zbtElem *)elem);
-}
-
 /*-----------------------------------------------------------------------------
  * Node allocation / tree lifecycle
  *----------------------------------------------------------------------------*/
@@ -669,7 +663,7 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
 }
 
 /* Remove element 'e' from the tree and free it. The caller is responsible for
- * removing it from the ZSET dict first (the dict has no key destructor). */
+ * removing it from the member index first, which does not own elements. */
 void zbtDeleteElem(zbtree *t, zbtElem *e) {
     double score = e->score;
     sds ele = zbtGetEle(e);
@@ -692,11 +686,9 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
 }
 
 /* Move an existing element to reflect a new score. The element object is
- * reused so the ZSET dict entry does not need updating. */
+ * reused, so the member index entry does not need updating: it maps
+ * member -> elem and the member is unchanged. Only the tree position moves. */
 void zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
-    /* Remove and reinsert. We must remove from the dict? No: the dict maps
-     * member -> elem and the member is unchanged, so only the tree position
-     * changes. Detach the element object, reinsert it with the new score. */
     double score = e->score;
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = zbtFindLeaf(t, score, ele);
@@ -930,17 +922,17 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
 }
 
 /*-----------------------------------------------------------------------------
- * Range deletion (also removes the members from the ZSET dict)
+ * Range deletion (also removes the members from the member index)
  *----------------------------------------------------------------------------*/
 
 /* Delete every element whose 1-based rank falls in [first, last] (inclusive),
- * removing each member from the companion dict 'd' as well.
+ * removing each member from the companion index 'mi' as well.
  *
  * Instead of locating and rebalancing once per element (O(K log N)), this
  * removes a whole leaf slice per structural pass: at most one O(log N) rank
  * lookup and one rebalance per touched leaf, giving O(K + (K/leaf) * log N). */
 static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
-                                        unsigned long last, dict *d) {
+                                        unsigned long last, zmindex *mi) {
     unsigned long removed = 0;
     if (last > t->length) last = t->length;
 
@@ -958,7 +950,7 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
 
         for (int k = 0; k < take; k++) {
             zbtElem *el = lf->elems[idx + k];
-            dictDelete(d, zbtGetEle(el));
+            zmiDeleteElem(mi, el);
             t->alloc_size -= zmalloc_usable_size(el);
             zbtFreeElem(el);
         }
@@ -980,7 +972,7 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
     return removed;
 }
 
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, zmindex *mi) {
     if (t->length == 0) return 0;
     double minv = range->min, maxv = range->max;
     unsigned long before = range->minex ?
@@ -990,22 +982,22 @@ unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
         zbtCountBefore(t, beforeScoreLt, &maxv) :
         zbtCountBefore(t, beforeScoreLe, &maxv);
     if (before >= upto) return 0;
-    return zbtDeleteRankRange(t, before + 1, upto, d);
+    return zbtDeleteRankRange(t, before + 1, upto, mi);
 }
 
-unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d) {
+unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, zmindex *mi) {
     if (t->length == 0) return 0;
     unsigned long before = zbtCountBefore(t, beforeNotGteMin, range);
     unsigned long upto = zbtCountBefore(t, beforeLteMax, range);
     if (before >= upto) return 0;
-    return zbtDeleteRankRange(t, before + 1, upto, d);
+    return zbtDeleteRankRange(t, before + 1, upto, mi);
 }
 
 /* Delete elements whose 1-based rank is in [start, end] (inclusive). */
 unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned int start,
-                                   unsigned int end, dict *d) {
+                                   unsigned int end, zmindex *mi) {
     if (t->length == 0 || start > end) return 0;
-    return zbtDeleteRankRange(t, start, end, d);
+    return zbtDeleteRankRange(t, start, end, mi);
 }
 
 /*-----------------------------------------------------------------------------
@@ -1053,7 +1045,7 @@ static void zbtCollectLeaves(zbtree *t, zbtNode *n, zbtLeaf **prev) {
 
 /* Relocate every tree node using the provided defrag allocator, then rebuild
  * the leaf sibling chain and head/tail pointers. Element objects are handled
- * separately by the caller (via the ZSET dict scan + zbtReplaceElem). */
+ * separately by the caller (via the member index scan + zbtReplaceElem). */
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *)) {
     t->root = zbtDefragNode(t->root, fn);
     t->root->parent = NULL;
@@ -1331,7 +1323,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
                                 ZBT_LEAF_MAX * ZBT_INNER_MAX + 3, 5000};
     for (int trial = 0; trial < (int)(sizeof(sizes) / sizeof(sizes[0])); trial++) {
         int M = sizes[trial];
-        dict *d = dictCreate(&zsetDictType);
+        zmindex *mi = zmiCreate();
         zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
         for (int i = 0; i < M; i++) {
             char buf[32];
@@ -1342,8 +1334,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
         }
         zbtree *bt = zbtCreate();
         zbtBuildFromSorted(bt, arr, M);
-        for (int i = 0; i < M; i++)
-            serverAssert(dictAdd(d, arr[i], NULL) == DICT_OK);
+        zmiAddBatch(mi, arr, M);
         zfree(arr);
         zbtDebugVerify(bt);
         serverAssert(bt->length == (unsigned long)M);
@@ -1351,26 +1342,26 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(zbtElemByRank(bt, M, NULL)->score == (double)(M - 1));
 
         if (M >= 10) {
-            /* Remove a middle window and confirm dict/tree stay in sync. */
+            /* Remove a middle window and confirm index/tree stay in sync. */
             unsigned long lo = M / 4 + 1, hi = M / 2;
             unsigned long want = hi - lo + 1;
-            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, d);
+            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, mi);
             zbtDebugVerify(bt);
             serverAssert(got == want);
             serverAssert(bt->length == (unsigned long)M - want);
-            serverAssert(dictSize(d) == bt->length);
+            serverAssert(zmiSize(mi) == bt->length);
             /* Score suffix removal. */
             zrangespec rs = {.min = (double)(M * 3 / 4), .max = 1.0 / 0.0,
                              .minex = 0, .maxex = 0};
-            zbtDeleteRangeByScore(bt, &rs, d);
+            zbtDeleteRangeByScore(bt, &rs, mi);
             zbtDebugVerify(bt);
-            serverAssert(dictSize(d) == bt->length);
+            serverAssert(zmiSize(mi) == bt->length);
         }
         /* Remove everything that is left. */
-        zbtDeleteRangeByRank(bt, 1, bt->length, d);
+        zbtDeleteRangeByRank(bt, 1, bt->length, mi);
         zbtDebugVerify(bt);
-        serverAssert(bt->length == 0 && dictSize(d) == 0);
-        dictRelease(d);
+        serverAssert(bt->length == 0 && zmiSize(mi) == 0);
+        zmiRelease(mi);
         zbtFree(bt);
     }
     test_cond("Bulk build + range delete", 1);
@@ -1378,7 +1369,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
     /* --- Random-window range deletion, checking occupancy --- */
     {
         const int M = 20000;
-        dict *d = dictCreate(&zsetDictType);
+        zmindex *mi = zmiCreate();
         zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
         for (int i = 0; i < M; i++) {
             char buf[32];
@@ -1389,8 +1380,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
         }
         zbtree *bt = zbtCreate();
         zbtBuildFromSorted(bt, arr, M);
-        for (int i = 0; i < M; i++)
-            serverAssert(dictAdd(d, arr[i], NULL) == DICT_OK);
+        zmiAddBatch(mi, arr, M);
         zfree(arr);
 
         /* Delete windows wide enough to empty whole leaves, from positions
@@ -1406,19 +1396,19 @@ int zbtreeTest(int argc, char **argv, int flags) {
             unsigned long hi = lo + span;
             if (hi > bt->length) hi = bt->length;
             unsigned long before = bt->length;
-            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, d);
+            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, mi);
             zbtDebugVerify(bt);
             serverAssert(got == hi - lo + 1);
             serverAssert(bt->length == before - got);
-            serverAssert(dictSize(d) == bt->length);
+            serverAssert(zmiSize(mi) == bt->length);
             /* Ranks stay dense and ordered after every window removal. */
             serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, 1, NULL)) == 1);
             serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, bt->length, NULL))
                          == bt->length);
         }
-        zbtDeleteRangeByRank(bt, 1, bt->length, d);
-        serverAssert(bt->length == 0 && dictSize(d) == 0);
-        dictRelease(d);
+        zbtDeleteRangeByRank(bt, 1, bt->length, mi);
+        serverAssert(bt->length == 0 && zmiSize(mi) == 0);
+        zmiRelease(mi);
         zbtFree(bt);
     }
     test_cond("Random-window range delete keeps occupancy", 1);

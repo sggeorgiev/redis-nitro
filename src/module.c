@@ -12329,17 +12329,25 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
 
         field = createStringObject(fieldStr, sdslen(fieldStr));
         value = createStringObject(val, sdslen(val));
-    } else if (kv->type == OBJ_ZSET) {
-        zbtElem *znode = (zbtElem *) key;
-        sds fieldStr = zbtGetEle(znode);
-        field = createStringObject(fieldStr, sdslen(fieldStr));
-        value = createStringObjectFromLongDouble(znode->score, 0);
     }
     
     serverAssert(field != NULL);
     data->fn(data->key, field, value, data->user_data);
     decrRefCount(field);
     if (value) decrRefCount(value);
+}
+
+/* Same, for a large sorted set: its members live in a member index rather
+ * than a dict. */
+static void moduleScanZsetCallback(void *privdata, zbtElem *elem) {
+    ScanKeyCBData *data = privdata;
+    sds member = zbtGetEle(elem);
+    robj *field = createStringObject(member, sdslen(member));
+    robj *value = createStringObjectFromLongDouble(elem->score, 0);
+
+    data->fn(data->key, field, value, data->user_data);
+    decrRefCount(field);
+    decrRefCount(value);
 }
 
 /* Scan api that allows a module to scan the elements in a hash, set or sorted set key
@@ -12391,6 +12399,7 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
         return 0;
     }
     dict *ht = NULL;
+    zmindex *mi = NULL;
     kvobj *kv = key->kv;
     if (kv->type == OBJ_SET) {
         if (kv->encoding == OBJ_ENCODING_HT)
@@ -12400,7 +12409,7 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
             ht = kv->ptr;
     } else if (kv->type == OBJ_ZSET) {
         if (kv->encoding == OBJ_ENCODING_BTREE)
-            ht = ((zset *)kv->ptr)->dict;
+            mi = ((zset *)kv->ptr)->mi;
     } else {
         errno = EINVAL;
         return 0;
@@ -12410,9 +12419,14 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
         return 0;
     }
     int ret = 1;
-    if (ht) {
+    if (ht || mi) {
         ScanKeyCBData data = { key, privdata, fn };
-        cursor->cursor = dictScan(ht, cursor->cursor, moduleScanKeyCallback, &data);
+        if (mi)
+            cursor->cursor = zmiScan(mi, cursor->cursor,
+                                     moduleScanZsetCallback, &data);
+        else
+            cursor->cursor = dictScan(ht, cursor->cursor,
+                                      moduleScanKeyCallback, &data);
         if (cursor->cursor == 0) {
             cursor->done = 1;
             ret = 0;

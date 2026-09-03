@@ -1716,16 +1716,12 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     serverAssert(!((data->type != LLONG_MAX) && o));
 
     kvobj *kv = NULL;
-    zbtElem *znode = NULL;
     if (!o) { /* If scanning keyspace */
         kv = dictGetKV(de);
         keyStr = kvobjGetKey(kv);
     } else if (o->type == OBJ_HASH) {
         hashEntry = dictGetKey(de);
         keyStr = entryGetField(hashEntry);
-    } else if (o->type == OBJ_ZSET) {
-        znode = dictGetKey(de);
-        keyStr = zbtGetEle(znode);
     } else {
         keyStr = dictGetKey(de);
     }
@@ -1766,23 +1762,37 @@ void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
         if (entryIsExpired(hashEntry))
             return;
 
-    } else if (o->type == OBJ_ZSET) {
-        /* Format the score the same way every other reply path does. A
-         * listpack-encoded zset stores scores already rendered by d2string(),
-         * so scanning a small and a large zset holding the same score used to
-         * hand back two different strings ("0.1" vs "0.10000000000000001"),
-         * neither matching ZSCORE for the large one. d2string() is also the
-         * cheaper conversion: no long double promotion and no snprintf(). */
-        char buf[MAX_D2STRING_CHARS];
-        int len = d2string(buf, sizeof(buf), znode->score);
-        key = sdsdup(keyStr);
-        val = sdsnewlen(buf, len);
     } else {
         serverPanic("Type not handled in SCAN callback.");
     }
 
     vecPush(keys, key);
     if (val && !data->no_values) vecPush(keys, val);
+}
+
+/* Same, for a large sorted set: its members live in a member index rather
+ * than a dict, so ZSCAN reaches them through zmiScan(). */
+static void zsetScanCallback(void *privdata, zbtElem *elem) {
+    scanData *data = (scanData *)privdata;
+    sds member = zbtGetEle(elem);
+    data->sampled++;
+
+    if (data->pattern &&
+        !stringmatchlen(data->pattern, sdslen(data->pattern), member,
+                        sdslen(member), 0))
+        return;
+
+    /* Format the score the same way every other reply path does. A
+     * listpack-encoded zset stores scores already rendered by d2string(), so
+     * scanning a small and a large zset holding the same score used to hand
+     * back two different strings ("0.1" vs "0.10000000000000001"), neither
+     * matching ZSCORE for the large one. d2string() is also the cheaper
+     * conversion: no long double promotion and no snprintf(). */
+    char buf[MAX_D2STRING_CHARS];
+    int len = d2string(buf, sizeof(buf), elem->score);
+
+    vecPush(data->keys, sdsdup(member));
+    if (!data->no_values) vecPush(data->keys, sdsnewlen(buf, len));
 }
 
 /* Try to parse a SCAN cursor stored at object 'o':
@@ -1932,6 +1942,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
 
     /* Handle the case of a hash table. */
     ht = NULL;
+    zmindex *mi = NULL;
     if (o == NULL) {
         ht = NULL;
     } else if (o->type == OBJ_SET && o->encoding == OBJ_ENCODING_HT) {
@@ -1940,7 +1951,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
         ht = o->ptr;
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = o->ptr;
-        ht = zs->dict;
+        mi = zs->mi;
     }
 
     vec keys;
@@ -1948,11 +1959,11 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     vecInit(&keys, keys_stack, 256);
     /* Hash on dict only has pointers to dict entries; other paths allocate
      * temporary sds that must be released. */
-    if (o && (!ht || o->type == OBJ_ZSET))
+    if (o && (!(ht || mi) || o->type == OBJ_ZSET))
         vecSetFreeMethod(&keys, sdsfreegeneric);
 
     /* For main dictionary scan or data structure using hashtable. */
-    if (!o || ht) {
+    if (!o || ht || mi) {
         /* We set the max number of iterations to ten times the specified
          * COUNT, so if the hash table is in a pathological state (very
          * sparsely populated) we avoid to block too much time at the cost
@@ -1993,6 +2004,8 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
              * If cursor is empty, we should try exploring next non-empty slot. */
             if (o == NULL) {
                 cursor = kvstoreScan(c->db->keys, cursor, onlydidx, scanCallback, scanShouldSkipDict, &data);
+            } else if (mi) {
+                cursor = zmiScan(mi, cursor, zsetScanCallback, &data);
             } else {
                 cursor = dictScan(ht, cursor, scanCallback, &data);
             }

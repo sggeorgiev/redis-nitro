@@ -382,18 +382,17 @@ dict *dictDefragTables(dict *d) {
     return ret;
 }
 
-/* Defrag a single zset element, updating the B+ tree leaf slot and dict key. */
-void activeDefragZsetNode(zset *zs, dictEntry *de, dictEntryLink plink) {
-    zbtElem *elem = dictGetKey(de);
-
+/* Defrag a single zset element, updating the B+ tree leaf slot and the member
+ * index slot. */
+void activeDefragZsetNode(zset *zs, zbtElem *elem) {
     /* Try to relocate the element allocation first. */
     zbtElem *newelem = activeDefragAllocWithoutFree(elem);
     if (!newelem) return; /* No defrag needed */
 
     /* Point the tree leaf slot (and any separators) at the relocated element,
-     * then update the dict key. Finally free the old allocation. */
+     * then the index slot. Finally free the old allocation. */
     zbtReplaceElem(zs->tree, elem, newelem);
-    dictSetKeyAtLink(zs->dict, newelem, &plink, 0);
+    zmiReplaceElem(zs->mi, elem, newelem);
     activeDefragFree(elem);
 }
 
@@ -569,10 +568,9 @@ typedef struct {
     zset *zs;
 } scanLaterZsetData;
 
-void scanZsetCallback(void *privdata, const dictEntry *_de, dictEntryLink plink) {
-    dictEntry *de = (dictEntry*)_de;
+void scanZsetCallback(void *privdata, zbtElem *elem) {
     scanLaterZsetData *data = privdata;
-    activeDefragZsetNode(data->zs, de, plink);
+    activeDefragZsetNode(data->zs, elem);
     server.stat_active_defrag_scanned++;
 }
 
@@ -584,14 +582,14 @@ void scanZsetCallback(void *privdata, const dictEntry *_de, dictEntryLink plink)
  * phases so a single call never blocks the event loop for long:
  *   1. relocate the tree's internal/leaf nodes incrementally (the resume
  *      bookmark lives in the tree, so it tolerates mutations between slices);
- *   2. relocate the dict entries and the elements they point to.
+ *   2. relocate the elements the member index points to.
  * Returns 1 when time is up and more node work remains (the key must be kept),
  * otherwise 0. When it returns 0 with *cursor == 0 the whole zset is done. */
 int scanLaterZset(robj *ob, unsigned long *cursor, monotime endtime) {
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_BTREE);
     zset *zs = (zset*)ob->ptr;
 
-    typedef enum { ZSET_PHASE_NODES = 0, ZSET_PHASE_DICT = 1 } zsetDefragPhase;
+    typedef enum { ZSET_PHASE_NODES = 0, ZSET_PHASE_INDEX = 1 } zsetDefragPhase;
     static zsetDefragPhase phase = ZSET_PHASE_NODES;
 
     /* A freshly scheduled key always enters with cursor == 0; (re)start at the
@@ -604,16 +602,15 @@ int scanLaterZset(robj *ob, unsigned long *cursor, monotime endtime) {
             int more = zbtDefragNodesIncremental(zs->tree, activeDefragAlloc,
                                                  ZSET_DEFRAG_NODE_BUDGET);
             server.stat_active_defrag_scanned += ZSET_DEFRAG_NODE_BUDGET;
-            if (!more) { phase = ZSET_PHASE_DICT; break; }
+            if (!more) { phase = ZSET_PHASE_INDEX; break; }
         } while (getMonotonicUs() <= endtime);
         /* Node phase not finished: keep the key and yield. */
         if (phase == ZSET_PHASE_NODES) return 1;
     }
 
-    /* Dict/element phase. */
+    /* Index/element phase. */
     scanLaterZsetData data = {zs};
-    dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
-    *cursor = dictScanDefrag(zs->dict, *cursor, scanZsetCallback, &defragfns, &data);
+    *cursor = zmiScanDefrag(zs->mi, *cursor, scanZsetCallback, &data);
     if (*cursor == 0) phase = ZSET_PHASE_NODES; /* ready for the next key */
     return 0;
 }
@@ -696,7 +693,7 @@ void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
     zset *zs = (zset*)ob->ptr;
     zset *newzs;
     zbtree *newtree;
-    dict *newdict;
+    zmindex *newmi;
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_BTREE);
     if ((newzs = activeDefragAlloc(zs)))
         ob->ptr = zs = newzs;
@@ -704,7 +701,7 @@ void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
         zs->tree = newtree;
     if (zs->tree->length > server.active_defrag_max_scan_fields) {
         /* Large zset: defer BOTH the B+ tree node relocation and the
-         * dict/element scan to the bounded incremental steps performed by
+         * index/element scan to the bounded incremental steps performed by
          * scanLaterZset(), so a single defrag call can't block the event loop.
          * Reset the node-relocation bookmark so this cycle starts at the head. */
         if (zs->tree->defrag_resume) {
@@ -713,22 +710,19 @@ void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
         }
         defragLater(ctx, ob);
     } else {
-        /* Small zset: relocate all the tree nodes at once, then use
-         * dictScanDefrag to iterate and defrag both dictEntry structures and
-         * the zset elements. dictScanDefrag handles the dictEntry structures
-         * via defragfns, and calls our callback with plink for each entry so we
-         * can relocate the element and fix the tree leaf slot. */
+        /* Small zset: relocate all the tree nodes at once, then walk the
+         * member index so each element can be relocated and both the tree
+         * leaf slot and the index slot pointed at its new address. */
         zbtDefragNodes(zs->tree, activeDefragAlloc);
         scanLaterZsetData data = {zs};
-        dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
         unsigned long cursor = 0;
         do {
-            cursor = dictScanDefrag(zs->dict, cursor, scanZsetCallback, &defragfns, &data);
+            cursor = zmiScanDefrag(zs->mi, cursor, scanZsetCallback, &data);
         } while (cursor != 0);
     }
-    /* defrag the dict struct and tables */
-    if ((newdict = dictDefragTables(zs->dict)))
-        zs->dict = newdict;
+    /* defrag the index struct and its bucket arrays */
+    if ((newmi = zmiDefragTables(zs->mi, activeDefragAlloc)))
+        zs->mi = newmi;
 }
 
 void defragHash(defragKeysCtx *ctx, kvobj *ob) {
