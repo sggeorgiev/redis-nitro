@@ -77,98 +77,27 @@ typedef struct zbtInner {
  * Element allocation
  *----------------------------------------------------------------------------*/
 
-/* moff is bounded by the header plus the widest score plus the largest sds
+/* The member offset stored in zbtElem.data[0] is bounded by the largest sds
  * header, so a single byte is always enough to hold it. */
-static_assert(sizeof(zbtElem) + 8 + sizeof(struct sdshdr64) <= UINT8_MAX,
+static_assert(sizeof(zbtElem) + 1 + sizeof(struct sdshdr64) <= UINT8_MAX,
               "zbtElem member offset must fit in a byte");
 
-static size_t zbtScoreEncSize(uint8_t enc) {
-    switch (enc) {
-    case ZBT_SCORE_I8:  return 1;
-    case ZBT_SCORE_I16: return 2;
-    case ZBT_SCORE_I24: return 3;
-    case ZBT_SCORE_I32: return 4;
-    case ZBT_SCORE_I48: return 6;
-    default:            return 8;
-    }
-}
-
-/* Pick the narrowest integer encoding that round-trips 'd', or a raw double.
- * Not on the compare hot path; zbtGetScore is. */
-static void zbtScoreEncode(double d, uint8_t *enc, unsigned char *buf) {
-    long long ll;
-
-    /* double2ll(-0.0) succeeds with 0, but ZSCORE must still reply -0. */
-    if (d == 0 && signbit(d)) {
-        *enc = ZBT_SCORE_DBL;
-        memcpy(buf, &d, sizeof(d));
-        return;
-    }
-    if (!double2ll(d, &ll)) {
-        *enc = ZBT_SCORE_DBL;
-        memcpy(buf, &d, sizeof(d));
-        return;
-    }
-    if (ll >= INT8_MIN && ll <= INT8_MAX) {
-        *enc = ZBT_SCORE_I8;
-        buf[0] = (unsigned char)(int8_t)ll;
-    } else if (ll >= INT16_MIN && ll <= INT16_MAX) {
-        int16_t v = (int16_t)ll;
-        *enc = ZBT_SCORE_I16;
-        memcpy(buf, &v, 2);
-    } else if (ll >= -(1LL << 23) && ll <= ((1LL << 23) - 1)) {
-        unsigned long long u = (unsigned long long)ll;
-        *enc = ZBT_SCORE_I24;
-        buf[0] = (unsigned char)u;
-        buf[1] = (unsigned char)(u >> 8);
-        buf[2] = (unsigned char)(u >> 16);
-    } else if (ll >= INT32_MIN && ll <= INT32_MAX) {
-        int32_t v = (int32_t)ll;
-        *enc = ZBT_SCORE_I32;
-        memcpy(buf, &v, 4);
-    } else if (ll >= -(1LL << 47) && ll <= ((1LL << 47) - 1)) {
-        unsigned long long u = (unsigned long long)ll;
-        *enc = ZBT_SCORE_I48;
-        buf[0] = (unsigned char)u;
-        buf[1] = (unsigned char)(u >> 8);
-        buf[2] = (unsigned char)(u >> 16);
-        buf[3] = (unsigned char)(u >> 24);
-        buf[4] = (unsigned char)(u >> 32);
-        buf[5] = (unsigned char)(u >> 40);
-    } else {
-        *enc = ZBT_SCORE_DBL;
-        memcpy(buf, &d, sizeof(d));
-    }
-}
-
 /* Allocate an element with the member SDS embedded in the same allocation
- * (single block: zbtElem header + score bytes + sds header + data). The
- * member is copied from 'buf', which does not have to be an sds: callers
- * holding plain bytes (listpack entries, integer members) can build an
- * element without first materializing a temporary sds. When 'wide' is set
- * the score is stored as a raw double so a later in-place write cannot
- * overflow the allocation. */
+ * (single block: zbtElem header + sds header + data). The member is copied
+ * from 'buf', which does not have to be an sds: callers holding plain bytes
+ * (listpack entries, integer members) can build an element without first
+ * materializing a temporary sds. */
 static zbtElem *zbtCreateElemBufGen(double score, const char *buf, size_t len,
-                                    int wide, size_t *usable)
+                                    size_t *usable)
 {
-    uint8_t enc;
-    unsigned char sbuf[8];
-    if (wide) {
-        enc = ZBT_SCORE_DBL;
-        memcpy(sbuf, &score, sizeof(score));
-    } else {
-        zbtScoreEncode(score, &enc, sbuf);
-    }
-    size_t score_sz = zbtScoreEncSize(enc);
     char sds_type = sdsReqType(len);
     size_t sds_hdr_len = sdsHdrSize(sds_type);
-    size_t hdr = sizeof(zbtElem) + score_sz;
+    size_t hdr = sizeof(zbtElem) + 1;  /* score + the offset byte itself */
     size_t sds_buf_size = sds_hdr_len + len + 1;
     size_t total = hdr + sds_buf_size;
 
     zbtElem *e = zmalloc_usable(total, usable);
-    e->enc = enc;
-    memcpy(e->data, sbuf, score_sz);
+    e->score = score;
     size_t sds_offset = hdr + sds_hdr_len;
     zbtSetOffset(e, (uint8_t)sds_offset);
 
@@ -178,23 +107,17 @@ static zbtElem *zbtCreateElemBufGen(double score, const char *buf, size_t len,
     return e;
 }
 
-/* Allocate an element with the member SDS embedded in the same allocation
- * (single block: zbtElem header + score bytes + sds header + data). The
- * member is copied from 'buf', which does not have to be an sds: callers
- * holding plain bytes (listpack entries, integer members) can build an
- * element without first materializing a temporary sds. */
 zbtElem *zbtCreateElemBuf(double score, const char *buf, size_t len) {
-    return zbtCreateElemBufGen(score, buf, len, 0, NULL);
+    return zbtCreateElemBufGen(score, buf, len, NULL);
 }
 
 zbtElem *zbtCreateElemBufUsable(double score, const char *buf, size_t len,
                                 size_t *usable)
 {
-    return zbtCreateElemBufGen(score, buf, len, 0, usable);
+    return zbtCreateElemBufGen(score, buf, len, usable);
 }
 
-/* Duplicate the complete packed representation. This preserves the source
- * score encoding and copies the member with a single memcpy. */
+/* Duplicate the complete packed representation, including score and member. */
 zbtElem *zbtDupElem(const zbtElem *elem, size_t *usable) {
     size_t size = zbtGetOffset(elem) + sdslen(zbtGetEle(elem)) + 1;
     zbtElem *copy = zmalloc_usable(size, usable);
@@ -208,12 +131,6 @@ zbtElem *zbtCreateElem(double score, sds ele) {
     return zbtCreateElemBuf(score, ele, sdslen(ele));
 }
 
-/* Like zbtCreateElem(), but the score is forced to ZBT_SCORE_DBL so a later
- * in-place write of any double (ZUNIONSTORE aggregation) cannot overflow. */
-zbtElem *zbtCreateElemWide(double score, sds ele) {
-    return zbtCreateElemBufGen(score, ele, sdslen(ele), 1, NULL);
-}
-
 /* Free a detached element that is not owned by any tree. Used by callers that
  * allocate an element with zbtCreateElem() but fail before ownership is
  * transferred to a tree (e.g. duplicate detection on RDB load). */
@@ -225,9 +142,8 @@ void zbtFreeElem(zbtElem *e) {
  * -1 (smaller). NULL is treated as +infinity. Ordering: score, then member. */
 int zbtCompare(double score, sds ele, const zbtElem *e) {
     if (e == NULL) return -1;
-    double escore = zbtGetScore(e);
-    if (score < escore) return -1;
-    if (score > escore) return 1;
+    if (score < e->score) return -1;
+    if (score > e->score) return 1;
     return sdscmp(ele, zbtGetEle(e));
 }
 
@@ -882,14 +798,12 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
         zbtUpdateToRoot(t, (zbtNode *)lf);
 }
 
-/* Move an existing element to reflect a new score. Returns the (possibly
- * reallocated) element: a width change allocates a new object, and the
- * caller must rewire the ZSET dict key when the pointer changes. */
+/* Move an existing element to reflect a new score. The element object is
+ * reused; the caller does not need to rewire the ZSET dict. */
 zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     /* Detach, rewrite the score, reinsert. The dict maps member -> elem and
-     * the member is unchanged, so only the tree position (and possibly the
-     * allocation) changes. */
-    double score = zbtGetScore(e);
+     * the member is unchanged, so only the tree position changes. */
+    double score = e->score;
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = zbtFindLeaf(t, score, ele);
     int found;
@@ -907,21 +821,9 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     else
         zbtUpdateToRoot(t, (zbtNode *)lf);
 
-    uint8_t newenc;
-    unsigned char newbuf[8];
-    zbtScoreEncode(newscore, &newenc, newbuf);
-    if (zbtScoreEncSize(newenc) == zbtScoreEncSize(e->enc)) {
-        e->enc = newenc;
-        memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
-        zbtInsertElemWithSize(t, e, old_usable);
-        return e;
-    }
-
-    size_t new_usable;
-    zbtElem *ne = zbtCreateElemBufUsable(newscore, ele, sdslen(ele), &new_usable);
-    zfree_with_size(e, old_usable);
-    zbtInsertElemWithSize(t, ne, new_usable);
-    return ne;
+    e->score = newscore;
+    zbtInsertElemWithSize(t, e, old_usable);
+    return e;
 }
 
 /*-----------------------------------------------------------------------------
@@ -2059,42 +1961,29 @@ int zbtreeTest(int argc, char **argv, int flags) {
         test_cond("Incremental node defrag", 1);
     }
 
-    /* Compact score encoding: round-trip every width and cross boundaries
-     * in both directions, including inf and -0.0. */
+    /* Score is a raw double: round-trip integers, fractions, inf, and -0.0. */
     {
         zbtree *bt = zbtCreate();
         struct {
             double score;
             const char *name;
-            uint8_t enc;
         } cases[] = {
-            {0, "z0", ZBT_SCORE_I8},
-            {127, "i8hi", ZBT_SCORE_I8},
-            {-128, "i8lo", ZBT_SCORE_I8},
-            {128, "i16", ZBT_SCORE_I16},
-            {-129, "i16n", ZBT_SCORE_I16},
-            {32767, "i16hi", ZBT_SCORE_I16},
-            {32768, "i24", ZBT_SCORE_I24},
-            {8388607, "i24hi", ZBT_SCORE_I24},
-            {8388608, "i32", ZBT_SCORE_I32},
-            {2147483647.0, "i32hi", ZBT_SCORE_I32},
-            {2147483648.0, "i48", ZBT_SCORE_I48},
-            {(double)((1LL << 47) - 1), "i48hi", ZBT_SCORE_I48},
-            {(double)(1LL << 47), "dbl48", ZBT_SCORE_DBL},
-            {1.5, "frac", ZBT_SCORE_DBL},
-            {INFINITY, "inf", ZBT_SCORE_DBL},
-            {-INFINITY, "ninf", ZBT_SCORE_DBL},
-            {-0.0, "nzero", ZBT_SCORE_DBL},
+            {0, "z0"},
+            {127, "i8hi"},
+            {-128, "i8lo"},
+            {1.5, "frac"},
+            {INFINITY, "inf"},
+            {-INFINITY, "ninf"},
+            {-0.0, "nzero"},
+            {(double)(1LL << 47), "big"},
         };
         int ncases = (int)(sizeof(cases) / sizeof(cases[0]));
-        zbtElem **elems = zmalloc(sizeof(zbtElem *) * ncases);
         for (int i = 0; i < ncases; i++) {
             sds s = sdsnew(cases[i].name);
-            elems[i] = zbtInsert(bt, cases[i].score, s);
+            zbtElem *e = zbtInsert(bt, cases[i].score, s);
             sdsfree(s);
-            serverAssert(elems[i]->enc == cases[i].enc);
-            double got = zbtGetScore(elems[i]);
-            if (cases[i].enc == ZBT_SCORE_DBL && cases[i].score == 0) {
+            double got = zbtGetScore(e);
+            if (cases[i].score == 0 && signbit(cases[i].score)) {
                 serverAssert(got == 0 && signbit(got));
             } else if (isinf(cases[i].score)) {
                 serverAssert(isinf(got) && !!signbit(got) == !!signbit(cases[i].score));
@@ -2103,40 +1992,8 @@ int zbtreeTest(int argc, char **argv, int flags) {
             }
         }
         zbtDebugVerify(bt);
-
-        /* Width changes in both directions. */
-        elems[1] = zbtUpdateScore(bt, elems[1], 128);           /* 127 I8 -> 128 I16 */
-        serverAssert(elems[1]->enc == ZBT_SCORE_I16 && zbtGetScore(elems[1]) == 128);
-        elems[1] = zbtUpdateScore(bt, elems[1], 127);           /* back I16 -> I8 */
-        serverAssert(elems[1]->enc == ZBT_SCORE_I8 && zbtGetScore(elems[1]) == 127);
-
-        zbtElem *one;
-        {
-            sds s = sdsnew("one");
-            one = zbtInsert(bt, 1, s);
-            sdsfree(s);
-        }
-        one = zbtUpdateScore(bt, one, 1.5);                     /* 1 I8 -> 1.5 DBL */
-        serverAssert(one->enc == ZBT_SCORE_DBL && zbtGetScore(one) == 1.5);
-        one = zbtUpdateScore(bt, one, 1);                       /* 1.5 DBL -> 1 I8 */
-        serverAssert(one->enc == ZBT_SCORE_I8 && zbtGetScore(one) == 1);
-
-        zbtElem *big;
-        {
-            sds s = sdsnew("i32x");
-            big = zbtInsert(bt, 2147483647.0, s);
-            sdsfree(s);
-        }
-        serverAssert(big->enc == ZBT_SCORE_I32);
-        big = zbtUpdateScore(bt, big, (double)(1LL << 47));     /* I32 -> DBL via 2^47 */
-        serverAssert(big->enc == ZBT_SCORE_DBL && zbtGetScore(big) == (double)(1LL << 47));
-        big = zbtUpdateScore(bt, big, 2147483648.0);            /* DBL -> I48 */
-        serverAssert(big->enc == ZBT_SCORE_I48 && zbtGetScore(big) == 2147483648.0);
-
-        zbtDebugVerify(bt);
-        zfree(elems);
         zbtFree(bt);
-        test_cond("Compact score encoding width boundaries", 1);
+        test_cond("Score stored as double", 1);
     }
 
     /* Range endpoint lookups, against a linear reference. Both directions of

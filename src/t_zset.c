@@ -2644,7 +2644,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                      if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
 
                     /* Create a detached element with embedded sds and score. */
-                    znode = zbtCreateElemWide(score, tmp);
+                    znode = zbtCreateElem(score, tmp);
                     /* Add element pointer to dict using the bucket we already found */
                     dictSetKeyAtLink(dstzset->dict, znode, &bucket, 1);
                     if (staged_cnt == staged_cap) {
@@ -2654,14 +2654,12 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     staged[staged_cnt++] = znode;
                     sdsfree(tmp); /* zbtCreateElem copied it, we can free our copy */
                 } else {
-                    /* Existing element: aggregate score. Elements were allocated
-                     * wide (ZBT_SCORE_DBL) so the in-place write always fits. */
+                    /* Existing element: aggregate score in place. */
                     de = *link;
                     znode = dictGetKey(de);
                     double newscore = zbtGetScore(znode);
                     zunionInterAggregate(&newscore, score, aggregate);
-                    serverAssert(znode->enc == ZBT_SCORE_DBL);
-                    memcpy(znode->data, &newscore, sizeof(newscore));
+                    znode->score = newscore;
                 }
             }
             zuiClearIterator(&src[i]);
