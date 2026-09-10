@@ -1814,22 +1814,39 @@ struct sharedObjectsStruct {
  * allocation right after this header, mirroring the old skiplist node layout
  * so the dict can store zbtElem* as keys.
  *
- * Layout: [enc][moff][score bytes][sds header][member bytes]. moff is the
- * offset from the element start to the embedded member data. It has to be
- * stored because both the score encoding width and the sds header size vary,
- * so the member data does not sit at a fixed distance from the element start. */
+ * Layout: [meta][score bytes][sds header][member bytes]. meta packs the
+ * ZBT_SCORE_* tag in its top 3 bits and the offset from the element start to
+ * the embedded member data in its low 5 bits. The offset has to be stored
+ * because both the score encoding width and the sds header size vary, so the
+ * member data does not sit at a fixed distance from the element start; it is
+ * at most 1 + 8 + sizeof(struct sdshdr64) = 26, hence the 5-bit field (see
+ * the static assertion in zbtree.c). Keeping both in one byte instead of two
+ * shrinks every element by a byte, which is often a whole jemalloc size
+ * class for short members. */
+#define ZBT_MOFF_BITS 5
+#define ZBT_MOFF_MASK ((1 << ZBT_MOFF_BITS) - 1)
+
 typedef struct zbtElem {
-    uint8_t enc;    /* ZBT_SCORE_* encoding tag */
-    uint8_t moff;   /* offset from element start to member data */
+    uint8_t meta;   /* [ZBT_SCORE_* tag:3][member offset:5] */
     char data[];    /* [score bytes][sds header][member bytes] */
 } zbtElem;
 
-static inline uint8_t zbtGetOffset(const zbtElem *e) {
-    return e->moff;
+static inline uint8_t zbtGetEnc(const zbtElem *e) {
+    return (uint8_t)(e->meta >> ZBT_MOFF_BITS);
 }
 
-static inline void zbtSetOffset(zbtElem *e, uint8_t off) {
-    e->moff = off;
+static inline uint8_t zbtGetOffset(const zbtElem *e) {
+    return (uint8_t)(e->meta & ZBT_MOFF_MASK);
+}
+
+static inline void zbtSetMeta(zbtElem *e, uint8_t enc, uint8_t off) {
+    e->meta = (uint8_t)((enc << ZBT_MOFF_BITS) | off);
+}
+
+/* Replace the score encoding tag, keeping the member offset. Only valid when
+ * the new tag has the same width as the old one, so the member does not move. */
+static inline void zbtSetEnc(zbtElem *e, uint8_t enc) {
+    e->meta = (uint8_t)((enc << ZBT_MOFF_BITS) | (e->meta & ZBT_MOFF_MASK));
 }
 
 /* Decode the packed score. Kept inline: zbtCompare is the hottest consumer,
@@ -1838,7 +1855,7 @@ static inline void zbtSetOffset(zbtElem *e, uint8_t off) {
  * host-endian memcpy cannot drop the low bytes on big-endian hosts. */
 static inline double zbtGetScore(const zbtElem *e) {
     const unsigned char *p = (const unsigned char *)e->data;
-    switch (e->enc) {
+    switch (zbtGetEnc(e)) {
     case ZBT_SCORE_I8:
         return (double)(int8_t)p[0];
     case ZBT_SCORE_I16: {

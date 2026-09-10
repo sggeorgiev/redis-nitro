@@ -77,10 +77,13 @@ typedef struct zbtInner {
  * Element allocation
  *----------------------------------------------------------------------------*/
 
-/* moff is bounded by the header plus the widest score plus the largest sds
- * header, so a single byte is always enough to hold it. */
-static_assert(sizeof(zbtElem) + 8 + sizeof(struct sdshdr64) <= UINT8_MAX,
-              "zbtElem member offset must fit in a byte");
+/* The member offset is bounded by the header plus the widest score plus the
+ * largest sds header, so the 5 bits left over by the score tag in the meta
+ * byte are always enough to hold it. */
+static_assert(sizeof(zbtElem) + 8 + sizeof(struct sdshdr64) <= ZBT_MOFF_MASK,
+              "zbtElem member offset must fit in the meta byte");
+static_assert(ZBT_SCORE_DBL < (1 << (8 - ZBT_MOFF_BITS)),
+              "zbtElem score tag must fit in the meta byte");
 
 static size_t zbtScoreEncSize(uint8_t enc) {
     switch (enc) {
@@ -168,10 +171,9 @@ zbtElem *zbtCreateElem(double score, const char *buf, size_t len,
     size_t total = hdr + sds_buf_size;
 
     zbtElem *e = zmalloc_usable(total, usable);
-    e->enc = enc;
-    memcpy(e->data, sbuf, score_sz);
     size_t sds_offset = hdr + sds_hdr_len;
-    zbtSetOffset(e, (uint8_t)sds_offset);
+    zbtSetMeta(e, enc, (uint8_t)sds_offset);
+    memcpy(e->data, sbuf, score_sz);
 
     char *dst = (char *)e + hdr;
     sds emb = sdsnewplacement(dst, sds_buf_size, sds_type, buf, len);
@@ -884,8 +886,8 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     uint8_t newenc;
     unsigned char newbuf[8];
     zbtScoreEncode(newscore, &newenc, newbuf);
-    if (zbtScoreEncSize(newenc) == zbtScoreEncSize(e->enc)) {
-        e->enc = newenc;
+    if (zbtScoreEncSize(newenc) == zbtScoreEncSize(zbtGetEnc(e))) {
+        zbtSetEnc(e, newenc);
         memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
         zbtInsertElemWithSize(t, e, old_usable);
         return e;
@@ -2066,7 +2068,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
             sds s = sdsnew(cases[i].name);
             elems[i] = zbtInsert(bt, cases[i].score, s);
             sdsfree(s);
-            serverAssert(elems[i]->enc == cases[i].enc);
+            serverAssert(zbtGetEnc(elems[i]) == cases[i].enc);
             double got = zbtGetScore(elems[i]);
             if (cases[i].enc == ZBT_SCORE_DBL && cases[i].score == 0) {
                 serverAssert(got == 0 && signbit(got));
@@ -2080,9 +2082,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
 
         /* Width changes in both directions. */
         elems[1] = zbtUpdateScore(bt, elems[1], 128);           /* 127 I8 -> 128 I16 */
-        serverAssert(elems[1]->enc == ZBT_SCORE_I16 && zbtGetScore(elems[1]) == 128);
+        serverAssert(zbtGetEnc(elems[1]) == ZBT_SCORE_I16 && zbtGetScore(elems[1]) == 128);
         elems[1] = zbtUpdateScore(bt, elems[1], 127);           /* back I16 -> I8 */
-        serverAssert(elems[1]->enc == ZBT_SCORE_I8 && zbtGetScore(elems[1]) == 127);
+        serverAssert(zbtGetEnc(elems[1]) == ZBT_SCORE_I8 && zbtGetScore(elems[1]) == 127);
 
         zbtElem *one;
         {
@@ -2091,9 +2093,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
             sdsfree(s);
         }
         one = zbtUpdateScore(bt, one, 1.5);                     /* 1 I8 -> 1.5 DBL */
-        serverAssert(one->enc == ZBT_SCORE_DBL && zbtGetScore(one) == 1.5);
+        serverAssert(zbtGetEnc(one) == ZBT_SCORE_DBL && zbtGetScore(one) == 1.5);
         one = zbtUpdateScore(bt, one, 1);                       /* 1.5 DBL -> 1 I8 */
-        serverAssert(one->enc == ZBT_SCORE_I8 && zbtGetScore(one) == 1);
+        serverAssert(zbtGetEnc(one) == ZBT_SCORE_I8 && zbtGetScore(one) == 1);
 
         zbtElem *big;
         {
@@ -2101,11 +2103,11 @@ int zbtreeTest(int argc, char **argv, int flags) {
             big = zbtInsert(bt, 2147483647.0, s);
             sdsfree(s);
         }
-        serverAssert(big->enc == ZBT_SCORE_I32);
+        serverAssert(zbtGetEnc(big) == ZBT_SCORE_I32);
         big = zbtUpdateScore(bt, big, (double)(1LL << 47));     /* I32 -> DBL via 2^47 */
-        serverAssert(big->enc == ZBT_SCORE_DBL && zbtGetScore(big) == (double)(1LL << 47));
+        serverAssert(zbtGetEnc(big) == ZBT_SCORE_DBL && zbtGetScore(big) == (double)(1LL << 47));
         big = zbtUpdateScore(bt, big, 2147483648.0);            /* DBL -> I48 */
-        serverAssert(big->enc == ZBT_SCORE_I48 && zbtGetScore(big) == 2147483648.0);
+        serverAssert(zbtGetEnc(big) == ZBT_SCORE_I48 && zbtGetScore(big) == 2147483648.0);
 
         zbtDebugVerify(bt);
         zfree(elems);
