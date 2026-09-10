@@ -620,59 +620,6 @@ dictEntry *dictAddNonExisting(dict *d, void *key __stored_key) {
     return dictInsertKeyAtLink(d, key, bucket);
 }
 
-/* Batch form of dictAddNonExisting() for an array of known-absent keys.
- * Prefetches upcoming keys and destination buckets, and expands the table
- * once so it does not resize mid-batch. */
-#define DICT_ADD_BATCH_PREFETCH 8 /* Power of two: ring index is a mask. */
-void dictAddNonExistingBatch(dict *d, void **keys __stored_key, size_t n) {
-    uint64_t hashes[DICT_ADD_BATCH_PREFETCH], hash;
-    size_t i, primed;
-    int htidx;
-    unsigned long idx;
-    void *key;
-
-    if (n == 0) return;
-
-    /* dictFind() may advance rehashing, so check before we pick the table. */
-#ifdef DEBUG_ASSERTIONS
-    for (i = 0; i < n; i++)
-        debugAssert(dictFind(d, dictStoredKey2Key(d, keys[i])) == NULL);
-#endif
-
-    /* Expand once. Mid-batch growth would reallocate the table and invalidate
-     * prefetched buckets. */
-    dictExpand(d, dictSize(d) + n);
-    htidx = dictIsRehashing(d) ? 1 : 0;
-
-    primed = n < DICT_ADD_BATCH_PREFETCH ? n : DICT_ADD_BATCH_PREFETCH;
-    for (i = 0; i < primed; i++) {
-        hashes[i] = dictGetHash(d, dictStoredKey2Key(d, keys[i]));
-        idx = hashes[i] & DICTHT_SIZE_MASK(d->ht_size_exp[htidx]);
-        redis_prefetch_write(&d->ht_table[htidx][idx]);
-    }
-
-    for (i = 0; i < n; i++) {
-        /* Prefetch the key two windows ahead so its bytes are warm when hashed. */
-        if (i + 2 * DICT_ADD_BATCH_PREFETCH < n)
-            redis_prefetch_read(keys[i + 2 * DICT_ADD_BATCH_PREFETCH]);
-
-        key = keys[i];
-        hash = hashes[i & (DICT_ADD_BATCH_PREFETCH - 1)];
-        idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[htidx]);
-        /* Dup the key if necessary. */
-        if (d->type->keyDup) key = d->type->keyDup(d, key);
-        dictInsertKeyAtLink(d, key, &d->ht_table[htidx][idx]);
-
-        /* Hash the next window and prefetch its bucket. */
-        if (i + DICT_ADD_BATCH_PREFETCH < n) {
-            hash = dictGetHash(d, dictStoredKey2Key(d, keys[i + DICT_ADD_BATCH_PREFETCH]));
-            hashes[(i + DICT_ADD_BATCH_PREFETCH) & (DICT_ADD_BATCH_PREFETCH - 1)] = hash;
-            idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[htidx]);
-            redis_prefetch_write(&d->ht_table[htidx][idx]);
-        }
-    }
-}
-
 /* Add or Overwrite:
  * Add an element, discarding the old value if the key already exists.
  * Return 1 if the key was added from scratch, 0 if there was already an
@@ -2577,55 +2524,6 @@ int dictTest(int argc, char **argv, int flags) {
             zfree(probe);
         }
         dictRelease(d); /* freeCallback releases the stored keys */
-    }
-
-    TEST("dictAddNonExistingBatch() inserts a batch into a fresh dict") {
-        dictType dt = BenchmarkDictType;
-        dt.no_value = 1;
-        dict *d = dictCreate(&dt);
-        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
-
-        long n = 5000;
-        void **keys = zmalloc(sizeof(void *) * n);
-        for (long i = 0; i < n; i++) keys[i] = stringFromLongLong(i);
-
-        dictAddNonExistingBatch(d, keys, n);
-        assert((long)dictSize(d) == n);
-        for (long i = 0; i < n; i++) {
-            char *probe = stringFromLongLong(i);
-            assert(dictFind(d, probe) != NULL);
-            zfree(probe);
-        }
-        zfree(keys);
-        dictRelease(d);
-    }
-
-    TEST("dictAddNonExistingBatch() stays correct across a rehash") {
-        /* Leave rehashing unfinished so the batch runs against two tables. */
-        dictType dt = BenchmarkDictType;
-        dt.no_value = 1;
-        dict *d = dictCreate(&dt);
-        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
-
-        long seed = 1024;
-        for (long i = 0; i < seed; i++)
-            assert(dictAdd(d, stringFromLongLong(i), NULL) == DICT_OK);
-        assert(dictExpand(d, seed * 4) == DICT_OK);
-        assert(dictIsRehashing(d));
-
-        long n = 2000;
-        void **keys = zmalloc(sizeof(void *) * n);
-        for (long i = 0; i < n; i++) keys[i] = stringFromLongLong(seed + i);
-        dictAddNonExistingBatch(d, keys, n);
-        assert((long)dictSize(d) == seed + n);
-
-        for (long i = 0; i < seed + n; i++) {
-            char *probe = stringFromLongLong(i);
-            assert(dictFind(d, probe) != NULL);
-            zfree(probe);
-        }
-        zfree(keys);
-        dictRelease(d);
     }
 
     return 0;

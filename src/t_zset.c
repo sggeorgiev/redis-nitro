@@ -748,9 +748,10 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
             elems[cnt++] = elem;
             zzlNext(zl,&eptr,&sptr);
         }
-        /* Members from a listpack-encoded zset are unique, so index them in one
-         * batch that skips the per-insert duplicate scan. */
-        dictAddNonExistingBatch(zs->dict, (void **)elems, cnt);
+        /* Members from a listpack-encoded zset are unique, so skip the
+         * per-insert duplicate scan. */
+        for (unsigned long i = 0; i < cnt; i++)
+            dictAddNonExisting(zs->dict, elems[i]);
         zbtBuildFromSorted(zs->tree, elems, cnt);
         zfree(elems);
 
@@ -1179,9 +1180,10 @@ robj *zsetDup(robj *o) {
             elems[cnt++] = znode;
             ln = zbtIterNext(&it);
         }
-        /* The source zset's members are unique, so index the copies in one
-         * batch that skips the per-insert duplicate scan. */
-        dictAddNonExistingBatch(new_zs->dict, (void **)elems, cnt);
+        /* The source zset's members are unique, so skip the per-insert
+         * duplicate scan. */
+        for (unsigned long i = 0; i < cnt; i++)
+            dictAddNonExisting(new_zs->dict, elems[i]);
         zbtBuildFromSorted(new_zs->tree, elems, cnt);
         zfree(elems);
     } else {
@@ -2147,7 +2149,8 @@ robj *zsetCreateFromElems(robj *reuse, zbtElem **elems, unsigned long n,
     zset *zs = zobj->ptr;
     if (!dict_indexed) {
         dictExpand(zs->dict, n);
-        dictAddNonExistingBatch(zs->dict, (void **)elems, n);
+        for (unsigned long i = 0; i < n; i++)
+            dictAddNonExisting(zs->dict, elems[i]);
     }
     /* Already sorted above; skip zsetBuildTreeFromElems()'s second check. */
     serverAssert(zs->tree->length == 0);
@@ -2317,9 +2320,11 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
         zuiClearIterator(&src[j]);
 
         /* Source 0 cannot empty the result (cardinality is incremented before
-         * the zero check), so this is the unique-key batch of its members. */
+         * the zero check), so index its unique members without a duplicate
+         * scan. */
         if (j == 0 && src0cnt > 0) {
-            dictAddNonExistingBatch(dstzset->dict, (void **)src0elems, src0cnt);
+            for (unsigned long i = 0; i < src0cnt; i++)
+                dictAddNonExisting(dstzset->dict, src0elems[i]);
             zfree(src0elems);
             src0elems = NULL;
         }
@@ -2965,9 +2970,10 @@ static void zrangeResultBuildStagedTree(zrange_result_handler *handler)
     }
 
     zset *zs = handler->dstobj->ptr;
-    /* The range is taken from a sorted set, so members are unique: index them
-     * in one batch that skips the per-insert duplicate scan. */
-    dictAddNonExistingBatch(zs->dict, (void **)elems, n);
+    /* The range is taken from a sorted set, so members are unique: skip the
+     * per-insert duplicate scan. */
+    for (unsigned long i = 0; i < n; i++)
+        dictAddNonExisting(zs->dict, elems[i]);
     zbtBuildFromSortedWithSize(zs->tree, elems, n,
                                handler->staged_alloc_size);
     zfree(elems);
