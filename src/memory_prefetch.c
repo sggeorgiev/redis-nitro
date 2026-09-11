@@ -40,7 +40,8 @@ typedef enum {
 typedef struct dictPrefetchLookup {
     dictPrefetchState state;  /* Current FSM stage of this lookup */
     dictHtIdx ht_idx;         /* Index of the current hash table (0 or 1 for rehashing) */
-    uint64_t bucket_idx;      /* Index of the bucket in the current hash table */
+    uint64_t home_idx;        /* Home slot of the key in the current hash table */
+    uint64_t bucket_idx;      /* Slot of the current candidate in the probe run */
     uint64_t key_hash;        /* Hash value of the key being looked up */
     dictEntry *current_entry; /* Pointer to the current entry being processed */
 } dictPrefetchLookup;
@@ -129,31 +130,43 @@ static void dictPrefetchBucket(dictPrefetcher *p, dictPrefetchLookup *lk) {
         return;
     }
 
-    /* Prefetch the bucket */
-    lk->bucket_idx = lk->key_hash & DICTHT_SIZE_MASK(d->ht_size_exp[lk->ht_idx]);
+    /* Prefetch the home slot */
+    lk->home_idx = lk->key_hash & DICTHT_SIZE_MASK(d->ht_size_exp[lk->ht_idx]);
+    lk->bucket_idx = lk->home_idx;
     dictPrefetchAdvance(p, &d->ht_table[lk->ht_idx][lk->bucket_idx]);
     lk->current_entry = NULL;
     lk->state = PREFETCH_ENTRY;
 }
 
-/* Prefetch the entry in the bucket and move to the PREFETCH_ENTRY_KEY state.
- * If no more entries in the bucket, move to the PREFETCH_BUCKET state to look at the next table. */
+/* Prefetch the next candidate slot of the key's probe run and move to the
+ * PREFETCH_ENTRY_KEY state. If the run is over, move to the PREFETCH_BUCKET
+ * state to look at the next table.
+ *
+ * The table is open addressed, so the candidates for a key are the occupied
+ * slots from its home slot up to DICT_MAX_PROBE slots further down; the first
+ * empty slot ends the run. The physical slot array carries guard slots past
+ * the mask, so walking the run never wraps, and it never runs off the end
+ * either since the walk stops at the last physical slot. */
 static void dictPrefetchEntry(dictPrefetcher *p, dictPrefetchLookup *lk) {
     size_t i = p->cur_idx;
+    dict *d = p->dicts[i];
 
     if (lk->current_entry) {
-        /* We already found an entry in the bucket - move to the next entry */
-        lk->current_entry = dictGetNext(lk->current_entry);
+        /* We already looked at a candidate - move on to the next slot */
+        lk->current_entry = NULL;
+        if (++lk->bucket_idx - lk->home_idx < DICT_MAX_PROBE &&
+            lk->bucket_idx < DICTHT_PHYSICAL_SLOTS(d->ht_size_exp[lk->ht_idx]))
+            lk->current_entry = d->ht_table[lk->ht_idx][lk->bucket_idx];
     } else {
-        /* Go to the first entry in the bucket */
-        lk->current_entry = p->dicts[i]->ht_table[lk->ht_idx][lk->bucket_idx];
+        /* Go to the home slot of the key */
+        lk->current_entry = d->ht_table[lk->ht_idx][lk->bucket_idx];
     }
 
     if (lk->current_entry) {
         dictPrefetchAdvance(p, lk->current_entry);
         lk->state = PREFETCH_ENTRY_KEY;
     } else {
-        /* No entry found in the bucket - try the bucket in the next table */
+        /* Run exhausted - try the home slot in the next table */
         lk->state = PREFETCH_BUCKET;
     }
 }
@@ -173,7 +186,7 @@ static void dictPrefetchEntryKey(dictPrefetcher *p, dictPrefetchLookup *lk) {
 
 /* Compare the entry's stored key against the lookup key. On match, ask
  * the dictType to prefetch the value-side payload (if any) and mark the
- * lookup done. On mismatch, walk to the next entry in the chain.
+ * lookup done. On mismatch, walk to the next candidate of the probe run.
  *
  * The entry's stored key may be in a different shape than the lookup key
  * (e.g. dbDictType stores a kvobj but keyCompare wants the sds). When that
@@ -185,11 +198,22 @@ static void dictPrefetchEntryValue(dictPrefetcher *p, dictPrefetchLookup *lk) {
     dict *d = p->dicts[i];
     dictType *type = d->type;
     const void *stored_key = dictGetKey(lk->current_entry);
+
+    /* A slot of a deleted key holds no key at all: skip it. */
+    if (stored_key == NULL) {
+        lk->state = PREFETCH_ENTRY;
+        return;
+    }
+
     const void *cmp_key = type->keyFromStoredKey ? type->keyFromStoredKey(stored_key) : stored_key;
 
-    /* 1. If this is the last element, we assume a hit and don't compare the keys
+    /* 1. If this is the last candidate of the run, we assume a hit and don't
+     *    compare the keys
      * 2. The stored entry matches the lookup key. */
-    if ((!dictGetNext(lk->current_entry) && !dictIsRehashing(d)) ||
+    int lastInRun = (lk->bucket_idx + 1 - lk->home_idx >= DICT_MAX_PROBE) ||
+                    (lk->bucket_idx + 1 >= DICTHT_PHYSICAL_SLOTS(d->ht_size_exp[lk->ht_idx])) ||
+                    (d->ht_table[lk->ht_idx][lk->bucket_idx + 1] == NULL);
+    if ((lastInRun && !dictIsRehashing(d)) ||
         dictCompareKeys(d, p->keys[i], cmp_key))
     {
         if (type->prefetchEntryValue) {
@@ -198,7 +222,7 @@ static void dictPrefetchEntryValue(dictPrefetcher *p, dictPrefetchLookup *lk) {
         }
         dictPrefetchMarkDone(p, lk);
     } else {
-        /* Not found in the current entry, move to the next entry */
+        /* Not the key we look for, move to the next candidate */
         lk->state = PREFETCH_ENTRY;
     }
 }

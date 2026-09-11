@@ -307,7 +307,7 @@ size_t kvstoreMemUsage(kvstore *kvs) {
     size_t metaSize = kvs->dtype.dictMetadataBytes(NULL);
     unsigned long long keys_count = kvstoreSize(kvs);
     mem += keys_count * dictEntryMemUsage(kvs->dtype.no_value) +
-           kvstoreBuckets(kvs) * sizeof(dictEntry*) +
+           kvstoreBuckets(kvs) * (sizeof(dictEntry *) + sizeof(uint8_t)) +
            kvs->allocated_dicts * (sizeof(dict) + metaSize);
 
     /* Values are dict* shared with kvs->dicts */
@@ -695,7 +695,7 @@ uint64_t kvstoreIncrementallyRehash(kvstore *kvs, uint64_t threshold_us) {
 }
 
 size_t kvstoreOverheadHashtableLut(kvstore *kvs) {
-    return kvs->bucket_count * sizeof(dictEntry *);
+    return kvs->bucket_count * (sizeof(dictEntry *) + sizeof(uint8_t));
 }
 
 size_t kvstoreOverheadHashtableRehashing(kvstore *kvs) {

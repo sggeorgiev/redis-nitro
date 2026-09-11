@@ -380,12 +380,27 @@ start_server {tags {"other"}} {
     }
 }
 
+proc dict_main_table_size {htstats} {
+    if {![regexp {Hash table 0 stats[^\n]*\n table size: (\d+)} $htstats -> size]} {
+        error "could not parse HTSTATS: $htstats"
+    }
+    return $size
+}
+
 start_server {tags {"other external:skip"}} {
     test {Don't rehash if redis has child process} {
         r config set save ""
         r config set rdb-key-save-delay 1000000
 
-        populate 4095 "" 1
+        # Fill a 4096-slot table to just under the 0.75 growth threshold so a
+        # post-fork write can trigger expansion without crossing the 0.9
+        # hard cap during the save.
+        populate 3070 "" 1
+        wait_for_condition 50 100 {
+            ![string match "*rehashing target*" [r debug HTSTATS 9]]
+        } else {
+            fail "hash table did not finish rehashing before bgsave"
+        }
         r bgsave
         wait_for_condition 10 100 {
             [s rdb_bgsave_in_progress] eq 1
@@ -393,16 +408,19 @@ start_server {tags {"other external:skip"}} {
             fail "bgsave did not start in time"
         }
 
+        set size_during [dict_main_table_size [r debug HTSTATS 9]]
         r mset k1 v1 k2 v2
-        # Hash table should not rehash
-        assert_no_match "*table size: 8192*" [r debug HTSTATS 9]
+        # Hash table should not rehash while the child is saving
+        assert_equal [dict_main_table_size [r debug HTSTATS 9]] $size_during
+        assert_no_match "*rehashing target*" [r debug HTSTATS 9]
         exec kill -9 [get_child_pid 0]
         waitForBgsave r
 
-        # Hash table should rehash since there is no child process,
-        # size is power of two and over 4096, so it is 8192
+        # Hash table should rehash once resizing is allowed again and a write
+        # forces the load-factor check.
+        r set postfork_resize_trigger 1
         wait_for_condition 50 100 {
-            [string match "*table size: 8192*" [r debug HTSTATS 9]]
+            [dict_main_table_size [r debug HTSTATS 9]] > $size_during
         } else {
             fail "hash table did not rehash after child process killed"
         }
@@ -461,8 +479,6 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
         for {set j 1} {$j <= 128} {incr j} {
             r set "{foo}$j" a
         }
-        assert_match "*table size: 128*" [r debug HTSTATS 0]
-
         # disable resizing, the reason for not using slow bgsave is because
         # it will hit the dict_force_resize_ratio.
         r debug dict-resizing 0
@@ -471,14 +487,14 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
         for {set j 1} {$j <= 123} {incr j} {
             r del "{foo}$j"
         }
-        assert_match "*table size: 128*" [r debug HTSTATS 0]
+        set size_before [dict_main_table_size [r debug HTSTATS 0]]
 
         # enable resizing
         r debug dict-resizing 1
 
         # waiting for serverCron to resize the tables
         wait_for_condition 1000 10 {
-            [string match {*table size: 8*} [r debug HTSTATS 0]]
+            [dict_main_table_size [r debug HTSTATS 0]] < $size_before
         } else {
             puts [r debug HTSTATS 0]
             fail "hash tables weren't resize."
@@ -501,12 +517,14 @@ start_cluster 1 0 {tags {"other external:skip cluster slow"}} {
             r del "{alice}$j"
         }
 
+        set size_before [dict_main_table_size [r debug HTSTATS 0]]
+
         # enable resizing
         r debug dict-resizing 1
 
         # waiting for serverCron to resize the tables
         wait_for_condition 1000 10 {
-            [string match {*table size: 16*} [r debug HTSTATS 0]]
+            [dict_main_table_size [r debug HTSTATS 0]] < $size_before
         } else {
             puts [r debug HTSTATS 0]
             fail "hash tables weren't resize."

@@ -3,7 +3,8 @@
  * This file implements in-memory hash tables with insert/del/replace/find/
  * get-random-element operations. Hash tables will auto-resize if needed
  * tables of power of two in size are used, collisions are handled by
- * chaining. See the source code for more information... :)
+ * open addressing with linear probing (Robin Hood insertion). See the
+ * source code for more information... :)
  *
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
@@ -114,10 +115,9 @@ typedef struct dictType {
 
     /* Flags */
     /* The 'no_value' flag, if set, indicates that values are not used, i.e. the
-     * dict is a set. When this flag is set, it's not possible to access the
-     * value of a dictEntry and it's also impossible to use dictSetKey(). It 
-     * enables an optimization to store a key directly without an allocating 
-     * dictEntry in between, if it is the only key in the bucket. */
+ * dict is a set. When this flag is set, it's not possible to access the
+ * value of a dictEntry and it's also impossible to use dictSetKey(). The
+ * key is stored directly in the open-addressed slot using pointer tagging. */
     unsigned int no_value:1;
     /* This flag is required for `no_value` optimization since the optimization
      * reuses LSB bits as metadata */ 
@@ -158,6 +158,15 @@ typedef struct dictType {
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
 #define DICTHT_SIZE_MASK(exp) ((exp) == -1 ? 0 : (DICTHT_SIZE(exp))-1)
+#define DICT_MAX_PROBE 64
+/* Slots a probe run may spill into past the end of the table, so that a run
+ * never has to wrap around. A table smaller than DICT_MAX_PROBE gets a guard
+ * of its own size: a run cannot hold more entries than the table does, and a
+ * fixed 64 slot tail would dwarf the tiny dicts Redis allocates by the
+ * thousand (one per pubsub channel, and so on). */
+#define DICTHT_GUARD_SLOTS(exp) (DICTHT_SIZE(exp) < DICT_MAX_PROBE ? \
+                                 DICTHT_SIZE(exp) : (unsigned long)DICT_MAX_PROBE)
+#define DICTHT_PHYSICAL_SLOTS(exp) ((exp) == -1 ? 0 : (DICTHT_SIZE(exp) + DICTHT_GUARD_SLOTS(exp)))
 
 struct dict {
     dictType *type;
@@ -167,11 +176,18 @@ struct dict {
 
     unsigned long allocated_entries; /* allocated dictEntry structs (not inline keys) */
 
+    unsigned long ht_tombstones[2]; /* transient tombstones while compaction paused */
+
     long rehashidx; /* rehashing not in progress if rehashidx == -1 */
 
     /* Note: pauserehash is a full unsigned so iterator increments
      * don't perform RMW on the same storage unit as other bitfields. */
     unsigned pauserehash; /* If >0 rehashing is paused */
+    unsigned pausecompact; /* If >0 deletion uses tombstones instead of shift */
+
+#ifdef DEBUG_ASSERTIONS
+    unsigned long long linkEpoch; /* bumped on structural slot changes */
+#endif
 
     /* Keep small vars at end for optimal (minimal) struct padding */
     signed char ht_size_exp[2]; /* exponent of size. (size = 1<<exp) */
@@ -228,7 +244,7 @@ typedef struct {
 #define dictMetadataSize(d) ((d)->type->dictMetadataBytes \
                              ? (d)->type->dictMetadataBytes(d) : 0)
 
-#define dictBuckets(d) (DICTHT_SIZE((d)->ht_size_exp[0])+DICTHT_SIZE((d)->ht_size_exp[1]))
+#define dictBuckets(d) (DICTHT_PHYSICAL_SLOTS((d)->ht_size_exp[0])+DICTHT_PHYSICAL_SLOTS((d)->ht_size_exp[1]))
 #define dictSize(d) ((d)->ht_used[0]+(d)->ht_used[1])
 #define dictIsEmpty(d) ((d)->ht_used[0] == 0 && (d)->ht_used[1] == 0)
 #define dictIsRehashing(d) ((d)->rehashidx != -1)
