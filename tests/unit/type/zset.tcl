@@ -1509,6 +1509,38 @@ start_server {tags {"zset"}} {
         }
     }
 
+    test "B-tree ZRANGE rank end-walk, whole-tree BYSCORE, ZRANGESTORE" {
+        with_btree_encoding {
+            r del zn
+            set args {}
+            for {set i 0} {$i < 100} {incr i} {
+                lappend args $i [format e%03d $i]
+            }
+            r zadd zn {*}$args
+            assert_encoding btree zn
+            # Reverse rank window matching the fleet ZREVRANGE 5 10 shape.
+            assert_equal {e094 e093 e092 e091 e090 e089} [r zrevrange zn 5 10]
+            assert_equal {e094 94 e093 93 e092 92 e091 91 e090 90 e089 89} \
+                [r zrevrange zn 5 10 WITHSCORES]
+            # Start-0 rank walk (ZRANGESTORE 0 N / ZRANGE 0 N).
+            assert_equal 11 [r zrangestore zd zn 0 10]
+            assert_equal [r zrange zn 0 10] [r zrange zd 0 -1]
+            # Whole tree in [0,1] after scaling scores into (0,1).
+            r del zs
+            set args {}
+            for {set i 0} {$i < 200} {incr i} {
+                lappend args [expr {($i + 1) / 201.0}] [format s%03d $i]
+            }
+            r zadd zs {*}$args
+            assert_encoding btree zs
+            assert_equal 200 [llength [r zrange zs 0 1 BYSCORE]]
+            assert_equal 400 [llength [r zrange zs 0 1 BYSCORE WITHSCORES]]
+            # Finite max still stops the walk (cannot skip the bound).
+            assert_equal 6 [llength [r zrangebyscore zn -inf 5]]
+            assert_equal {e010 e011 e012} [r zrangebyscore zn 10 20 LIMIT 0 3]
+        }
+    }
+
     test "Large B-tree ZREMRANGEBYSCORE/BYLEX batched deletion" {
         with_btree_encoding {
             r del zs

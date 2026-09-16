@@ -3936,6 +3936,7 @@ const void *zbtGetEleForDict(const void *elem);
 unsigned long zbtRankByElem(zbtree *t, zbtElem *e);
 unsigned long zbtGetRank(zbtree *t, double score, sds ele);
 zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it);
+zbtElem *zbtElemByEndOffset(zbtree *t, unsigned long offset, int reverse, zbtIter *it);
 zbtElem *zbtFirst(zbtree *t, zbtIter *it);
 zbtElem *zbtLast(zbtree *t, zbtIter *it);
 zbtElem *zbtIterNext(zbtIter *it);

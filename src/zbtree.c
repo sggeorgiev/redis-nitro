@@ -50,6 +50,11 @@
 #define ZBT_LEAF_MIN   (ZBT_LEAF_MAX/2)
 #define ZBT_INNER_MAX  64
 #define ZBT_INNER_MIN  (ZBT_INNER_MAX/2)
+/* Offsets up to this many elements are reached by stepping along the leaf
+ * chain, which stays cheaper than the root-to-leaf descent zbtElemByRank()
+ * needs to jump straight to a rank. Matches the search window the skiplist
+ * used before the tree replaced it. */
+#define ZBT_RANGE_WALK_MAX 10
 
 /* Common node header. Both leaf and inner nodes start with it so that a
  * zbtNode* can be inspected polymorphically. */
@@ -1205,6 +1210,21 @@ zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it) {
  * Iteration
  *----------------------------------------------------------------------------*/
 
+/* 0-based offset from the low end (reverse=0) or high end (reverse=1).
+ * Small offsets walk the leaf chain from head/tail; larger ones rank-jump. */
+zbtElem *zbtElemByEndOffset(zbtree *t, unsigned long offset, int reverse,
+                           zbtIter *it)
+{
+    if (offset > ZBT_RANGE_WALK_MAX) {
+        unsigned long rank = reverse ? (t->length - offset) : (offset + 1);
+        return zbtElemByRank(t, rank, it);
+    }
+    zbtElem *e = reverse ? zbtLast(t, it) : zbtFirst(t, it);
+    for (unsigned long i = 0; i < offset && e != NULL; i++)
+        e = reverse ? zbtIterPrev(it) : zbtIterNext(it);
+    return e;
+}
+
 zbtElem *zbtFirst(zbtree *t, zbtIter *it) {
     if (t->length == 0) return NULL;
     zbtLeaf *lf = (zbtLeaf *)t->head;
@@ -1410,12 +1430,6 @@ static int beforeNotGteMin(const zbtElem *e, void *arg) {
 static int beforeLteMax(const zbtElem *e, void *arg) {
     return zslLexValueLteMax(zbtGetEle((zbtElem *)e), (zlexrangespec *)arg);
 }
-
-/* Offsets up to this many elements are reached by stepping along the leaf
- * chain, which stays cheaper than the root-to-leaf descent zbtElemByRank()
- * needs to jump straight to a rank. Matches the search window the skiplist
- * used before the tree replaced it. */
-#define ZBT_RANGE_WALK_MAX 10
 
 /* Shared implementation of the Nth-in-range lookups. 'before_lo' selects the
  * elements that precede the range, 'before_hi' those up to and including its
@@ -1986,6 +2000,21 @@ int zbtreeTest(int argc, char **argv, int flags) {
     }
     zbtDebugVerify(t);
     test_cond("Insert N elements", t->length == (unsigned long)N);
+
+    /* End-offset positioning must match rank for both leaf-walk and rank-jump. */
+    {
+        zbtIter it;
+        int ok = 1;
+        for (unsigned long off = 0; off < 15 && off < t->length; off++) {
+            zbtElem *walk = zbtElemByEndOffset(t, off, 0, &it);
+            zbtElem *rank = zbtElemByRank(t, off + 1, NULL);
+            if (walk != rank) ok = 0;
+            walk = zbtElemByEndOffset(t, off, 1, &it);
+            rank = zbtElemByRank(t, t->length - off, NULL);
+            if (walk != rank) ok = 0;
+        }
+        test_cond("zbtElemByEndOffset matches rank", ok);
+    }
 
     /* Full in-order scan is sorted and matches length. */
     {

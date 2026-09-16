@@ -3205,12 +3205,8 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
         zbtIter it;
         zbtElem *ln;
 
-        /* Compute the 1-based rank of the starting element, then walk the
-         * leaf chain forward or backward using the iterator. */
-        if (reverse)
-            ln = zbtElemByRank(t, llen - start, &it);
-        else
-            ln = zbtElemByRank(t, start + 1, &it);
+        /* Small offsets from an end walk the leaf chain; otherwise rank-jump. */
+        ln = zbtElemByEndOffset(t, (unsigned long)start, reverse, &it);
 
         while(rangelen--) {
             serverAssertWithInfo(c,zobj,ln != NULL);
@@ -3218,7 +3214,8 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
                 handler->emitResultFromElem(handler, ln);
             } else {
                 sds ele = zbtGetEle(ln);
-                handler->emitResultFromCBuffer(handler, ele, sdslen(ele), zbtGetScore(ln));
+                double score = withscores ? zbtGetScore(ln) : 0;
+                handler->emitResultFromCBuffer(handler, ele, sdslen(ele), score);
             }
             ln = reverse ? zbtIterPrev(&it) : zbtIterNext(&it);
         }
@@ -3252,16 +3249,55 @@ void zrevrangeCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_RANK, ZRANGE_DIRECTION_REVERSE);
 }
 
+/* True when walking from an in-range start toward this end cannot hit the
+ * opposite score bound before the tree ends. Exclusive ±inf still includes
+ * every finite score. */
+static int zrangeScoreOpenEnd(const zrangespec *range, int reverse) {
+    /* Exclusive ±inf still excludes an element whose score is that infinity. */
+    if (reverse)
+        return !range->minex && isinf(range->min) && range->min < 0.0;
+    return !range->maxex && isinf(range->max) && range->max > 0.0;
+}
+
+/* If the next 'want' elements from 1-based 'rank' stay in range, return that
+ * count and set *skip_bound. Otherwise return -1 (caller uses a deferred reply
+ * and per-element bound checks). */
+static long zbtScoreRangeKnownLen(zbtree *t, zrangespec *range,
+                                  unsigned long rank, int reverse,
+                                  long limit, int *skip_bound)
+{
+    unsigned long remaining = reverse ? rank : (t->length - rank + 1);
+    unsigned long want;
+
+    *skip_bound = 0;
+    if (limit < 0 || (unsigned long)limit >= remaining)
+        want = remaining;
+    else
+        want = (unsigned long)limit;
+    if (want == 0) return 0;
+
+    if (!zrangeScoreOpenEnd(range, reverse)) {
+        unsigned long far_rank = reverse ? (rank - want + 1) : (rank + want - 1);
+        zbtElem *far = zbtElemByRank(t, far_rank, NULL);
+        double s;
+        if (far == NULL) return -1;
+        s = zbtGetScore(far);
+        if (!zslValueGteMin(s, range) || !zslValueLteMax(s, range))
+            return -1;
+    }
+    *skip_bound = 1;
+    return (long)want;
+}
+
 /* This command implements ZRANGEBYSCORE, ZREVRANGEBYSCORE. */
 void genericZrangebyscoreCommand(zrange_result_handler *handler,
     zrangespec *range, robj *zobj, long offset, long limit, 
     int reverse) {
     unsigned long rangelen = 0;
 
-    handler->beginResultEmission(handler, -1);
-
     /* For invalid offset, return directly. */
     if (offset < 0 || (offset > 0 && offset >= (long)zsetLength(zobj))) {
+        handler->beginResultEmission(handler, 0);
         handler->finalizeResultEmission(handler, 0);
         return;
     }
@@ -3272,6 +3308,8 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
         unsigned char *vstr;
         unsigned int vlen;
         long long vlong;
+
+        handler->beginResultEmission(handler, -1);
 
         /* If reversed, get the last node in range as starting point. */
         if (reverse) {
@@ -3324,22 +3362,40 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
         zbtree *t = zs->tree;
         zbtIter it;
         zbtElem *ln;
+        unsigned long rank = 0;
+        int skip_bound = 0;
+        long known_len = -1;
 
         /* If reversed, get the last node in range as starting point. */
         if (reverse) {
-            ln = zbtNthInRange(t, range, -offset-1, NULL, &it);
+            ln = zbtNthInRange(t, range, -offset-1, &rank, &it);
         } else {
-            ln = zbtNthInRange(t, range, offset, NULL, &it);
+            ln = zbtNthInRange(t, range, offset, &rank, &it);
         }
 
-        while (ln && limit--) {
-            double score = zbtGetScore(ln);
+        if (ln == NULL || limit == 0) {
+            known_len = 0;
+            ln = NULL;
+        } else {
+            known_len = zbtScoreRangeKnownLen(t, range, rank, reverse, limit,
+                                             &skip_bound);
+        }
+        handler->beginResultEmission(handler, known_len);
 
-            /* Abort when the node is no longer in range. */
-            if (reverse) {
-                if (!zslValueGteMin(score,range)) break;
-            } else {
-                if (!zslValueLteMax(score,range)) break;
+        while (ln && limit--) {
+            double score = 0;
+
+            /* Bound checks (and score decode) are skipped when the far end of
+             * this emit is already known to sit in range. */
+            if (!skip_bound || (handler->withscores && !handler->emitResultFromElem))
+                score = zbtGetScore(ln);
+
+            if (!skip_bound) {
+                if (reverse) {
+                    if (!zslValueGteMin(score,range)) break;
+                } else {
+                    if (!zslValueLteMax(score,range)) break;
+                }
             }
 
             rangelen++;
