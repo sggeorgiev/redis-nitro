@@ -204,12 +204,10 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             }
         } else if (o->encoding == OBJ_ENCODING_BTREE) {
             zset *zs = o->ptr;
-            dictIterator di;
-            dictEntry *de;
+            zbtIter it;
+            zbtElem *znode;
 
-            dictInitIterator(&di, zs->dict);
-            while((de = dictNext(&di)) != NULL) {
-                zbtElem *znode = dictGetKey(de);
+            for (znode = zbtFirst(zs->tree, &it); znode; znode = zbtIterNext(&it)) {
                 sds sdsele = zbtGetEle(znode);
                 const int len = fpconv_dtoa(zbtGetScore(znode), buf);
                 buf[len] = '\0';
@@ -218,7 +216,6 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
                 mixDigest(eledigest,buf,strlen(buf));
                 xorDigest(digest,eledigest,20);
             }
-            dictResetIterator(&di);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
@@ -1053,12 +1050,6 @@ NULL
 
         /* Get the hash table reference from the object, if possible. */
         switch (o->encoding) {
-        case OBJ_ENCODING_BTREE:
-            {
-                zset *zs = o->ptr;
-                ht = zs->dict;
-            }
-            break;
         case OBJ_ENCODING_HT:
             ht = o->ptr;
             break;

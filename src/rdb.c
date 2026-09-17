@@ -3059,19 +3059,41 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         o = createZsetObject();
         zs = o->ptr;
 
-        if (zsetlen > DICT_HT_INITIAL_SIZE && dictTryExpand(zs->dict,zsetlen) != DICT_OK) {
-            rdbReportCorruptRDB("OOM in dictTryExpand %llu", (unsigned long long)zsetlen);
+        /* Load every element into a detached buffer, checking membership
+         * uniqueness *before* handing ownership to the tree. The tree is then
+         * built bottom-up in a single O(N) pass. */
+        dictType seenType = {
+            dictSdsHash, NULL, NULL, dictSdsKeyCompare,
+            NULL, NULL, NULL,
+            .no_value = 1,
+            .keyFromStoredKey = zbtGetEleForDict,
+        };
+        dict *seen = dictCreate(&seenType);
+        uint64_t total = zsetlen;
+        if (total > ULONG_MAX ||
+            dictTryExpand(seen, (unsigned long)total) != DICT_OK)
+        {
+            rdbReportCorruptRDB("OOM in duplicate index for zset of length %llu",
+                                (unsigned long long)total);
+            dictRelease(seen);
             decrRefCount(o);
             return NULL;
         }
-
-        /* Load every element into a detached buffer, checking membership
-         * uniqueness *before* handing ownership to the tree. The tree is then
-         * built bottom-up in a single O(N) pass. The dict is populated as we go
-         * (its key destructor is NULL, so the buffered elements below are still
-         * owned by us until zbtBuildFromSorted() takes them). */
-        uint64_t total = zsetlen;
-        zbtElem **elems = zmalloc(sizeof(zbtElem *) * total);
+        if (total > SIZE_MAX / sizeof(zbtElem *)) {
+            rdbReportCorruptRDB("Invalid zset length %llu",
+                                (unsigned long long)total);
+            dictRelease(seen);
+            decrRefCount(o);
+            return NULL;
+        }
+        zbtElem **elems = ztrymalloc(sizeof(zbtElem *) * (size_t)total);
+        if (elems == NULL) {
+            rdbReportCorruptRDB("OOM loading zset of length %llu",
+                                (unsigned long long)total);
+            dictRelease(seen);
+            decrRefCount(o);
+            return NULL;
+        }
         uint64_t loaded = 0;
         while(zsetlen--) {
             sds sdsele;
@@ -3103,21 +3125,34 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
             totelelen += sdslen(sdsele);
 
-            znode = zbtCreateElemWithHash(score, sdsele, sdslen(sdsele), 0, NULL, NULL);
-            sdsfree(sdsele); /* zbtCreateElem copies the sds into the element. */
-            uint64_t hash = zbtElemHash(znode);
-            dictEntryLink bucket, link;
-            link = dictFindLinkByHash(zs->dict, zbtGetEle(znode), hash, &bucket);
-            if (link != NULL) {
+            uint64_t hash = dictSdsHash(sdsele);
+            dictEntryLink bucket;
+            if (dictFindLinkByHash(seen, sdsele, hash, &bucket) != NULL) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
-                zbtFreeElem(znode);
+                sdsfree(sdsele);
                 goto zseterr;
             }
-            dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
+            znode = zbtCreateElemWithHash(score, sdsele, sdslen(sdsele), 0,
+                                          NULL, &hash);
+            dictSetKeyAtLink(seen, znode, &bucket, 1);
+            sdsfree(sdsele); /* zbtCreateElem copies the sds into the element. */
             elems[loaded++] = znode;
             continue;
 
         zseterr:
+            dictRelease(seen);
+            for (uint64_t i = 0; i < loaded; i++) zbtFreeElem(elems[i]);
+            zfree(elems);
+            decrRefCount(o);
+            return NULL;
+        }
+
+        /* Release the temporary duplicate index before allocating the final
+         * member index, keeping peak load memory close to the final object. */
+        dictRelease(seen);
+        if (!zbtIndexTryReserve(zs->tree, (unsigned long)loaded)) {
+            rdbReportCorruptRDB("OOM in member index for zset of length %llu",
+                                (unsigned long long)loaded);
             for (uint64_t i = 0; i < loaded; i++) zbtFreeElem(elems[i]);
             zfree(elems);
             decrRefCount(o);

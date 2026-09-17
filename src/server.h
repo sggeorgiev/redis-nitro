@@ -1921,19 +1921,45 @@ static inline uint64_t zbtElemHash(const zbtElem *e) {
 /* B+ tree node is opaque outside zbtree.c. */
 typedef struct zbtNode zbtNode;
 
+/* Open-addressed member index (see zbtree.c). Buckets are 16- or 32-bit
+ * leaf IDs; the concrete bucket type is private to zbtree.c. */
+typedef struct zbtIndexTable {
+    void *buckets;
+    unsigned long size;       /* buckets, power of two */
+    unsigned long used;       /* live entries */
+    unsigned long filled;     /* live + tombstones */
+    int wide_ids;
+    uint32_t scan_revision;
+} zbtIndexTable;
+
+typedef struct zbtIndexRehash {
+    zbtIndexTable table;
+    uint32_t next_leaf_id;
+    uint16_t resize_id;
+} zbtIndexRehash;
+
 typedef struct zbtree {
     zbtNode *root;
     zbtNode *head;          /* leftmost leaf (minimum) */
     zbtNode *tail;          /* rightmost leaf (maximum) */
     unsigned long length;
     size_t alloc_size;      /* total tracked memory used by the tree */
-    /* Active-defrag incremental node relocation bookmark. When node
-     * relocation is split across multiple time-bounded steps, this records
-     * the (score, member) of the first element of the next leaf to relocate,
-     * so it survives structural mutations between steps. NULL means "start
-     * from the head". Owned by the tree and freed in zbtFree(). */
+    /* Active-defrag bookmark. During incremental node relocation this records
+     * the first element of the next leaf; during element relocation it records
+     * the next element itself. The (score, member) key survives structural
+     * mutations between slices. NULL means "start from the head". */
     sds defrag_resume;
     double defrag_resume_score;
+    /* Open-addressed by-name index. Hash slots store a tag plus leaf ID;
+     * table_to_leaf translates the ID to the current leaf pointer. */
+    zbtIndexTable member_index;
+    zbtIndexRehash *member_rehash;
+    struct zbtLeaf **table_to_leaf;
+    uint32_t score_leaf_cap;
+    uint32_t next_score_leaf_id;
+    uint32_t free_score_leaf_id;
+    uint32_t member_revision;
+    zbtElem *pending_insert; /* not yet in the index (insert/split) */
 } zbtree;
 
 /* Lightweight position used for O(1) forward/backward range iteration. */
@@ -1943,7 +1969,6 @@ typedef struct zbtIter {
 } zbtIter;
 
 typedef struct zset {
-    dict *dict;
     zbtree *tree;
 } zset;
 
@@ -3330,7 +3355,15 @@ extern dictType objectKeyNoValueDictType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern dictType setDictType;
 extern dictType BenchmarkDictType;
-extern dictType zsetDictType;
+typedef struct zbtreeInsertPosition {
+    void *bucket;
+    unsigned int pos;
+    uint32_t hash;
+    uint32_t revision;
+} zbtreeInsertPosition;
+
+typedef void zbtScanFunction(void *privdata, const unsigned char *ele,
+                             size_t len, double score);
 extern dictType dbDictType;
 extern double R_Zero, R_PosInf, R_NegInf, R_Nan;
 extern dictType hashDictType;
@@ -3929,26 +3962,41 @@ void zbtBuildFromSortedWithSize(zbtree *t, zbtElem **elems, unsigned long n,
                                 size_t elems_alloc_size);
 zbtElem *zbtInsert(zbtree *t, double score, sds ele);
 zbtElem *zbtInsertWithHash(zbtree *t, double score, sds ele, const uint64_t *known_hash);
+zbtElem *zbtInsertWithHashAt(zbtree *t, double score, sds ele, const uint64_t *known_hash,
+                             const zbtreeInsertPosition *position);
 void zbtDeleteElem(zbtree *t, zbtElem *e);
 zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore);
 int zbtCompare(double score, sds ele, const zbtElem *e);
 const void *zbtGetEleForDict(const void *elem);
+zbtElem *zbtFindMember(zbtree *t, sds ele, zbtreeInsertPosition *position);
+zbtElem *zbtFindMemberHash(zbtree *t, sds ele, uint32_t hash,
+                           zbtreeInsertPosition *position);
+void zbtIndexReserve(zbtree *t, unsigned long count);
+int zbtIndexTryReserve(zbtree *t, unsigned long count);
+void zbtIndexMaintenance(zbtree *t, unsigned int steps);
+void zbtIndexIndexTree(zbtree *t);
+zbtElem *zbtRandomElem(zbtree *t);
+uint64_t zbtScan(zbtree *t, uint64_t cursor, unsigned long count,
+                 zbtScanFunction *fn, void *privdata);
+void zbtDismissIndex(zbtree *t);
 unsigned long zbtRankByElem(zbtree *t, zbtElem *e);
 unsigned long zbtGetRank(zbtree *t, double score, sds ele);
 zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it);
 zbtElem *zbtElemByEndOffset(zbtree *t, unsigned long offset, int reverse, zbtIter *it);
 zbtElem *zbtFirst(zbtree *t, zbtIter *it);
 zbtElem *zbtLast(zbtree *t, zbtIter *it);
+zbtElem *zbtSeekGE(zbtree *t, double score, sds ele, zbtIter *it);
 zbtElem *zbtIterNext(zbtIter *it);
 zbtElem *zbtIterPrev(zbtIter *it);
 zbtElem *zbtNthInRange(zbtree *t, zrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
 zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n, unsigned long *out_rank, zbtIter *it);
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d);
-unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned long start, unsigned long end, dict *d);
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range);
+unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range);
+unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned long start, unsigned long end);
 void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe);
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *));
 int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budget);
+void zbtDefragIndex(zbtree *t, void *(*fn)(void *));
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score);
 double zzlGetScore(unsigned char *sptr);
 void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
@@ -3963,7 +4011,6 @@ robj *zsetCreateFromElems(robj *reuse, zbtElem **elems, unsigned long n,
                           size_t maxelelen, size_t totelelen, int dict_indexed);
 void zsetFreeDetachedElems(zbtElem **elems, unsigned long n, int allow_async);
 void zsetBuildTreeFromElems(zset *zs, zbtElem **elems, unsigned long n);
-void zsetBuildTreeFromDict(zset *zs);
 int zsetScore(robj *zobj, sds member, double *score);
 int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore);
 long zsetRank(robj *zobj, sds ele, int reverse, double *score);

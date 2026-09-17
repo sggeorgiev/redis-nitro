@@ -1671,6 +1671,29 @@ int objectTypeCompare(robj *o, long long target) {
     else 
         return 1;
 }
+
+typedef struct {
+    client *c;
+    sds pat;
+    size_t patlen;
+    int use_pattern;
+    unsigned long emitted;
+} zsetBtreeScanData;
+
+static void zsetBtreeScanReply(void *privdata, const unsigned char *ele,
+                               size_t len, double score)
+{
+    zsetBtreeScanData *data = privdata;
+    if (data->use_pattern &&
+        !stringmatchlen(data->pat, data->patlen, (char *)ele, (int)len, 0))
+        return;
+    addReplyBulkCBuffer(data->c, ele, len);
+    char buf[MAX_D2STRING_CHARS];
+    int slen = d2string(buf, sizeof(buf), score);
+    addReplyBulkCBuffer(data->c, buf, slen);
+    data->emitted += 2;
+}
+
 /* This callback is used by scanGenericCommand in order to collect elements
  * returned by the dictionary iterator into a list. */
 void scanCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
@@ -1905,8 +1928,19 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
     } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HT) {
         ht = o->ptr;
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
+        zsetBtreeScanData data = {c, pat, patlen, use_pattern, 0};
+        addReplyArrayLen(c, 2);
+        void *cursor_reply = addReplyDeferredLen(c);
+        void *replylen = addReplyDeferredLen(c);
         zset *zs = o->ptr;
-        ht = zs->dict;
+        uint64_t next = zbtScan(zs->tree, cursor, (unsigned long)count,
+                                zsetBtreeScanReply, &data);
+        char cursor_buf[LONG_STR_SIZE];
+        int cursor_len = ull2string(cursor_buf, sizeof(cursor_buf), next);
+        setDeferredReplyBulkSds(c, cursor_reply,
+                                sdsnewlen(cursor_buf, cursor_len));
+        setDeferredArrayLen(c, replylen, data.emitted);
+        return;
     }
 
     vec keys;

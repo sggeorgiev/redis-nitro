@@ -5303,6 +5303,8 @@ int RM_ZsetRem(RedisModuleKey *key, RedisModuleString *ele, int *deleted) {
         oldsize = kvobjAllocSize(key->kv);
     if (zsetDel(key->kv,ele->ptr)) {
         if (deleted) *deleted = 1;
+        if (key->kv->encoding == OBJ_ENCODING_BTREE)
+            zbtIndexMaintenance(((zset *)key->kv->ptr)->tree, 1);
         int64_t l = (int64_t) zsetLength(key->kv);
         updateKeysizesHist(key->db, OBJ_ZSET, l+1, l);
         if (server.memory_tracking_enabled)
@@ -12311,6 +12313,35 @@ typedef struct {
     RedisModuleScanKeyCB fn;
 } ScanKeyCBData;
 
+typedef struct {
+    robj *field;
+    double score;
+} BtreeScanItem;
+
+typedef struct {
+    BtreeScanItem *items;
+    size_t count;
+    size_t capacity;
+} BtreeScanData;
+
+/* B+ tree leaves may move if module code changes the sorted set. Collect one
+ * small batch before calling the module so no tree pointer survives a
+ * callback. */
+static void moduleBtreeScanCollect(void *privdata, const unsigned char *ele,
+                                   size_t len, double score)
+{
+    BtreeScanData *data = privdata;
+    if (data->count == data->capacity) {
+        data->capacity = data->capacity ? data->capacity * 2 : 64;
+        data->items = zrealloc(data->items,
+                               data->capacity * sizeof(*data->items));
+    }
+
+    data->items[data->count].field = createStringObject((char *)ele, len);
+    data->items[data->count].score = score;
+    data->count++;
+}
+
 static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntryLink plink) {
     UNUSED(plink);
     ScanKeyCBData *data = privdata;
@@ -12405,8 +12436,7 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
         if (kv->encoding == OBJ_ENCODING_HT)
             ht = kv->ptr;
     } else if (kv->type == OBJ_ZSET) {
-        if (kv->encoding == OBJ_ENCODING_BTREE)
-            ht = ((zset *)kv->ptr)->dict;
+        /* B+ tree zsets use zbtScan below, not a dict. */
     } else {
         errno = EINVAL;
         return 0;
@@ -12461,6 +12491,38 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
         cursor->cursor = 1;
         cursor->done = 1;
         ret = 0;
+    } else if (kv->type == OBJ_ZSET &&
+               kv->encoding == OBJ_ENCODING_BTREE)
+    {
+        BtreeScanData data = {0};
+        zset *zs = kv->ptr;
+        cursor->cursor = zbtScan(zs->tree, cursor->cursor, 64,
+                                 moduleBtreeScanCollect, &data);
+
+        size_t i = 0;
+        for (; i < data.count; i++) {
+            robj *value = createStringObjectFromLongDouble(data.items[i].score, 0);
+            fn(key, data.items[i].field, value, privdata);
+            decrRefCount(value);
+            decrRefCount(data.items[i].field);
+
+            /* Removing the current member is safe. If the callback removes the
+             * key or changes its encoding, this B+ tree cursor has no meaning. */
+            if (key->kv != kv || kv->encoding != OBJ_ENCODING_BTREE) {
+                cursor->cursor = 0;
+                cursor->done = 1;
+                ret = 0;
+                i++;
+                break;
+            }
+        }
+        while (i < data.count) decrRefCount(data.items[i++].field);
+        zfree(data.items);
+
+        if (cursor->cursor == 0) {
+            cursor->done = 1;
+            ret = 0;
+        }
     } else if (kv->type == OBJ_ZSET || kv->type == OBJ_HASH) {
         unsigned char *lp, *p;
         /* is hash with expiry on fields, then lp tuples are [field][value][expire] */

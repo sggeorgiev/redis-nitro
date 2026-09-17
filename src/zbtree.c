@@ -3,8 +3,9 @@
  *
  * Design goals (see the ZSET encoding notes in server.h):
  *   - Elements are ordered by (score, member) exactly like the old skiplist.
- *   - Each member is a single heap object (zbtElem) with an embedded SDS, so
- *     the ZSET dict can keep mapping member -> zbtElem* for O(1) score lookup.
+ *   - Each member is a single heap object (zbtElem) with an embedded SDS.
+ *   - Membership is an open-addressed table of (tag, leaf ID) plus
+ *     table_to_leaf[], not a companion dict.
  *   - Leaves are packed arrays of zbtElem pointers, doubly linked so range
  *     scans walk contiguous memory instead of chasing skiplist pointers.
  *   - Internal nodes carry per-child subtree sizes, giving O(log N) rank and
@@ -20,6 +21,7 @@
 
 #include "server.h"
 #include <math.h>
+#include <string.h>
 
 /* Fanout of the tree. Nodes are allowed to temporarily hold one extra slot
  * (hence the "+1" sized arrays) before they are split.
@@ -56,6 +58,21 @@
  * used before the tree replaced it. */
 #define ZBT_RANGE_WALK_MAX 10
 
+/* Member lookup uses an open addressed table with eight slots per bucket. */
+#define ZBT_INDEX_BUCKET_ITEMS 8
+#define ZBT_INDEX_INITIAL_BUCKETS 4
+#define ZBT_INDEX_MAX_LOAD_NUM 31
+#define ZBT_INDEX_MAX_LOAD_DEN 32
+#define ZBT_INDEX_MIN_LOAD_NUM 1
+#define ZBT_INDEX_MIN_LOAD_DEN 8
+#define ZBT_INDEX_MAX_FILLED_NUM 63
+#define ZBT_INDEX_MAX_FILLED_DEN 64
+#define ZBT_INDEX_DELETED_ID UINT32_MAX
+#define ZBT_INDEX_WIDE_ID_AT (UINT16_MAX / 2)
+#define ZBT_NEW_LEAF_ID UINT32_MAX
+#define ZBT_NO_LEAF_ID UINT32_MAX
+#define ZBT_SCAN_BUCKETS_PER_STEP 4
+
 /* Common node header. Both leaf and inner nodes start with it so that a
  * zbtNode* can be inspected polymorphically. */
 struct zbtNode {
@@ -67,8 +84,16 @@ struct zbtNode {
 typedef struct zbtLeaf {
     zbtNode n;
     struct zbtLeaf *prev, *next;         /* sibling leaves (sorted order) */
+    uint32_t id;
+    uint16_t index_resize;               /* resize that copied this leaf, 0 if none */
+    uint8_t tags[ZBT_LEAF_MAX + 1];      /* hash >> 24, not folded */
     zbtElem *elems[ZBT_LEAF_MAX + 1];
 } zbtLeaf;
+
+#define ZBT_FREE_LEAF_ID(next) \
+    ((zbtLeaf *)((((uintptr_t)(next)) << 1) | 1))
+#define ZBT_IS_FREE_LEAF_ID(ptr) (((uintptr_t)(ptr) & 1) != 0)
+#define ZBT_NEXT_FREE_LEAF_ID(ptr) ((uint32_t)((uintptr_t)(ptr) >> 1))
 
 
 typedef struct zbtInner {
@@ -77,6 +102,23 @@ typedef struct zbtInner {
     unsigned long csize[ZBT_INNER_MAX + 1]; /* subtree element count of child[i] */
     zbtElem *sep[ZBT_INNER_MAX + 1];        /* minimum element of child[i] */
 } zbtInner;
+
+typedef struct zbtIndexBucket16 {
+    uint64_t tags;
+    uint64_t home_tags;
+    uint16_t id[ZBT_INDEX_BUCKET_ITEMS];
+} zbtIndexBucket16;
+
+typedef struct zbtIndexBucket32 {
+    uint64_t tags;
+    uint64_t home_tags;
+    uint32_t id[ZBT_INDEX_BUCKET_ITEMS];
+} zbtIndexBucket32;
+
+typedef union zbtIndexBucket {
+    zbtIndexBucket16 narrow;
+    zbtIndexBucket32 wide;
+} zbtIndexBucket;
 
 /*-----------------------------------------------------------------------------
  * Element allocation
@@ -305,6 +347,992 @@ const void *zbtGetEleForDict(const void *elem) {
     return zbtGetEle((const zbtElem *)elem);
 }
 
+static uint32_t zbtElemIndexHash(const zbtElem *e) {
+    return (uint32_t)zbtElemHash(e);
+}
+
+static uint8_t zbtElemLeafTag(const zbtElem *e) {
+    return (uint8_t)(zbtElemIndexHash(e) >> 24);
+}
+
+static void zbtLeafSetElem(zbtLeaf *lf, int idx, zbtElem *e) {
+    lf->elems[idx] = e;
+    lf->tags[idx] = zbtElemLeafTag(e);
+    e->leaf = lf;
+}
+
+static void *zbtAlloc(zbtree *t, size_t bytes) {
+    size_t usable;
+    void *ptr = zmalloc_usable(bytes, &usable);
+    t->alloc_size += usable;
+    return ptr;
+}
+
+static void zbtFreeAllocation(zbtree *t, void *ptr) {
+    size_t usable;
+    zfree_usable(ptr, &usable);
+    t->alloc_size -= usable;
+}
+
+static uint32_t zbtIndexNextRevision(void) {
+    static uint32_t revision = 0;
+    if (++revision == 0) revision++;
+    return revision;
+}
+
+static void zbtIndexInvalidateScan(zbtree *t) {
+    if (t->member_index.size)
+        t->member_index.scan_revision = zbtIndexNextRevision();
+}
+
+static void zbtRegisterLeaf(zbtree *t, zbtLeaf *leaf, uint32_t id);
+static void zbtReleaseLeafId(zbtree *t, uint32_t id);
+static int zbtIndexMove(zbtree *t, uint32_t hash, uint32_t old_leaf_id,
+                        uint32_t new_leaf_id, int target_is_incomplete,
+                        int *target_was_copied);
+static void zbtIndexInsert(zbtree *t, uint32_t hash, uint32_t leaf_id,
+                           const zbtreeInsertPosition *position);
+static int zbtIndexRehashStep(zbtree *t, int steps);
+static void zbtIndexExpandIfNeeded(zbtree *t, unsigned long add);
+static void zbtIndexShrinkIfNeeded(zbtree *t);
+static void zbtIndexTableRelease(zbtree *t, zbtIndexTable *table);
+static void zbtIndexTableInsertRaw(zbtIndexTable *table, uint32_t hash,
+                                   uint32_t id);
+static int zbtIndexFindReference(zbtree *t, uint32_t hash, uint32_t leaf_id,
+                                 zbtIndexBucket **found_bucket,
+                                 unsigned int *found_pos);
+static void zbtIndexDeleteAt(zbtree *t, zbtIndexBucket *bucket,
+                             unsigned int pos);
+static int zbtIndexLeafMigrated(const zbtree *t, const zbtLeaf *leaf);
+
+static void zbtIndexMoveElem(zbtree *t, zbtElem *e, uint32_t old_id,
+                             uint32_t new_id, int incomplete, int *copied)
+{
+    if (old_id == new_id) return;
+    uint32_t hash = zbtElemIndexHash(e);
+    if (!zbtIndexMove(t, hash, old_id, new_id, incomplete, copied)) {
+        if (t->pending_insert == e) return;
+        zbtIndexBucket *bucket;
+        unsigned int pos;
+        if (zbtIndexFindReference(t, hash, new_id, &bucket, &pos)) return;
+        zbtIndexTable *table = t->member_rehash ?
+            &t->member_rehash->table : &t->member_index;
+        zbtIndexTableInsertRaw(table, hash, new_id);
+    }
+}
+
+static void zbtIndexMoveRange(zbtree *t, zbtLeaf *dst, int from, int n,
+                              uint32_t old_id, int incomplete, int *copied)
+{
+    for (int i = 0; i < n; i++)
+        zbtIndexMoveElem(t, dst->elems[from + i], old_id, dst->id,
+                         incomplete, copied);
+}
+
+static int zbtLeafFindMember(zbtLeaf *leaf, uint32_t hash,
+                             const unsigned char *ele, size_t elelen,
+                             unsigned int *score_pos)
+{
+    uint8_t tag = (uint8_t)(hash >> 24);
+    uint8_t *tags = leaf->tags;
+    unsigned int count = leaf->n.count;
+    uint8_t *p = tags;
+    uint8_t *end = tags + count;
+    while (p < end && (p = memchr(p, tag, (size_t)(end - p))) != NULL) {
+        unsigned int i = (unsigned int)(p - tags);
+        zbtElem *e = leaf->elems[i];
+        if (zbtHasCachedHash(e) && (uint32_t)zbtGetCachedHash(e) != hash) {
+            p++;
+            continue;
+        }
+        sds s = zbtGetEle(e);
+        if (sdslen(s) == elelen && memcmp(s, ele, elelen) == 0) {
+            if (score_pos) *score_pos = i;
+            return 1;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static unsigned long zbtIndexSlots(const zbtIndexTable *table) {
+    return table->size * ZBT_INDEX_BUCKET_ITEMS;
+}
+
+static size_t zbtIndexBucketBytes(const zbtIndexTable *table) {
+    return table->wide_ids ? sizeof(zbtIndexBucket32) : sizeof(zbtIndexBucket16);
+}
+
+static size_t zbtIndexTableBytes(const zbtIndexTable *table) {
+    return table->size * zbtIndexBucketBytes(table);
+}
+
+static inline zbtIndexBucket *zbtIndexBucketAt(const zbtIndexTable *table,
+                                               unsigned long index)
+{
+    return (zbtIndexBucket *)((unsigned char *)table->buckets +
+           index * zbtIndexBucketBytes(table));
+}
+
+static inline uint64_t *zbtIndexHomeTagsAt(const zbtIndexTable *table,
+                                           unsigned long index)
+{
+    return &zbtIndexBucketAt(table, index)->narrow.home_tags;
+}
+
+static inline uint32_t zbtIndexGetId(const zbtIndexTable *table,
+                                     const zbtIndexBucket *bucket,
+                                     unsigned int pos)
+{
+    if (table->wide_ids) return bucket->wide.id[pos];
+    uint16_t id = bucket->narrow.id[pos];
+    return id == UINT16_MAX ? ZBT_INDEX_DELETED_ID : id;
+}
+
+static inline uint64_t zbtIndexTags(const zbtIndexBucket *bucket) {
+    return bucket->narrow.tags;
+}
+
+static inline void zbtIndexSetId(const zbtIndexTable *table,
+                                 zbtIndexBucket *bucket, unsigned int pos,
+                                 uint32_t id)
+{
+    if (table->wide_ids) {
+        bucket->wide.id[pos] = id;
+    } else {
+        serverAssert(id == ZBT_INDEX_DELETED_ID || id < UINT16_MAX);
+        bucket->narrow.id[pos] = id == ZBT_INDEX_DELETED_ID ?
+                                 UINT16_MAX : (uint16_t)id;
+    }
+}
+
+static inline uint8_t zbtIndexTag(uint32_t hash) {
+    uint8_t tag = hash >> 24;
+    return tag ? tag : 1;
+}
+
+static inline uint64_t zbtIndexTagBits(uint8_t tag) {
+    uint64_t mixed = (uint64_t)tag * UINT64_C(0x9e3779b97f4a7c15);
+    return (UINT64_C(1) << (tag & 63)) |
+           (UINT64_C(1) << (mixed >> 58)) |
+           (UINT64_C(1) << ((mixed >> 36) & 63));
+}
+
+static inline void zbtIndexRecordHomeTag(zbtIndexTable *table, uint32_t hash) {
+    unsigned long home = hash & (table->size - 1);
+    *zbtIndexHomeTagsAt(table, home) |= zbtIndexTagBits(zbtIndexTag(hash));
+}
+
+static inline int zbtIndexHomeMayContain(const zbtIndexTable *table,
+                                         uint32_t hash)
+{
+    unsigned long home = hash & (table->size - 1);
+    uint64_t bits = zbtIndexTagBits(zbtIndexTag(hash));
+    return (*zbtIndexHomeTagsAt(table, home) & bits) == bits;
+}
+
+static inline uint64_t zbtIndexTagMask(uint64_t tags, uint8_t tag) {
+    uint64_t x = tags ^ (UINT64_C(0x0101010101010101) * tag);
+    return (x - UINT64_C(0x0101010101010101)) & ~x &
+           UINT64_C(0x8080808080808080);
+}
+
+static inline unsigned int zbtIndexFirstTag(uint64_t mask) {
+    return (unsigned int)(__builtin_ctzll(mask) >> 3);
+}
+
+static inline void zbtIndexSetTag(zbtIndexBucket *bucket, unsigned int pos,
+                                  uint8_t tag)
+{
+    uint64_t shift = pos * 8;
+    bucket->narrow.tags =
+        (zbtIndexTags(bucket) & ~(UINT64_C(0xff) << shift)) |
+        ((uint64_t)tag << shift);
+}
+
+static unsigned long zbtIndexNextPower(unsigned long size) {
+    unsigned long result = ZBT_INDEX_INITIAL_BUCKETS;
+    while (result < size) {
+        if (result > ULONG_MAX / 2) return 0;
+        result <<= 1;
+    }
+    return result;
+}
+
+static unsigned long zbtIndexBucketsForElements(unsigned long elements) {
+    if (elements == 0) return ZBT_INDEX_INITIAL_BUCKETS;
+    unsigned long quotient = elements / ZBT_INDEX_MAX_LOAD_NUM;
+    unsigned long remainder = elements % ZBT_INDEX_MAX_LOAD_NUM;
+    if (quotient > ULONG_MAX / ZBT_INDEX_MAX_LOAD_DEN) return 0;
+    unsigned long slots = quotient * ZBT_INDEX_MAX_LOAD_DEN;
+    unsigned long extra =
+        (remainder * ZBT_INDEX_MAX_LOAD_DEN + ZBT_INDEX_MAX_LOAD_NUM - 1) /
+        ZBT_INDEX_MAX_LOAD_NUM;
+    if (slots > ULONG_MAX - extra) return 0;
+    slots += extra;
+    unsigned long buckets = slots / ZBT_INDEX_BUCKET_ITEMS +
+                            (slots % ZBT_INDEX_BUCKET_ITEMS != 0);
+    return zbtIndexNextPower(buckets);
+}
+
+static void zbtIndexTableInit(zbtree *t, zbtIndexTable *table,
+                              unsigned long buckets, int wide_ids)
+{
+    memset(table, 0, sizeof(*table));
+    table->size = zbtIndexNextPower(buckets);
+    serverAssert(table->size != 0);
+    table->wide_ids = wide_ids;
+    table->scan_revision = zbtIndexNextRevision();
+    size_t bytes = zbtIndexTableBytes(table);
+    size_t usable;
+    table->buckets = zcalloc_usable(bytes, &usable);
+    t->alloc_size += usable;
+}
+
+static int zbtIndexTableTryInit(zbtree *t, zbtIndexTable *table,
+                                unsigned long buckets, int wide_ids)
+{
+    memset(table, 0, sizeof(*table));
+    table->size = zbtIndexNextPower(buckets);
+    if (table->size == 0) return 0;
+    table->wide_ids = wide_ids;
+    size_t bucket_bytes = zbtIndexBucketBytes(table);
+    if (table->size > SIZE_MAX / bucket_bytes) {
+        memset(table, 0, sizeof(*table));
+        return 0;
+    }
+    size_t usable;
+    table->buckets = ztrycalloc_usable(table->size * bucket_bytes, &usable);
+    if (table->buckets == NULL) {
+        memset(table, 0, sizeof(*table));
+        return 0;
+    }
+    table->scan_revision = zbtIndexNextRevision();
+    t->alloc_size += usable;
+    return 1;
+}
+
+static void zbtIndexTableRelease(zbtree *t, zbtIndexTable *table) {
+    if (table->buckets) zbtFreeAllocation(t, table->buckets);
+    memset(table, 0, sizeof(*table));
+}
+
+static void zbtRegisterLeaf(zbtree *t, zbtLeaf *leaf, uint32_t id) {
+    if (id == ZBT_NEW_LEAF_ID) {
+        if (t->free_score_leaf_id && t->member_rehash == NULL) {
+            id = t->free_score_leaf_id - 1;
+            serverAssert(ZBT_IS_FREE_LEAF_ID(t->table_to_leaf[id]));
+            t->free_score_leaf_id =
+                ZBT_NEXT_FREE_LEAF_ID(t->table_to_leaf[id]);
+        } else {
+            id = t->next_score_leaf_id++;
+            if (id == t->score_leaf_cap) {
+                uint32_t newcap = t->score_leaf_cap ? t->score_leaf_cap * 2 : 16;
+                size_t usable, old_usable = 0;
+                t->table_to_leaf = zrealloc_usable(
+                    t->table_to_leaf,
+                    newcap * sizeof(*t->table_to_leaf),
+                    &usable, &old_usable);
+                memset(t->table_to_leaf + t->score_leaf_cap, 0,
+                       (newcap - t->score_leaf_cap) *
+                       sizeof(*t->table_to_leaf));
+                t->score_leaf_cap = newcap;
+                t->alloc_size += usable - old_usable;
+            }
+        }
+    }
+    leaf->id = id;
+    t->table_to_leaf[id] = leaf;
+}
+
+static void zbtReleaseLeafId(zbtree *t, uint32_t id) {
+    serverAssert(id < t->next_score_leaf_id);
+    t->table_to_leaf[id] = ZBT_FREE_LEAF_ID(t->free_score_leaf_id);
+    t->free_score_leaf_id = id + 1;
+}
+
+static void zbtIndexTableInsertRaw(zbtIndexTable *table, uint32_t hash,
+                                   uint32_t id)
+{
+    uint8_t tag = zbtIndexTag(hash);
+    unsigned long mask = table->size - 1;
+    unsigned long index = hash & mask;
+
+    for (unsigned long probes = 0; probes < table->size; probes++) {
+        zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
+        for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++) {
+            uint8_t oldtag = (uint8_t)(zbtIndexTags(bucket) >> (pos * 8));
+            uint32_t oldid = zbtIndexGetId(table, bucket, pos);
+            if (oldtag == 0 || oldid == ZBT_INDEX_DELETED_ID) {
+                if (oldtag == 0) table->filled++;
+                zbtIndexSetTag(bucket, pos, tag);
+                zbtIndexSetId(table, bucket, pos, id);
+                table->used++;
+                zbtIndexRecordHomeTag(table, hash);
+                return;
+            }
+        }
+        index = (index + 1) & mask;
+    }
+    serverPanic("B+ tree member index has no free slot");
+}
+
+static zbtLeaf *zbtLeafFromId(zbtree *t, uint32_t id) {
+    if (id >= t->next_score_leaf_id) return NULL;
+    zbtLeaf *leaf = t->table_to_leaf[id];
+    if (leaf == NULL || ZBT_IS_FREE_LEAF_ID(leaf)) return NULL;
+    return leaf;
+}
+
+static int zbtIndexTableFind(zbtree *t, zbtIndexTable *table,
+                             uint32_t hash, const unsigned char *ele,
+                             size_t elelen,
+                             zbtLeaf **found_leaf, unsigned int *found_leaf_pos,
+                             zbtIndexBucket **found_bucket,
+                             unsigned int *found_pos,
+                             zbtIndexBucket **insert_bucket,
+                             unsigned int *insert_pos)
+{
+    if (table->size == 0) return 0;
+    if (!zbtIndexHomeMayContain(table, hash)) return 0;
+    uint8_t tag = zbtIndexTag(hash);
+    unsigned long mask = table->size - 1;
+    unsigned long index = hash & mask;
+    zbtIndexBucket *first_deleted = NULL;
+    unsigned int first_deleted_pos = 0;
+
+    for (unsigned long probes = 0; probes < table->size; probes++) {
+        zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
+        uint64_t matches = zbtIndexTagMask(zbtIndexTags(bucket), tag);
+        while (matches) {
+            unsigned int pos = zbtIndexFirstTag(matches);
+            if ((uint8_t)(zbtIndexTags(bucket) >> (pos * 8)) != tag) {
+                matches &= matches - 1;
+                continue;
+            }
+            uint32_t id = zbtIndexGetId(table, bucket, pos);
+            if (id != ZBT_INDEX_DELETED_ID) {
+                zbtLeaf *leaf = zbtLeafFromId(t, id);
+                if (leaf == NULL) {
+                    serverAssert(t->member_rehash &&
+                                 table == &t->member_index);
+                    matches &= matches - 1;
+                    continue;
+                }
+                serverAssert(leaf->id == id);
+                if (t->member_rehash) {
+                    int in_new = table == &t->member_rehash->table;
+                    int migrated = zbtIndexLeafMigrated(t, leaf);
+                    if (in_new != migrated) {
+                        matches &= matches - 1;
+                        continue;
+                    }
+                }
+                unsigned int leaf_pos;
+                if (zbtLeafFindMember(leaf, hash, ele, elelen, &leaf_pos)) {
+                    if (found_leaf) *found_leaf = leaf;
+                    if (found_leaf_pos) *found_leaf_pos = leaf_pos;
+                    if (found_bucket) *found_bucket = bucket;
+                    if (found_pos) *found_pos = pos;
+                    return 1;
+                }
+            }
+            matches &= matches - 1;
+        }
+
+        for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++) {
+            uint8_t oldtag = (uint8_t)(zbtIndexTags(bucket) >> (pos * 8));
+            if (oldtag == 0) {
+                if (insert_bucket) {
+                    *insert_bucket = first_deleted ? first_deleted : bucket;
+                    *insert_pos = first_deleted ? first_deleted_pos : pos;
+                }
+                return 0;
+            }
+            if (first_deleted == NULL &&
+                zbtIndexGetId(table, bucket, pos) == ZBT_INDEX_DELETED_ID)
+            {
+                first_deleted = bucket;
+                first_deleted_pos = pos;
+            }
+        }
+        index = (index + 1) & mask;
+    }
+    if (insert_bucket && first_deleted) {
+        *insert_bucket = first_deleted;
+        *insert_pos = first_deleted_pos;
+    }
+    return 0;
+}
+
+static int zbtIndexTableFindReference(zbtIndexTable *table, uint32_t hash,
+                                      uint32_t id,
+                                      zbtIndexBucket **found_bucket,
+                                      unsigned int *found_pos)
+{
+    if (table->size == 0) return 0;
+    if (!zbtIndexHomeMayContain(table, hash)) return 0;
+    uint8_t tag = zbtIndexTag(hash);
+    unsigned long mask = table->size - 1;
+    unsigned long index = hash & mask;
+
+    for (unsigned long probes = 0; probes < table->size; probes++) {
+        zbtIndexBucket *bucket = zbtIndexBucketAt(table, index);
+        uint64_t matches = zbtIndexTagMask(zbtIndexTags(bucket), tag);
+        while (matches) {
+            unsigned int pos = zbtIndexFirstTag(matches);
+            if ((uint8_t)(zbtIndexTags(bucket) >> (pos * 8)) == tag &&
+                zbtIndexGetId(table, bucket, pos) == id)
+            {
+                *found_bucket = bucket;
+                *found_pos = pos;
+                return 1;
+            }
+            matches &= matches - 1;
+        }
+        if (zbtIndexTagMask(zbtIndexTags(bucket), 0)) return 0;
+        index = (index + 1) & mask;
+    }
+    return 0;
+}
+
+static int zbtIndexStartResize(zbtree *t, unsigned long elements,
+                               int allow_same_size)
+{
+    if (t->member_rehash) return 0;
+    unsigned long buckets = zbtIndexBucketsForElements(elements);
+    serverAssert(buckets != 0);
+    if (buckets == t->member_index.size && !allow_same_size) return 0;
+
+    t->member_rehash = zbtAlloc(t, sizeof(*t->member_rehash));
+    memset(t->member_rehash, 0, sizeof(*t->member_rehash));
+    int wide_ids = t->member_index.wide_ids ||
+                   t->next_score_leaf_id >= ZBT_INDEX_WIDE_ID_AT;
+    zbtIndexTableInit(t, &t->member_rehash->table, buckets, wide_ids);
+    zbtLeaf *first = (zbtLeaf *)t->head;
+    serverAssert(first != NULL);
+    t->member_rehash->next_leaf_id = first->id;
+    uint16_t resize_id = first->index_resize + 1;
+    if (resize_id == 0) resize_id = 1;
+    t->member_rehash->resize_id = resize_id;
+    t->member_revision = zbtIndexNextRevision();
+    return 1;
+}
+
+static int zbtIndexLeafMigrated(const zbtree *t, const zbtLeaf *leaf) {
+    return t->member_rehash &&
+           leaf->index_resize == t->member_rehash->resize_id;
+}
+
+static void zbtIndexCopyLeaf(zbtree *t, zbtLeaf *leaf) {
+    zbtIndexRehash *rehash = t->member_rehash;
+    serverAssert(rehash != NULL);
+    if (zbtIndexLeafMigrated(t, leaf)) return;
+
+    /* Structural changes can move members into an uncopied leaf before the
+     * rehash cursor reaches it. Remove those partial target references, then
+     * publish one fresh reference for every current member in the leaf. */
+    for (unsigned int i = 0; i < leaf->n.count; i++) {
+        zbtIndexBucket *bucket;
+        unsigned int pos;
+        uint32_t hash = zbtElemIndexHash(leaf->elems[i]);
+        while (zbtIndexTableFindReference(&rehash->table, hash, leaf->id,
+                                           &bucket, &pos))
+        {
+            zbtIndexSetId(&rehash->table, bucket, pos,
+                          ZBT_INDEX_DELETED_ID);
+            rehash->table.used--;
+        }
+    }
+    for (unsigned int i = 0; i < leaf->n.count; i++) {
+        if (t->pending_insert == leaf->elems[i]) continue;
+        zbtIndexTableInsertRaw(&rehash->table, zbtElemIndexHash(leaf->elems[i]),
+                               leaf->id);
+    }
+    leaf->index_resize = rehash->resize_id;
+    /* Entries may have moved to buckets already passed by an active scan. */
+    zbtIndexInvalidateScan(t);
+    t->member_revision = zbtIndexNextRevision();
+}
+
+static int zbtIndexRehashStep(zbtree *t, int steps) {
+    zbtIndexRehash *rehash = t->member_rehash;
+    if (rehash == NULL) return 0;
+
+    while (steps--) {
+        zbtLeaf *leaf = NULL;
+        if (rehash->next_leaf_id != ZBT_NO_LEAF_ID &&
+            rehash->next_leaf_id < t->next_score_leaf_id)
+        {
+            leaf = zbtLeafFromId(t, rehash->next_leaf_id);
+        }
+        if (leaf == NULL) leaf = (zbtLeaf *)t->head;
+        while (leaf && zbtIndexLeafMigrated(t, leaf)) leaf = leaf->next;
+        if (leaf == NULL) {
+            serverAssert(rehash->table.used == t->length);
+            zbtIndexTable old = t->member_index;
+            t->member_index = rehash->table;
+            zbtFreeAllocation(t, rehash);
+            t->member_rehash = NULL;
+            zbtIndexTableRelease(t, &old);
+            t->member_revision = zbtIndexNextRevision();
+            return 0;
+        }
+
+        rehash->next_leaf_id =
+            leaf->next ? leaf->next->id : ZBT_NO_LEAF_ID;
+        zbtIndexCopyLeaf(t, leaf);
+    }
+    return 1;
+}
+
+static void zbtIndexExpandIfNeeded(zbtree *t, unsigned long add) {
+    if (t->member_index.size == 0) {
+        unsigned long buckets = zbtIndexBucketsForElements(add);
+        serverAssert(buckets != 0);
+        zbtIndexTableInit(t, &t->member_index, buckets, 0);
+        t->member_revision = zbtIndexNextRevision();
+        return;
+    }
+    if (t->member_rehash) {
+        zbtIndexTable *target = &t->member_rehash->table;
+        unsigned long slots = zbtIndexSlots(target);
+
+        if ((t->length + add) * ZBT_INDEX_MAX_LOAD_DEN <=
+                slots * ZBT_INDEX_MAX_LOAD_NUM &&
+            (target->filled + add) * ZBT_INDEX_MAX_FILLED_DEN <
+                slots * ZBT_INDEX_MAX_FILLED_NUM)
+            return;
+        while (t->member_rehash)
+            zbtIndexRehashStep(t, 64);
+    }
+
+    if (!t->member_index.wide_ids &&
+        t->next_score_leaf_id >= ZBT_INDEX_WIDE_ID_AT)
+    {
+        zbtIndexStartResize(t, t->member_index.used + add, 1);
+        return;
+    }
+
+    unsigned long slots = zbtIndexSlots(&t->member_index);
+    unsigned long live = t->member_index.used + add;
+    unsigned long filled = t->member_index.filled + add;
+    if (live * ZBT_INDEX_MAX_LOAD_DEN >
+            slots * ZBT_INDEX_MAX_LOAD_NUM ||
+        filled * ZBT_INDEX_MAX_FILLED_DEN >=
+            slots * ZBT_INDEX_MAX_FILLED_NUM)
+    {
+        zbtIndexStartResize(t, live, 1);
+    }
+}
+
+static void zbtIndexShrinkIfNeeded(zbtree *t) {
+    if (t->length == 0) {
+        zbtIndexTableRelease(t, &t->member_index);
+        if (t->member_rehash) {
+            zbtIndexTableRelease(t, &t->member_rehash->table);
+            zbtFreeAllocation(t, t->member_rehash);
+            t->member_rehash = NULL;
+        }
+        t->member_revision = zbtIndexNextRevision();
+        return;
+    }
+    if (t->member_rehash ||
+        t->member_index.size <= ZBT_INDEX_INITIAL_BUCKETS)
+        return;
+    unsigned long used = t->member_index.used;
+    if (used * ZBT_INDEX_MIN_LOAD_DEN <=
+        zbtIndexSlots(&t->member_index) * ZBT_INDEX_MIN_LOAD_NUM)
+    {
+        zbtIndexStartResize(t, used ? used : 1, 0);
+    }
+}
+
+static int zbtIndexOwnsBucket(zbtIndexTable *table, zbtIndexBucket *bucket) {
+    if (table->buckets == NULL) return 0;
+    uintptr_t address = (uintptr_t)bucket;
+    uintptr_t first = (uintptr_t)table->buckets;
+    uintptr_t last = first + table->size * zbtIndexBucketBytes(table);
+    return address >= first && address < last;
+}
+
+static int zbtIndexFind(zbtree *t, uint32_t hash,
+                        const unsigned char *ele, size_t elelen,
+                        zbtLeaf **found_leaf, unsigned int *found_leaf_pos,
+                        zbtIndexBucket **found_bucket,
+                        unsigned int *found_bucket_position)
+{
+    zbtIndexBucket *bucket = NULL, *hint_bucket = NULL;
+    unsigned int pos = 0, hint_pos = 0;
+    zbtIndexRehashStep(t, 1);
+
+    if (t->member_rehash &&
+        zbtIndexTableFind(t, &t->member_rehash->table, hash, ele, elelen,
+                          found_leaf, found_leaf_pos,
+                          &bucket, &pos, &hint_bucket, &hint_pos))
+        goto found;
+
+    if (zbtIndexTableFind(t, &t->member_index, hash, ele, elelen,
+                          found_leaf, found_leaf_pos,
+                          &bucket, &pos,
+                          t->member_rehash ? NULL : &hint_bucket,
+                          t->member_rehash ? NULL : &hint_pos))
+        goto found;
+
+    if (found_bucket) *found_bucket = hint_bucket;
+    if (found_bucket_position) *found_bucket_position = hint_pos;
+    return 0;
+
+found:
+    if (found_bucket) *found_bucket = bucket;
+    if (found_bucket_position) *found_bucket_position = pos;
+    return 1;
+}
+
+static int zbtIndexFindReference(zbtree *t, uint32_t hash,
+                                 uint32_t leaf_id,
+                                 zbtIndexBucket **found_bucket,
+                                 unsigned int *found_pos)
+{
+    zbtIndexBucket *bucket;
+    if (t->member_rehash &&
+        zbtIndexTableFindReference(&t->member_rehash->table, hash,
+                                   leaf_id, &bucket, found_pos))
+    {
+        *found_bucket = bucket;
+        return 1;
+    }
+    if (t->member_index.size &&
+        zbtIndexTableFindReference(&t->member_index, hash, leaf_id,
+                                   &bucket, found_pos))
+    {
+        *found_bucket = bucket;
+        return 1;
+    }
+    return 0;
+}
+
+static int zbtIndexMove(zbtree *t, uint32_t hash,
+                        uint32_t old_leaf_id, uint32_t new_leaf_id,
+                        int target_is_incomplete, int *target_was_copied)
+{
+    zbtIndexBucket *bucket;
+    unsigned int pos;
+    if (t->member_rehash == NULL) {
+        if (!zbtIndexTableFindReference(&t->member_index, hash,
+                                        old_leaf_id, &bucket, &pos))
+            return 0;
+        zbtIndexSetId(&t->member_index, bucket, pos, new_leaf_id);
+        return 1;
+    }
+
+    zbtLeaf *newleaf = zbtLeafFromId(t, new_leaf_id);
+    serverAssert(newleaf);
+    if (!zbtIndexLeafMigrated(t, newleaf) && target_is_incomplete) {
+        if (!zbtIndexFindReference(t, hash, old_leaf_id, &bucket, &pos))
+            return 0;
+        zbtIndexTable *source = zbtIndexOwnsBucket(&t->member_index, bucket) ?
+                                &t->member_index :
+                                &t->member_rehash->table;
+        zbtIndexSetId(source, bucket, pos, new_leaf_id);
+        return 1;
+    }
+    int copied_target = target_was_copied && *target_was_copied;
+    if (!zbtIndexLeafMigrated(t, newleaf)) {
+        zbtIndexCopyLeaf(t, newleaf);
+        copied_target = 1;
+        if (target_was_copied) *target_was_copied = 1;
+    }
+
+    if (!zbtIndexFindReference(t, hash, old_leaf_id, &bucket, &pos))
+        return 0;
+
+    zbtIndexTable *source = &t->member_index;
+    if (!zbtIndexOwnsBucket(source, bucket)) {
+        serverAssert(zbtIndexOwnsBucket(&t->member_rehash->table, bucket));
+        source = &t->member_rehash->table;
+    }
+    if (copied_target) {
+        zbtIndexSetId(source, bucket, pos, ZBT_INDEX_DELETED_ID);
+        source->used--;
+    } else if (source == &t->member_rehash->table) {
+        zbtIndexSetId(source, bucket, pos, new_leaf_id);
+    } else {
+        zbtIndexSetId(source, bucket, pos, ZBT_INDEX_DELETED_ID);
+        source->used--;
+        zbtIndexTableInsertRaw(&t->member_rehash->table, hash, new_leaf_id);
+    }
+    return 1;
+}
+
+static void zbtIndexDeleteAt(zbtree *t, zbtIndexBucket *bucket,
+                             unsigned int pos)
+{
+    zbtIndexTable *table = &t->member_index;
+    if (!zbtIndexOwnsBucket(table, bucket)) {
+        serverAssert(t->member_rehash &&
+                     zbtIndexOwnsBucket(&t->member_rehash->table, bucket));
+        table = &t->member_rehash->table;
+    }
+    serverAssert(zbtIndexGetId(table, bucket, pos) != ZBT_INDEX_DELETED_ID);
+    zbtIndexSetId(table, bucket, pos, ZBT_INDEX_DELETED_ID);
+    table->used--;
+}
+
+static void zbtIndexInsert(zbtree *t, uint32_t hash, uint32_t leaf_id,
+                           const zbtreeInsertPosition *position)
+{
+    if (t->member_rehash) {
+        zbtLeaf *leaf = zbtLeafFromId(t, leaf_id);
+        serverAssert(leaf);
+        if (!zbtIndexLeafMigrated(t, leaf))
+            zbtIndexCopyLeaf(t, leaf);
+    }
+
+    zbtIndexTable *table = t->member_rehash ?
+        &t->member_rehash->table : &t->member_index;
+    zbtIndexBucket *bucket = position ?
+        (zbtIndexBucket *)position->bucket : NULL;
+    unsigned int pos = position ? position->pos : 0;
+    if (position && position->hash == hash &&
+        position->revision == t->member_revision && bucket &&
+        zbtIndexOwnsBucket(table, bucket) &&
+        pos < ZBT_INDEX_BUCKET_ITEMS)
+    {
+        uint8_t oldtag = (uint8_t)(zbtIndexTags(bucket) >> (pos * 8));
+        uint32_t oldid = zbtIndexGetId(table, bucket, pos);
+        if (oldtag == 0 || oldid == ZBT_INDEX_DELETED_ID) {
+            if (oldtag == 0) table->filled++;
+            zbtIndexSetTag(bucket, pos, zbtIndexTag(hash));
+            zbtIndexSetId(table, bucket, pos, leaf_id);
+            table->used++;
+            zbtIndexRecordHomeTag(table, hash);
+            zbtIndexRehashStep(t, 1);
+            return;
+        }
+    }
+
+    table = t->member_rehash ?
+        &t->member_rehash->table : &t->member_index;
+    zbtIndexTableInsertRaw(table, hash, leaf_id);
+    zbtIndexRehashStep(t, 1);
+}
+
+static void zbtIndexDeleteElem(zbtree *t, zbtElem *e) {
+    uint32_t hash = zbtElemIndexHash(e);
+    zbtIndexBucket *bucket;
+    unsigned int pos;
+    serverAssert(zbtIndexFindReference(t, hash, e->leaf->id, &bucket, &pos));
+    zbtIndexDeleteAt(t, bucket, pos);
+}
+
+zbtElem *zbtFindMemberHash(zbtree *t, sds ele, uint32_t hash,
+                           zbtreeInsertPosition *position)
+{
+    zbtLeaf *leaf = NULL;
+    unsigned int leaf_pos = 0;
+    zbtIndexBucket *bucket = NULL;
+    unsigned int pos = 0;
+    int found = zbtIndexFind(t, hash, (const unsigned char *)ele, sdslen(ele),
+                             &leaf, &leaf_pos, &bucket, &pos);
+    if (position) {
+        position->bucket = bucket;
+        position->pos = pos;
+        position->hash = hash;
+        position->revision = t->member_revision;
+    }
+    if (!found) return NULL;
+    return leaf->elems[leaf_pos];
+}
+
+zbtElem *zbtFindMember(zbtree *t, sds ele, zbtreeInsertPosition *position) {
+    uint32_t hash = (uint32_t)dictSdsHash(ele);
+    return zbtFindMemberHash(t, ele, hash, position);
+}
+
+void zbtIndexReserve(zbtree *t, unsigned long count) {
+    zbtIndexExpandIfNeeded(t, count);
+}
+
+int zbtIndexTryReserve(zbtree *t, unsigned long count) {
+    serverAssert(t->length == 0);
+    serverAssert(t->member_index.size == 0);
+    serverAssert(t->member_rehash == NULL);
+    unsigned long buckets = zbtIndexBucketsForElements(count);
+    unsigned long leaves = count / ZBT_LEAF_MAX +
+                           (count % ZBT_LEAF_MAX != 0);
+    int wide_ids = leaves >= ZBT_INDEX_WIDE_ID_AT;
+    if (buckets == 0 ||
+        !zbtIndexTableTryInit(t, &t->member_index, buckets, wide_ids))
+        return 0;
+    t->member_revision = zbtIndexNextRevision();
+    return 1;
+}
+
+void zbtIndexMaintenance(zbtree *t, unsigned int steps) {
+    if (t->member_rehash)
+        zbtIndexRehashStep(t, (int)steps);
+    zbtIndexShrinkIfNeeded(t);
+    if (t->member_rehash)
+        zbtIndexRehashStep(t, (int)steps);
+}
+
+static unsigned long zbtRandomBelow(unsigned long limit) {
+    serverAssert(limit != 0);
+    unsigned long threshold = (0UL - limit) % limit;
+    unsigned long value;
+    do {
+        value = randomULong();
+    } while (value < threshold);
+    return value % limit;
+}
+
+void zbtIndexIndexTree(zbtree *t) {
+    if (t->length == 0) return;
+    zbtIndexExpandIfNeeded(t, t->length);
+    zbtIndexTable *table = t->member_rehash ?
+        &t->member_rehash->table : &t->member_index;
+    if (table->used >= t->length) {
+        while (t->member_rehash) zbtIndexRehashStep(t, 64);
+        return;
+    }
+    zbtLeaf *lf = (zbtLeaf *)t->head;
+    while (lf) {
+        if (t->member_rehash) {
+            zbtIndexCopyLeaf(t, lf);
+        } else {
+            for (uint32_t i = 0; i < lf->n.count; i++)
+                zbtIndexTableInsertRaw(&t->member_index,
+                                       zbtElemIndexHash(lf->elems[i]), lf->id);
+        }
+        lf = lf->next;
+    }
+    while (t->member_rehash) zbtIndexRehashStep(t, 64);
+}
+
+zbtElem *zbtRandomElem(zbtree *t) {
+    if (t->length == 0) return NULL;
+    zbtIndexMaintenance(t, 1);
+    /* Sampling an ID and a fixed-capacity leaf slot gives every element the
+     * same chance. Reject holes and unused slots; under normal occupancy this
+     * succeeds in O(1), while the rank fallback bounds pathological ID churn. */
+    for (unsigned int attempts = 0; attempts < 64; attempts++) {
+        uint32_t id = (uint32_t)zbtRandomBelow(t->next_score_leaf_id);
+        zbtLeaf *leaf = zbtLeafFromId(t, id);
+        if (leaf == NULL) continue;
+        unsigned int pos = (unsigned int)zbtRandomBelow(ZBT_LEAF_MAX);
+        if (pos < leaf->n.count) return leaf->elems[pos];
+    }
+    unsigned long rank = zbtRandomBelow(t->length) + 1;
+    return zbtElemByRank(t, rank, NULL);
+}
+
+static unsigned long zbtIndexScanSlot(const zbtree *t, zbtIndexTable *table,
+                                      zbtIndexBucket *bucket,
+                                      unsigned int slot_pos,
+                                      zbtScanFunction *fn, void *privdata)
+{
+    uint8_t tag = (uint8_t)(zbtIndexTags(bucket) >> (slot_pos * 8));
+    uint32_t id = zbtIndexGetId(table, bucket, slot_pos);
+    if (tag == 0 || id == ZBT_INDEX_DELETED_ID) return 0;
+    zbtLeaf *leaf = zbtLeafFromId((zbtree *)t, id);
+    if (leaf == NULL) {
+        serverAssert(t->member_rehash && table == &t->member_index);
+        return 0;
+    }
+    serverAssert(leaf->id == id);
+    if (t->member_rehash) {
+        int in_new = table == &t->member_rehash->table;
+        if (in_new != zbtIndexLeafMigrated(t, leaf)) return 0;
+    }
+
+    unsigned int positions[ZBT_LEAF_MAX + 1];
+    unsigned int count = 0;
+    for (unsigned int i = 0; i < leaf->n.count; i++) {
+        uint8_t leaf_tag = leaf->tags[i];
+        if (leaf_tag == tag || (tag == 1 && leaf_tag == 0))
+            positions[count++] = i;
+    }
+    serverAssert(count != 0);
+
+    unsigned long emitted = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        zbtElem *e = leaf->elems[positions[i]];
+        uint32_t hash = zbtElemIndexHash(e);
+        zbtIndexBucket *owner;
+        unsigned int owner_pos;
+        if (!zbtIndexTableFindReference(table, hash, id, &owner, &owner_pos) ||
+            owner != bucket || owner_pos != slot_pos)
+            continue;
+        sds s = zbtGetEle(e);
+        fn(privdata, (const unsigned char *)s, sdslen(s), zbtGetScore(e));
+        emitted++;
+    }
+    return emitted;
+}
+
+void zbtDismissIndex(zbtree *t) {
+    if (t->table_to_leaf)
+        dismissMemory(t->table_to_leaf,
+                      (size_t)t->score_leaf_cap * sizeof(void *));
+    if (t->member_index.buckets)
+        dismissMemory(t->member_index.buckets,
+                      zbtIndexTableBytes(&t->member_index));
+    if (t->member_rehash && t->member_rehash->table.buckets)
+        dismissMemory(t->member_rehash->table.buckets,
+                      zbtIndexTableBytes(&t->member_rehash->table));
+}
+
+uint64_t zbtScan(zbtree *t, uint64_t cursor, unsigned long count,
+                 zbtScanFunction *fn, void *privdata)
+{
+    if (t->length == 0) return 0;
+    uint32_t revision = (uint32_t)(cursor >> 32);
+    uint64_t group = cursor ? (uint32_t)cursor - 1 : 0;
+    if (cursor == 0 || revision != t->member_index.scan_revision) {
+        revision = t->member_index.scan_revision;
+        group = 0;
+    }
+
+    uint64_t first_buckets = t->member_index.size;
+    uint64_t total_buckets = first_buckets;
+    if (t->member_rehash)
+        total_buckets += t->member_rehash->table.size;
+    uint64_t bucket_index = group * ZBT_SCAN_BUCKETS_PER_STEP;
+    if (bucket_index >= total_buckets) return 0;
+    unsigned long emitted = 0;
+    unsigned long max_groups =
+        count > ULONG_MAX / 10 ? ULONG_MAX : count * 10;
+    unsigned long scanned_groups = 0;
+    while (bucket_index < total_buckets && emitted < count &&
+           scanned_groups < max_groups)
+    {
+        uint64_t end = bucket_index + ZBT_SCAN_BUCKETS_PER_STEP;
+        if (end > total_buckets) end = total_buckets;
+        while (bucket_index < end) {
+            zbtIndexTable *table;
+            uint64_t local;
+            if (bucket_index < first_buckets) {
+                table = &t->member_index;
+                local = bucket_index;
+            } else {
+                serverAssert(t->member_rehash != NULL);
+                table = &t->member_rehash->table;
+                local = bucket_index - first_buckets;
+            }
+            zbtIndexBucket *bucket = zbtIndexBucketAt(table, local);
+            for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++)
+                emitted += zbtIndexScanSlot(t, table, bucket, pos, fn, privdata);
+            bucket_index++;
+        }
+        group++;
+        scanned_groups++;
+    }
+    if (bucket_index >= total_buckets) return 0;
+    serverAssert(group < UINT32_MAX);
+    return ((uint64_t)revision << 32) | (uint32_t)(group + 1);
+}
+
 /*-----------------------------------------------------------------------------
  * Node allocation / tree lifecycle
  *----------------------------------------------------------------------------*/
@@ -316,7 +1344,10 @@ static zbtLeaf *zbtNewLeaf(zbtree *t) {
     lf->n.count = 0;
     lf->n.isleaf = 1;
     lf->prev = lf->next = NULL;
+    lf->id = ZBT_NO_LEAF_ID;
+    lf->index_resize = 0;
     t->alloc_size += usable;
+    zbtRegisterLeaf(t, lf, ZBT_NEW_LEAF_ID);
     return lf;
 }
 
@@ -336,14 +1367,21 @@ static void zbtFreeNodeShallow(zbtree *t, zbtNode *n) {
     t->alloc_size -= usable;
 }
 
+static void zbtFreeLeaf(zbtree *t, zbtLeaf *lf) {
+    zbtReleaseLeafId(t, lf->id);
+    zbtFreeNodeShallow(t, (zbtNode *)lf);
+}
+
 zbtree *zbtCreate(void) {
     size_t usable;
     zbtree *t = zmalloc_usable(sizeof(*t), &usable);
+    memset(t, 0, sizeof(*t));
     t->length = 0;
     t->alloc_size = usable;
     t->root = NULL;
     t->defrag_resume = NULL;
     t->defrag_resume_score = 0;
+    t->pending_insert = NULL;
     zbtLeaf *lf = zbtNewLeaf(t);
     t->root = (zbtNode *)lf;
     t->head = t->tail = (zbtNode *)lf;
@@ -369,6 +1407,12 @@ static void zbtFreeSubtree(zbtree *t, zbtNode *n) {
 void zbtFree(zbtree *t) {
     zbtFreeSubtree(t, t->root);
     if (t->defrag_resume) sdsfree(t->defrag_resume);
+    zbtIndexTableRelease(t, &t->member_index);
+    if (t->member_rehash) {
+        zbtIndexTableRelease(t, &t->member_rehash->table);
+        zbtFreeAllocation(t, t->member_rehash);
+    }
+    if (t->table_to_leaf) zfree(t->table_to_leaf);
     zfree(t);
 }
 
@@ -409,7 +1453,10 @@ static int zbtChildIdx(zbtInner *p, zbtNode *c) {
  * element's back-pointer goes stale and zbtRankByElem() walks up from the
  * wrong leaf. zbtDebugVerify() checks the whole tree for exactly that. */
 static void zbtLeafClaim(zbtLeaf *lf, int from, int to) {
-    for (int i = from; i < to; i++) lf->elems[i]->leaf = lf;
+    for (int i = from; i < to; i++) {
+        lf->elems[i]->leaf = lf;
+        lf->tags[i] = zbtElemLeafTag(lf->elems[i]);
+    }
 }
 
 /* Choose the child of inner node 'in' whose key range contains (score,ele).
@@ -603,9 +1650,12 @@ static void zbtSplitLeaf(zbtree *t, zbtLeaf *lf, int bias) {
     if (bias == ZBT_SPLIT_APPEND) keep = total - 1;
     else if (bias == ZBT_SPLIT_PREPEND) keep = 1;
     int move = total - keep;
+    uint32_t old_id = lf->id;
     memcpy(r->elems, &lf->elems[keep], move * sizeof(zbtElem *));
+    memcpy(r->tags, &lf->tags[keep], move);
     zbtLeafClaim(r, 0, move);
     r->n.count = move;
+    r->index_resize = lf->index_resize;
     lf->n.count = keep;
 
     r->next = lf->next;
@@ -614,33 +1664,54 @@ static void zbtSplitLeaf(zbtree *t, zbtLeaf *lf, int bias) {
     else t->tail = (zbtNode *)r;
     lf->next = r;
 
+    int copied = 0;
+    zbtIndexMoveRange(t, r, 0, move, old_id, 1, &copied);
+
     zbtInsertChild(t, (zbtInner *)lf->n.parent, (zbtNode *)lf, (zbtNode *)r);
 }
 
 /* Move n elements across the shared boundary of adjacent leaves 'left' and
  * 'right'. toRight != 0 moves the tail of left onto the front of right;
  * otherwise the head of right onto the end of left. */
-static void zbtLeafShift(zbtLeaf *left, zbtLeaf *right, int n, int toRight) {
+static void zbtLeafShift(zbtree *t, zbtLeaf *left, zbtLeaf *right, int n, int toRight) {
     serverAssert(n > 0);
+    int copied = 0;
     if (toRight) {
+        uint32_t old_id = left->id;
         memmove(&right->elems[n], &right->elems[0],
                 right->n.count * sizeof(zbtElem *));
-        if (n == 1) right->elems[0] = left->elems[left->n.count - 1];
-        else memcpy(&right->elems[0], &left->elems[(int)left->n.count - n],
+        memmove(&right->tags[n], &right->tags[0], right->n.count);
+        if (n == 1) {
+            right->elems[0] = left->elems[left->n.count - 1];
+            right->tags[0] = left->tags[left->n.count - 1];
+        } else {
+            memcpy(&right->elems[0], &left->elems[(int)left->n.count - n],
                     n * sizeof(zbtElem *));
+            memcpy(&right->tags[0], &left->tags[(int)left->n.count - n], n);
+        }
         zbtLeafClaim(right, 0, n);
         left->n.count -= (uint32_t)n;
         right->n.count += (uint32_t)n;
+        zbtIndexMoveRange(t, right, 0, n, old_id, 0, &copied);
     } else {
+        uint32_t old_id = right->id;
         int at = (int)left->n.count;
-        if (n == 1) left->elems[at] = right->elems[0];
-        else memcpy(&left->elems[at], &right->elems[0],
+        if (n == 1) {
+            left->elems[at] = right->elems[0];
+            left->tags[at] = right->tags[0];
+        } else {
+            memcpy(&left->elems[at], &right->elems[0],
                     n * sizeof(zbtElem *));
+            memcpy(&left->tags[at], &right->tags[0], n);
+        }
         zbtLeafClaim(left, at, at + n);
         memmove(&right->elems[0], &right->elems[n],
                 ((int)right->n.count - n) * sizeof(zbtElem *));
+        memmove(&right->tags[0], &right->tags[n],
+                (int)right->n.count - n);
         left->n.count += (uint32_t)n;
         right->n.count -= (uint32_t)n;
+        zbtIndexMoveRange(t, left, at, n, old_id, 0, &copied);
     }
 }
 
@@ -673,7 +1744,7 @@ static int zbtShareOverflow(zbtree *t, zbtLeaf *lf, int ins_idx) {
             int maxn = (int)lf->n.count - ZBT_LEAF_MIN;
             int n = slack < maxn ? slack : maxn;
             if (n <= 0) continue;
-            zbtLeafShift(L, lf, n, 0); /* smallest of lf onto L's end */
+            zbtLeafShift(t, L, lf, n, 0); /* smallest of lf onto L's end */
             zbtFixLeafPair(p, idx - 1);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return 1;
@@ -684,7 +1755,7 @@ static int zbtShareOverflow(zbtree *t, zbtLeaf *lf, int ins_idx) {
             int maxn = (int)lf->n.count - ZBT_LEAF_MIN;
             int n = slack < maxn ? slack : maxn;
             if (n <= 0) continue;
-            zbtLeafShift(lf, R, n, 1); /* largest of lf onto R's front */
+            zbtLeafShift(t, lf, R, n, 1); /* largest of lf onto R's front */
             zbtFixLeafPair(p, idx);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return 1;
@@ -714,8 +1785,8 @@ static void zbtInsertElem(zbtree *t, zbtElem *e, size_t usable) {
 
     memmove(&lf->elems[idx + 1], &lf->elems[idx],
             ((int)lf->n.count - idx) * sizeof(zbtElem *));
-    lf->elems[idx] = e;
-    e->leaf = lf;
+    memmove(&lf->tags[idx + 1], &lf->tags[idx], (int)lf->n.count - idx);
+    zbtLeafSetElem(lf, idx, e);
     lf->n.count++;
     t->length++;
     t->alloc_size += usable;
@@ -732,11 +1803,23 @@ static void zbtInsertElem(zbtree *t, zbtElem *e, size_t usable) {
     }
 }
 
-zbtElem *zbtInsertWithHash(zbtree *t, double score, sds ele, const uint64_t *known_hash) {
+zbtElem *zbtInsertWithHashAt(zbtree *t, double score, sds ele,
+                             const uint64_t *known_hash,
+                             const zbtreeInsertPosition *position)
+{
     size_t usable;
     zbtElem *e = zbtCreateElemWithHash(score, ele, sdslen(ele), 0, &usable, known_hash);
+    zbtIndexExpandIfNeeded(t, 1);
+    t->pending_insert = e;
     zbtInsertElem(t, e, usable);
+    zbtIndexInsert(t, zbtElemIndexHash(e), e->leaf->id, position);
+    t->pending_insert = NULL;
+    zbtIndexInvalidateScan(t);
     return e;
+}
+
+zbtElem *zbtInsertWithHash(zbtree *t, double score, sds ele, const uint64_t *known_hash) {
+    return zbtInsertWithHashAt(t, score, ele, known_hash, NULL);
 }
 
 zbtElem *zbtInsert(zbtree *t, double score, sds ele) {
@@ -755,7 +1838,7 @@ void zbtBuildFromSortedWithSize(zbtree *t, zbtElem **elems, unsigned long n,
     serverAssert(t->length == 0);
 
     /* Discard the placeholder empty root leaf created by zbtCreate(). */
-    zbtFreeNodeShallow(t, t->root);
+    zbtFreeLeaf(t, (zbtLeaf *)t->root);
     t->root = t->head = t->tail = NULL;
 
     /* Build the leaf level. Distribute elements as evenly as possible so that
@@ -817,6 +1900,7 @@ void zbtBuildFromSortedWithSize(zbtree *t, zbtElem **elems, unsigned long n,
 
     t->length = n;
     t->alloc_size += elems_alloc_size;
+    zbtIndexIndexTree(t);
 }
 
 void zbtBuildFromSorted(zbtree *t, zbtElem **elems, unsigned long n) {
@@ -946,7 +2030,7 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     if (idx > 0) {
         zbtLeaf *L = (zbtLeaf *)p->child[idx - 1];
         if ((int)L->n.count - deficit >= ZBT_LEAF_MIN) {
-            zbtLeafShift(L, lf, deficit, 1);
+            zbtLeafShift(t, L, lf, deficit, 1);
             zbtFixLeafPair(p, idx - 1);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
@@ -956,7 +2040,7 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     if (idx < (int)p->n.count - 1) {
         zbtLeaf *R = (zbtLeaf *)p->child[idx + 1];
         if ((int)R->n.count - deficit >= ZBT_LEAF_MIN) {
-            zbtLeafShift(lf, R, deficit, 0);
+            zbtLeafShift(t, lf, R, deficit, 0);
             zbtFixLeafPair(p, idx);
             zbtUpdateToRoot(t, (zbtNode *)p);
             return;
@@ -971,26 +2055,33 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
     if (idx > 0) { a = (zbtLeaf *)p->child[idx - 1]; b = lf; ai = idx - 1; }
     else { a = lf; b = (zbtLeaf *)p->child[idx + 1]; ai = idx; }
     serverAssert(a->n.count + b->n.count <= ZBT_LEAF_MAX);
+    uint32_t right_id = b->id;
+    int at = (int)a->n.count;
     memcpy(&a->elems[a->n.count], b->elems, b->n.count * sizeof(zbtElem *));
-    zbtLeafClaim(a, (int)a->n.count, (int)(a->n.count + b->n.count));
+    memcpy(&a->tags[a->n.count], b->tags, b->n.count);
+    zbtLeafClaim(a, at, at + (int)b->n.count);
     a->n.count += b->n.count;
+    int copied = 0;
+    zbtIndexMoveRange(t, a, at, (int)b->n.count, right_id, 0, &copied);
     a->next = b->next;
     if (b->next) b->next->prev = a;
     else t->tail = (zbtNode *)a;
     zbtRemoveChild(p, ai + 1);
-    zbtFreeNodeShallow(t, (zbtNode *)b);
+    zbtFreeLeaf(t, b);
     zbtFixupInnerAfterShrink(t, p, ai);
 }
 
-/* Remove element 'e' from the tree and free it. The caller is responsible for
- * removing it from the ZSET dict first (the dict has no key destructor). */
+/* Remove element 'e' from the tree and free it. */
 void zbtDeleteElem(zbtree *t, zbtElem *e) {
     zbtLeaf *lf = e->leaf;
     int idx = zbtLeafFindPtr(lf, e);
     serverAssert(idx >= 0);
 
+    zbtIndexDeleteElem(t, e);
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
+    memmove(&lf->tags[idx], &lf->tags[idx + 1],
+            (int)lf->n.count - idx - 1);
     lf->n.count--;
     t->length--;
     size_t usable;
@@ -1001,6 +2092,8 @@ void zbtDeleteElem(zbtree *t, zbtElem *e) {
         zbtRebalanceLeaf(t, lf);
     else
         zbtUpdateToRoot(t, (zbtNode *)lf);
+    zbtIndexShrinkIfNeeded(t);
+    zbtIndexInvalidateScan(t);
 }
 
 /* Whether the re-scored member at slot 'idx' of 'lf' still sorts inside it.
@@ -1051,7 +2144,8 @@ static int zbtLeafMoveSlot(zbtLeaf *lf, int idx, zbtElem *e, double score,
         }
         memmove(&lf->elems[idx], &lf->elems[idx + 1],
                 (lo - idx) * sizeof(zbtElem *));
-        lf->elems[lo] = e;
+        memmove(&lf->tags[idx], &lf->tags[idx + 1], lo - idx);
+        zbtLeafSetElem(lf, lo, e);
         return lo;
     }
     if (!up && idx > 0 && zbtCompare(score, ele, lf->elems[idx - 1]) < 0) {
@@ -1064,16 +2158,18 @@ static int zbtLeafMoveSlot(zbtLeaf *lf, int idx, zbtElem *e, double score,
         }
         memmove(&lf->elems[lo + 1], &lf->elems[lo],
                 (idx - lo) * sizeof(zbtElem *));
-        lf->elems[lo] = e;
+        memmove(&lf->tags[lo + 1], &lf->tags[lo], idx - lo);
+        zbtLeafSetElem(lf, lo, e);
         return lo;
     }
     lf->elems[idx] = e;
+    lf->tags[idx] = zbtElemLeafTag(e);
+    e->leaf = lf;
     return idx;
 }
 
 /* Move an existing element to reflect a new score. Returns the (possibly
- * reallocated) element: a width change allocates a new object, and the
- * caller must rewire the ZSET dict key when the pointer changes. */
+ * reallocated) element. */
 zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     sds ele = zbtGetEle(e);
     zbtLeaf *lf = e->leaf;
@@ -1112,11 +2208,13 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
         return ne;
     }
 
-    /* Slow path: detach, rewrite the score, reinsert. The dict maps member ->
-     * elem and the member is unchanged, so only the tree position (and
-     * possibly the allocation) changes. */
+    /* Slow path: detach, rewrite the score, reinsert. Index slot is removed
+     * first so a later rebalance cannot alias the leaf ID. */
+    zbtIndexDeleteElem(t, e);
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
+    memmove(&lf->tags[idx], &lf->tags[idx + 1],
+            (int)lf->n.count - idx - 1);
     lf->n.count--;
     t->length--;
     t->alloc_size -= old_usable;
@@ -1125,17 +2223,22 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     else
         zbtUpdateToRoot(t, (zbtNode *)lf);
 
+    zbtElem *ne = e;
     if (same_width) {
         e->enc = (e->enc & ZBT_ELEM_CACHED_HASH) | newenc;
         memcpy(e->data, newbuf, zbtScoreEncSize(newenc));
-        zbtInsertElem(t, e, old_usable);
-        return e;
+    } else {
+        size_t new_usable;
+        ne = zbtCreateElem(newscore, ele, sdslen(ele), 0, &new_usable);
+        zfree_with_size(e, old_usable);
+        old_usable = new_usable;
     }
-
-    size_t new_usable;
-    zbtElem *ne = zbtCreateElem(newscore, ele, sdslen(ele), 0, &new_usable);
-    zfree_with_size(e, old_usable);
-    zbtInsertElem(t, ne, new_usable);
+    zbtIndexExpandIfNeeded(t, 1);
+    t->pending_insert = ne;
+    zbtInsertElem(t, ne, old_usable);
+    zbtIndexInsert(t, zbtElemIndexHash(ne), ne->leaf->id, NULL);
+    t->pending_insert = NULL;
+    zbtIndexInvalidateScan(t);
     return ne;
 }
 
@@ -1230,6 +2333,25 @@ zbtElem *zbtFirst(zbtree *t, zbtIter *it) {
     zbtLeaf *lf = (zbtLeaf *)t->head;
     if (it) { it->leaf = (zbtNode *)lf; it->idx = 0; }
     return lf->elems[0];
+}
+
+zbtElem *zbtSeekGE(zbtree *t, double score, sds ele, zbtIter *it) {
+    if (t->length == 0) return NULL;
+    zbtLcp lcp = ZBT_LCP_INIT;
+    zbtLeaf *lf = zbtFindLeaf(t, score, ele, &lcp);
+    int found;
+    int idx = zbtLeafSearch(lf, score, ele, &found, &lcp);
+    UNUSED(found);
+    if (idx == (int)lf->n.count) {
+        lf = lf->next;
+        idx = 0;
+    }
+    if (lf == NULL) return NULL;
+    if (it) {
+        it->leaf = (zbtNode *)lf;
+        it->idx = idx;
+    }
+    return lf->elems[idx];
 }
 
 zbtElem *zbtLast(zbtree *t, zbtIter *it) {
@@ -1556,11 +2678,11 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
 }
 
 /*-----------------------------------------------------------------------------
- * Range deletion (also removes the members from the ZSET dict)
+ * Range deletion
  *----------------------------------------------------------------------------*/
 
 /* Delete 'want' consecutive elements starting at slot 'idx' of leaf 'lf',
- * removing each member from the companion dict 'd' as well.
+ * tombstoning each member in the open-addressed index.
  *
  * Instead of locating and rebalancing once per element (O(K log N)), this
  * removes a whole leaf slice per structural pass: one rebalance per touched
@@ -1572,7 +2694,7 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n,
  * The whole deletion is therefore O(K + K/leaf) with a single descent, done
  * by the caller, for the starting position. */
 static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
-                                     unsigned long want, dict *d) {
+                                     unsigned long want) {
     unsigned long removed = 0;
 
     while (want > 0) {
@@ -1589,16 +2711,15 @@ static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
 
         for (int k = 0; k < take; k++) {
             zbtElem *el = lf->elems[idx + k];
-            if (zbtHasCachedHash(el))
-                serverAssert(dictDeleteByHashAndPtr(d, el, zbtGetCachedHash(el)) == DICT_OK);
-            else
-                serverAssert(dictDelete(d, zbtGetEle(el)) == DICT_OK);
+            zbtIndexDeleteElem(t, el);
             size_t usable;
             zfree_usable(el, &usable);
             t->alloc_size -= usable;
         }
         memmove(&lf->elems[idx], &lf->elems[idx + take],
                 ((int)lf->n.count - idx - take) * sizeof(zbtElem *));
+        memmove(&lf->tags[idx], &lf->tags[idx + take],
+                (int)lf->n.count - idx - take);
         lf->n.count -= take;
         t->length -= take;
         removed += take;
@@ -1614,18 +2735,20 @@ static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
         idx = zbtLeafFindPtr(lf, next);
         serverAssert(idx >= 0);
     }
+    zbtIndexMaintenance(t, 16);
+    zbtIndexInvalidateScan(t);
     return removed;
 }
 
 /* Delete every element whose 1-based rank falls in [first, last] (inclusive). */
 static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
-                                        unsigned long last, dict *d) {
+                                        unsigned long last) {
     if (last > t->length) last = t->length;
     if (first > last) return 0;
 
     zbtIter it;
     if (zbtElemByRank(t, first, &it) == NULL) return 0;
-    return zbtDeleteSlices(t, (zbtLeaf *)it.leaf, it.idx, last - first + 1, d);
+    return zbtDeleteSlices(t, (zbtLeaf *)it.leaf, it.idx, last - first + 1);
 }
 
 /* Delete the elements between two boundaries of the sorted order. The
@@ -1633,8 +2756,7 @@ static unsigned long zbtDeleteRankRange(zbtree *t, unsigned long first,
  * handed over directly instead of being looked up again by rank. */
 static unsigned long zbtDeleteBoundaryRange(zbtree *t,
                                             zbtBeforeFn before_lo, void *lo_arg,
-                                            zbtBeforeFn before_hi, void *hi_arg,
-                                            dict *d) {
+                                            zbtBeforeFn before_hi, void *hi_arg) {
     if (t->length == 0) return 0;
     zbtBoundary lo, hi;
     zbtFindBoundary(t, before_lo, lo_arg, &lo);
@@ -1643,26 +2765,26 @@ static unsigned long zbtDeleteBoundaryRange(zbtree *t,
 
     zbtIter it;
     if (zbtBoundaryNext(&lo, &it) == NULL) return 0;
-    return zbtDeleteSlices(t, (zbtLeaf *)it.leaf, it.idx, hi.count - lo.count, d);
+    return zbtDeleteSlices(t, (zbtLeaf *)it.leaf, it.idx, hi.count - lo.count);
 }
 
-unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range, dict *d) {
+unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range) {
     double minv = range->min, maxv = range->max;
     return zbtDeleteBoundaryRange(t,
         range->minex ? beforeScoreLe : beforeScoreLt, &minv,
-        range->maxex ? beforeScoreLt : beforeScoreLe, &maxv, d);
+        range->maxex ? beforeScoreLt : beforeScoreLe, &maxv);
 }
 
-unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range, dict *d) {
+unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range) {
     return zbtDeleteBoundaryRange(t, beforeNotGteMin, range,
-                                  beforeLteMax, range, d);
+                                  beforeLteMax, range);
 }
 
 /* Delete elements whose 1-based rank is in [start, end] (inclusive). */
 unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned long start,
-                                    unsigned long end, dict *d) {
+                                    unsigned long end) {
     if (t->length == 0 || start > end) return 0;
-    return zbtDeleteRankRange(t, start, end, d);
+    return zbtDeleteRankRange(t, start, end);
 }
 
 /*-----------------------------------------------------------------------------
@@ -1676,6 +2798,7 @@ void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe) {
     int idx = zbtLeafFindPtr(lf, olde);
     serverAssert(idx >= 0);
     lf->elems[idx] = newe;
+    lf->tags[idx] = zbtElemLeafTag(newe);
     newe->leaf = lf;
     /* Ancestors only ever reference a leaf through its minimum, so nothing
      * above can be holding 'olde' unless it sat in slot 0. */
@@ -1723,6 +2846,8 @@ void zbtDefragNodes(zbtree *t, void *(*fn)(void *)) {
     zbtCollectLeaves(t, t->root, &prev);
     if (prev) prev->next = NULL;
     t->tail = (zbtNode *)prev;
+    for (zbtLeaf *lf = (zbtLeaf *)t->head; lf; lf = lf->next)
+        t->table_to_leaf[lf->id] = lf;
 }
 
 /* Relocate a single leaf (if the allocator decides to move it) and repair all
@@ -1732,6 +2857,7 @@ static zbtLeaf *zbtDefragRelocLeaf(zbtree *t, zbtLeaf *lf, void *(*fn)(void *)) 
     zbtLeaf *nl = fn(lf);
     if (!nl) return lf;
     zbtLeafClaim(nl, 0, (int)nl->n.count);
+    t->table_to_leaf[nl->id] = nl;
     if (nl->n.parent) {
         zbtInner *p = (zbtInner *)nl->n.parent;
         p->child[zbtChildIdx(p, (zbtNode *)lf)] = (zbtNode *)nl;
@@ -1814,6 +2940,25 @@ int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budge
     return 0;
 }
 
+void zbtDefragIndex(zbtree *t, void *(*fn)(void *)) {
+    if (t->table_to_leaf) {
+        void *n = fn(t->table_to_leaf);
+        if (n) t->table_to_leaf = n;
+    }
+    if (t->member_index.buckets) {
+        void *n = fn(t->member_index.buckets);
+        if (n) t->member_index.buckets = n;
+    }
+    if (t->member_rehash) {
+        void *n = fn(t->member_rehash);
+        if (n) t->member_rehash = n;
+        if (t->member_rehash->table.buckets) {
+            void *b = fn(t->member_rehash->table.buckets);
+            if (b) t->member_rehash->table.buckets = b;
+        }
+    }
+}
+
 /*-----------------------------------------------------------------------------
  * Debugging / test verification
  *----------------------------------------------------------------------------*/
@@ -1843,8 +2988,11 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
         serverAssert(n->count <= ZBT_LEAF_MAX);
         if (*leafdepth == -1) *leafdepth = depth;
         else serverAssert(*leafdepth == depth); /* all leaves same depth */
-        for (uint32_t i = 0; i < n->count; i++)
+        for (uint32_t i = 0; i < n->count; i++) {
             serverAssert(lf->elems[i]->leaf == lf);
+            serverAssert(lf->tags[i] == zbtElemLeafTag(lf->elems[i]));
+            serverAssert(t->table_to_leaf[lf->id] == lf);
+        }
         for (uint32_t i = 1; i < n->count; i++) {
             zbtElem *a = lf->elems[i - 1], *b = lf->elems[i];
             serverAssert(zbtCompare(zbtGetScore(a), zbtGetEle(a), b) < 0);
@@ -1892,6 +3040,73 @@ void zbtDebugVerify(zbtree *t) {
     }
     serverAssert(chain == t->length);
     serverAssert(t->tail == (zbtNode *)plf || (t->length == 0));
+
+    if (t->member_index.size) {
+        unsigned long live = t->member_index.used;
+        if (t->member_rehash) live += t->member_rehash->table.used;
+        lf = (zbtLeaf *)t->head;
+        while (lf) {
+            for (uint32_t i = 0; i < lf->n.count; i++) {
+                zbtElem *e = lf->elems[i];
+                zbtreeInsertPosition pos;
+                zbtElem *found = zbtFindMember(t, zbtGetEle(e), &pos);
+                serverAssert(found == e);
+            }
+            lf = lf->next;
+        }
+        UNUSED(live);
+
+        for (uint32_t id = 0; id < t->next_score_leaf_id; id++) {
+            zbtLeaf *mapped = t->table_to_leaf[id];
+            if (ZBT_IS_FREE_LEAF_ID(mapped)) {
+                uint32_t next = ZBT_NEXT_FREE_LEAF_ID(mapped);
+                serverAssert(next == 0 || next - 1 < t->next_score_leaf_id);
+            } else {
+                serverAssert(mapped != NULL && mapped->id == id);
+            }
+        }
+
+        zbtIndexTable *tables[2];
+        int require_migrated[2];
+        int ntables = 0;
+        tables[ntables] = &t->member_index;
+        require_migrated[ntables++] = 0; /* old/main: do not require */
+        if (t->member_rehash) {
+            tables[ntables] = &t->member_rehash->table;
+            require_migrated[ntables++] = 1;
+        }
+        for (int ti = 0; ti < ntables; ti++) {
+            zbtIndexTable *table = tables[ti];
+            unsigned long slot_live = 0;
+            for (unsigned long i = 0; i < table->size; i++) {
+                zbtIndexBucket *bucket = zbtIndexBucketAt(table, i);
+                uint64_t tags = zbtIndexTags(bucket);
+                for (unsigned int pos = 0; pos < ZBT_INDEX_BUCKET_ITEMS; pos++) {
+                    uint8_t tag = (uint8_t)(tags >> (pos * 8));
+                    uint32_t id = zbtIndexGetId(table, bucket, pos);
+                    if (tag == 0) continue;
+                    if (id == ZBT_INDEX_DELETED_ID) continue;
+                    slot_live++;
+                    serverAssert(id < t->next_score_leaf_id);
+                    zbtLeaf *leaf = t->table_to_leaf[id];
+                    serverAssert(leaf != NULL && !ZBT_IS_FREE_LEAF_ID(leaf));
+                    serverAssert(leaf->id == id);
+                    if (require_migrated[ti])
+                        serverAssert(zbtIndexLeafMigrated(t, leaf));
+                    int found_tag = 0;
+                    for (uint32_t k = 0; k < leaf->n.count; k++) {
+                        uint8_t ltag = leaf->tags[k];
+                        if (ltag == tag || (tag == 1 && ltag == 0)) {
+                            found_tag = 1;
+                            break;
+                        }
+                    }
+                    serverAssert(found_tag);
+                }
+            }
+            serverAssert(slot_live == table->used);
+        }
+    }
 }
 
 /* Test allocator that always relocates the block, to exercise the pointer
@@ -1958,6 +3173,25 @@ static void zbtCheckNthInRange(zbtree *t, zrangespec *range, long n) {
         serverAssert(zbtIterPrev(&bwd) == zbtElemByRank(t, got_rank - 1, NULL));
     else
         serverAssert(zbtIterPrev(&bwd) == NULL);
+}
+
+typedef struct zbtTestScanData {
+    dict *seen;
+    unsigned long emitted;
+    int duplicate;
+} zbtTestScanData;
+
+static void zbtTestScanCollect(void *privdata, const unsigned char *ele,
+                               size_t len, double score)
+{
+    UNUSED(score);
+    zbtTestScanData *data = privdata;
+    sds member = sdsnewlen(ele, len);
+    if (dictAdd(data->seen, member, NULL) != DICT_OK) {
+        sdsfree(member);
+        data->duplicate = 1;
+    }
+    data->emitted++;
 }
 
 int zbtreeTest(int argc, char **argv, int flags) {
@@ -2031,6 +3265,28 @@ int zbtreeTest(int argc, char **argv, int flags) {
         test_cond("Forward scan sorted and complete", c == (unsigned long)N);
     }
 
+    /* A stable cursor scan must assign every member to exactly one index slot,
+     * even when several members in a leaf share the same hash tag. */
+    {
+        dictType scanType = {
+            dictSdsHash, NULL, NULL, dictSdsKeyCompare,
+            dictSdsDestructor, NULL, NULL
+        };
+        zbtTestScanData data = {
+            .seen = dictCreate(&scanType),
+            .emitted = 0,
+            .duplicate = 0,
+        };
+        uint64_t cursor = 0;
+        do {
+            cursor = zbtScan(t, cursor, 10, zbtTestScanCollect, &data);
+        } while (cursor != 0);
+        test_cond("Stable index scan is complete without duplicates",
+                  !data.duplicate && data.emitted == (unsigned long)N &&
+                  dictSize(data.seen) == (unsigned long)N);
+        dictRelease(data.seen);
+    }
+
     /* Delete half in random order. */
     for (int i = 0; i < N; i += 2) {
         zbtElem *e = elements[i].elem;
@@ -2061,6 +3317,44 @@ int zbtreeTest(int argc, char **argv, int flags) {
     zfree(elements);
     zbtFree(t);
 
+    /* A prepend split can create a leaf behind the active rehash cursor.
+     * Members moved there must remain visible before another rehash step
+     * eventually reaches the new leaf. */
+    {
+        const int BASE = 256;
+        zbtElem **arr = zmalloc(sizeof(zbtElem *) * BASE);
+        for (int i = 0; i < BASE; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "rh:%03d", i);
+            sds member = sdsnew(buf);
+            arr[i] = zbtCreateElem((double)i, member, sdslen(member), 0, NULL);
+            sdsfree(member);
+        }
+        zbtree *bt = zbtCreate();
+        zbtBuildFromSorted(bt, arr, BASE);
+        zfree(arr);
+
+        for (int i = BASE; i <= 496; i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "rh:%03d", i);
+            sds member = sdsnew(buf);
+            zbtInsert(bt, (double)i, member);
+            sdsfree(member);
+        }
+        sds newmin = sdsnew("rh:min");
+        zbtInsert(bt, -1, newmin);
+        sdsfree(newmin);
+
+        sds first = sdsnew("rh:000");
+        zbtElem *found = zbtFindMember(bt, first, NULL);
+        test_cond("Rehash preserves members moved by a prepend split",
+                  found != NULL && zbtGetScore(found) == 0 &&
+                  bt->length == 498);
+        sdsfree(first);
+        zbtDebugVerify(bt);
+        zbtFree(bt);
+    }
+
     /* --- Bottom-up bulk build and batched range deletion --- */
     /* Cover boundary sizes around leaf/inner fan-out multiples. Every entry
      * must run: the multi-leaf sizes are the only ones that exercise range
@@ -2069,7 +3363,6 @@ int zbtreeTest(int argc, char **argv, int flags) {
                                 ZBT_LEAF_MAX * ZBT_INNER_MAX + 3, 5000};
     for (int trial = 0; trial < (int)(sizeof(sizes) / sizeof(sizes[0])); trial++) {
         int M = sizes[trial];
-        dict *d = dictCreate(&zsetDictType);
         zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
         for (int i = 0; i < M; i++) {
             char buf[32];
@@ -2080,8 +3373,6 @@ int zbtreeTest(int argc, char **argv, int flags) {
         }
         zbtree *bt = zbtCreate();
         zbtBuildFromSorted(bt, arr, M);
-        for (int i = 0; i < M; i++)
-            serverAssert(dictAdd(d, arr[i], NULL) == DICT_OK);
         zfree(arr);
         zbtDebugVerify(bt);
         serverAssert(bt->length == (unsigned long)M);
@@ -2089,33 +3380,26 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(zbtGetScore(zbtElemByRank(bt, M, NULL)) == (double)(M - 1));
 
         if (M >= 10) {
-            /* Remove a middle window and confirm dict/tree stay in sync. */
             unsigned long lo = M / 4 + 1, hi = M / 2;
             unsigned long want = hi - lo + 1;
-            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, d);
+            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi);
             zbtDebugVerify(bt);
             serverAssert(got == want);
             serverAssert(bt->length == (unsigned long)M - want);
-            serverAssert(dictSize(d) == bt->length);
-            /* Score suffix removal. */
             zrangespec rs = {.min = (double)(M * 3 / 4), .max = 1.0 / 0.0,
                              .minex = 0, .maxex = 0};
-            zbtDeleteRangeByScore(bt, &rs, d);
+            zbtDeleteRangeByScore(bt, &rs);
             zbtDebugVerify(bt);
-            serverAssert(dictSize(d) == bt->length);
         }
-        /* Remove everything that is left. */
-        zbtDeleteRangeByRank(bt, 1, bt->length, d);
+        zbtDeleteRangeByRank(bt, 1, bt->length);
         zbtDebugVerify(bt);
-        serverAssert(bt->length == 0 && dictSize(d) == 0);
-        dictRelease(d);
+        serverAssert(bt->length == 0);
         zbtFree(bt);
     }
     test_cond("Bulk build + range delete", 1);
 
     /* --- Cached hashes for large-member range deletion --- */
     {
-        dict *d = dictCreate(&zsetDictType);
         zbtree *bt = zbtCreate();
         char longbuf[ZBT_CACHE_HASH_MIN_LEN];
         memset(longbuf, 'x', sizeof(longbuf));
@@ -2132,18 +3416,15 @@ int zbtreeTest(int argc, char **argv, int flags) {
         serverAssert(zbtHasCachedHash(again));
         serverAssert(zbtGetCachedHash(again) == known);
         zbtFreeElem(again);
-        serverAssert(dictAdd(d, large_elem, NULL) == DICT_OK);
-        serverAssert(dictAdd(d, small_elem, NULL) == DICT_OK);
 
-        serverAssert(zbtDeleteRangeByRank(bt, 1, 1, d) == 1);
-        serverAssert(dictFind(d, large) == NULL);
-        serverAssert(dictFind(d, small) != NULL);
-        serverAssert(zbtDeleteRangeByRank(bt, 1, 1, d) == 1);
-        serverAssert(dictSize(d) == 0 && bt->length == 0);
+        serverAssert(zbtDeleteRangeByRank(bt, 1, 1) == 1);
+        serverAssert(zbtFindMember(bt, large, NULL) == NULL);
+        serverAssert(zbtFindMember(bt, small, NULL) != NULL);
+        serverAssert(zbtDeleteRangeByRank(bt, 1, 1) == 1);
+        serverAssert(bt->length == 0);
 
         sdsfree(large);
         sdsfree(small);
-        dictRelease(d);
         zbtFree(bt);
     }
     test_cond("Large members use cached hashes for range deletion", 1);
@@ -2151,7 +3432,6 @@ int zbtreeTest(int argc, char **argv, int flags) {
     /* --- Random-window range deletion, checking occupancy --- */
     {
         const int M = 20000;
-        dict *d = dictCreate(&zsetDictType);
         zbtElem **arr = zmalloc(sizeof(zbtElem *) * M);
         for (int i = 0; i < M; i++) {
             char buf[32];
@@ -2162,14 +3442,8 @@ int zbtreeTest(int argc, char **argv, int flags) {
         }
         zbtree *bt = zbtCreate();
         zbtBuildFromSorted(bt, arr, M);
-        for (int i = 0; i < M; i++)
-            serverAssert(dictAdd(d, arr[i], NULL) == DICT_OK);
         zfree(arr);
 
-        /* Delete windows wide enough to empty whole leaves, from positions
-         * that do not line up with leaf boundaries. zbtDebugVerify() asserts
-         * the minimum-occupancy invariant, which a single-element borrow
-         * cannot maintain against slice-at-a-time deletion. */
         unsigned long seed = 12345;
         while (bt->length > 200) {
             seed = seed * 1103515245 + 12345;
@@ -2179,19 +3453,16 @@ int zbtreeTest(int argc, char **argv, int flags) {
             unsigned long hi = lo + span;
             if (hi > bt->length) hi = bt->length;
             unsigned long before = bt->length;
-            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi, d);
+            unsigned long got = zbtDeleteRangeByRank(bt, lo, hi);
             zbtDebugVerify(bt);
             serverAssert(got == hi - lo + 1);
             serverAssert(bt->length == before - got);
-            serverAssert(dictSize(d) == bt->length);
-            /* Ranks stay dense and ordered after every window removal. */
             serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, 1, NULL)) == 1);
             serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, bt->length, NULL))
                          == bt->length);
         }
-        zbtDeleteRangeByRank(bt, 1, bt->length, d);
-        serverAssert(bt->length == 0 && dictSize(d) == 0);
-        dictRelease(d);
+        zbtDeleteRangeByRank(bt, 1, bt->length);
+        serverAssert(bt->length == 0);
         zbtFree(bt);
     }
     test_cond("Random-window range delete keeps occupancy", 1);

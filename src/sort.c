@@ -498,22 +498,20 @@ void sortCommandGeneric(client *c, int readonly) {
         start = 0;
     } else if (sortval->type == OBJ_ZSET) {
         if (sortval->encoding == OBJ_ENCODING_BTREE) {
-            dict *set = ((zset*)sortval->ptr)->dict;
-            dictIterator di;
-            dictEntry *setele;
+            zset *zs = sortval->ptr;
+            zbtIter it;
+            zbtElem *setele;
             sds sdsele;
 
             if (server.memory_tracking_enabled)
                 oldsize = kvobjAllocSize(sortval);
-            dictInitIterator(&di, set);
-            while((setele = dictNext(&di)) != NULL) {
-                sdsele = zbtGetEle(dictGetKey(setele));
+            for (setele = zbtFirst(zs->tree, &it); setele; setele = zbtIterNext(&it)) {
+                sdsele = zbtGetEle(setele);
                 vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
                 vector[j].u.score = 0;
                 vector[j].u.cmpobj = NULL;
                 j++;
             }
-            dictResetIterator(&di);
             if (server.memory_tracking_enabled)
                 updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), sortval, oldsize, kvobjAllocSize(sortval));
         } else if (sortval->encoding == OBJ_ENCODING_LISTPACK) {

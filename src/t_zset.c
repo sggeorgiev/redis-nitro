@@ -21,24 +21,19 @@
  * in order to get O(log(N)) INSERT and REMOVE operations into a sorted
  * data structure.
  *
- * The elements are added to a hash table mapping Redis objects to scores.
- * At the same time the elements are added to an order-statistic B+ tree (see
- * zbtree.c) mapping scores to Redis objects (so objects are sorted by scores
- * in this "view"). Small sorted sets use a listpack instead.
+ * The elements are indexed by an open-addressed hash table of leaf IDs
+ * (see zbtree.c) and stored in an order-statistic B+ tree mapping scores
+ * to members. Small sorted sets use a listpack instead.
  *
- * Note that the SDS string representing the element is the same in both the
- * hash table and the B+ tree in order to save memory: each element (zbtElem)
- * is a single allocation with the SDS embedded, and the dict stores the
- * element pointer as its key. The dictionary has no key destructor set, so we
- * should always remove an element from the dictionary first, and later from
- * the B+ tree (which owns and frees the element). */
+ * Each element (zbtElem) is a single allocation with the SDS embedded.
+ */
 #include "fast_float_strtod.h"
 #include "server.h"
 #include "intset.h"  /* Compact integer set structure */
 #include <math.h>
 
-/* dictType for zset's dict (maps sds member -> zbtElem*) */
-dictType zsetDictType = {
+/* Temporary membership of detached zbtElem* while assembling UNION/DIFF. */
+static dictType zsetStageDictType = {
     dictSdsHash,        /* hash function */
     NULL,               /* key dup */
     NULL,               /* val dup */
@@ -56,7 +51,7 @@ static uint64_t zsetDictHashElem(const void *stored) {
 
 /* Index already-built elements. Uses each element's cached member hash when
  * present so long members are not siphashed a second time. */
-static void zsetDictIndexElems(dict *d, zbtElem **elems, unsigned long n) {
+static void zsetStageIndexElems(dict *d, zbtElem **elems, unsigned long n) {
     dictAddNonExistingBatchHashed(d, (void **)elems, n, zsetDictHashElem);
 }
 
@@ -660,10 +655,8 @@ size_t zsetAllocSize(const robj *o) {
     if (o->encoding == OBJ_ENCODING_LISTPACK) {
         size = lpBytes(o->ptr);
     } else if (o->encoding == OBJ_ENCODING_BTREE) {
-        dict *d = ((zset*)o->ptr)->dict;
-        zbtree *t = ((zset*)o->ptr)->tree;
-        size = sizeof(zset) + zbtAllocSize(t) +
-            sizeof(dict) + dictMemUsage(d);
+        zset *zs = o->ptr;
+        size = sizeof(zset) + zbtAllocSize(zs->tree);
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -687,7 +680,7 @@ robj *zsetTypeCreate(size_t size_hint, size_t val_len_hint) {
 
     robj *zobj = createZsetObject();
     zset *zs = zobj->ptr;
-    dictExpand(zs->dict, size_hint);
+    zbtIndexReserve(zs->tree, size_hint);
     return zobj;
 }
 
@@ -726,11 +719,8 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
             serverPanic("Unknown target encoding");
 
         zs = zmalloc(sizeof(*zs));
-        zs->dict = dictCreate(&zsetDictType);
         zs->tree = zbtCreate();
-
-        /* Presize the dict to avoid rehashing */
-        dictExpand(zs->dict, cap);
+        zbtIndexReserve(zs->tree, cap);
 
         /* The listpack already stores elements in ascending (score, member)
          * order, so collect them and build the tree bottom-up in O(N) rather
@@ -760,7 +750,6 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         }
         /* Members from a listpack-encoded zset are unique, so index them in one
          * batch that skips the per-insert duplicate scan. */
-        zsetDictIndexElems(zs->dict, elems, cnt);
         zbtBuildFromSorted(zs->tree, elems, cnt);
         zfree(elems);
 
@@ -775,7 +764,6 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
         /* Walk the tree in order building the listpack, then free the tree. */
         zs = zobj->ptr;
-        dictRelease(zs->dict);
         zbtIter it;
         zbtElem *elem = zbtFirst(zs->tree, &it);
         while (elem) {
@@ -818,9 +806,8 @@ int zsetScore(robj *zobj, sds member, double *score) {
         if (zzlFind(zobj->ptr, member, score) == NULL) return C_ERR;
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
-        dictEntry *de = dictFind(zs->dict, member);
-        if (de == NULL) return C_ERR;
-        zbtElem *znode = dictGetKey(de);
+        zbtElem *znode = zbtFindMember(zs->tree, member, NULL);
+        if (znode == NULL) return C_ERR;
         *score = zbtGetScore(znode);
     } else {
         serverPanic("Unknown sorted set encoding");
@@ -948,30 +935,19 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
      * converted the key to skiplist. */
     if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
-        zbtElem *znode;
-        dictEntry *de;
-        dictEntryLink bucket, link;
-
-        /* Use dictFindLinkByHash so a new long member can reuse this hash
-         * when the element is created. */
+        zbtreeInsertPosition position;
         uint64_t elehash = dictSdsHash(ele);
-        link = dictFindLinkByHash(zs->dict, ele, elehash, &bucket);
+        zbtElem *znode = zbtFindMemberHash(zs->tree, ele, (uint32_t)elehash,
+                                           &position);
 
-        if (link != NULL) {
-            /* Element exists - get the dictEntry from the link */
-            de = *link;
-
-            /* NX? Return, same element already exists. */
+        if (znode != NULL) {
             if (nx) {
                 *out_flags |= ZADD_OUT_NOP;
                 return 1;
             }
 
-            /* Get the node pointer from dict entry */
-            znode = dictGetKey(de);
             curscore = zbtGetScore(znode);
 
-            /* Prepare the score for the increment if needed. */
             if (incr) {
                 score += curscore;
                 if (isnan(score)) {
@@ -980,7 +956,6 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
                 }
             }
 
-            /* GT/LT? Only update if score is greater/less than current. */
             if ((lt && score >= curscore) || (gt && score <= curscore)) {
                 *out_flags |= ZADD_OUT_NOP;
                 return 1;
@@ -988,21 +963,13 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             if (newscore) *newscore = score;
 
-            /* Remove and re-insert when score changes. */
             if (score != curscore) {
-                zbtElem *newnode = zbtUpdateScore(zs->tree, znode, score);
-                if (newnode != znode)
-                    dictSetKeyAtLink(zs->dict, newnode, &link, 0);
+                zbtUpdateScore(zs->tree, znode, score);
                 *out_flags |= ZADD_OUT_UPDATED;
             }
             return 1;
         } else if (!xx) {
-            /* Element doesn't exist - create element with embedded sds and add to tree */
-            znode = zbtInsertWithHash(zs->tree, score, ele, &elehash);
-
-            /* Add element pointer to dict using the bucket we already found */
-            dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
-
+            zbtInsertWithHashAt(zs->tree, score, ele, &elehash, &position);
             *out_flags |= ZADD_OUT_ADDED;
             if (newscore) *newscore = score;
             return 1;
@@ -1016,45 +983,22 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
     return 0; /* Never reached. */
 }
 
-/* Deletes the element 'ele' from the sorted set encoded as a skiplist+dict,
- * returning 1 if the element existed and was deleted, 0 otherwise (the
- * element was not there). It does not resize the dict after deleting the
- * element. */
-static int zsetRemoveFromSkiplist(zset *zs, sds ele) {
-    dictEntry *de;
-
-    de = dictUnlink(zs->dict,ele);
-    if (de != NULL) {
-        /* Get the element in order to delete it from the tree later. */
-        zbtElem *znode = dictGetKey(de);
-
-        /* Delete from the hash table and later from the tree.
-         * Note that the order is important: deleting from the tree
-         * actually releases the SDS string representing the element,
-         * which is shared between the tree and the hash table, so
-         * we need to delete from the tree as the final step. */
-        dictFreeUnlinkedEntry(zs->dict,de);
-
-        /* Delete from the tree. */
-        zbtDeleteElem(zs->tree, znode);
-
-        return 1;
-    }
-
-    return 0;
+/* Deletes the element 'ele' from a B+ tree sorted set, returning 1 if the
+ * element existed and was deleted, 0 otherwise. */
+static int zsetRemoveFromBtree(zset *zs, sds ele) {
+    zbtElem *znode = zbtFindMember(zs->tree, ele, NULL);
+    if (znode == NULL) return 0;
+    zbtDeleteElem(zs->tree, znode);
+    return 1;
 }
 
-/* Same, for a destination zset still being assembled: its elements are held by
- * the dict alone until zsetBuildTreeFromDict() hands them to the tree, so
- * dropping the entry here leaves the element for us to free. Returns 1 if the
- * member was present. */
-static int zsetRemoveDetached(zset *zs, sds ele, int has_hash, uint64_t hash) {
-    dictEntry *de = has_hash ? dictUnlinkByHash(zs->dict, ele, hash)
-                             : dictUnlink(zs->dict, ele);
+static int zsetRemoveDetached(dict *stage, sds ele, int has_hash, uint64_t hash) {
+    dictEntry *de = has_hash ? dictUnlinkByHash(stage, ele, hash)
+                             : dictUnlink(stage, ele);
     if (de == NULL) return 0;
 
     zbtElem *znode = dictGetKey(de);
-    dictFreeUnlinkedEntry(zs->dict, de);
+    dictFreeUnlinkedEntry(stage, de);
     zbtFreeElem(znode);
     return 1;
 }
@@ -1071,7 +1015,7 @@ int zsetDel(robj *zobj, sds ele) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
-        if (zsetRemoveFromSkiplist(zs, ele)) {
+        if (zsetRemoveFromBtree(zs, ele)) {
             return 1;
         }
     } else {
@@ -1129,11 +1073,9 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
         zbtree *t = zs->tree;
-        dictEntry *de;
 
-        de = dictFind(zs->dict,ele);
-        if (de != NULL) {
-            zbtElem *n = dictGetKey(de);
+        zbtElem *n = zbtFindMember(t, ele, NULL);
+        if (n != NULL) {
             rank = zbtRankByElem(t, n);
             /* Existing elements always have a rank. */
             serverAssert(rank != 0);
@@ -1175,7 +1117,6 @@ robj *zsetDup(robj *o) {
         zobj = createZsetObject();
         zs = o->ptr;
         new_zs = zobj->ptr;
-        dictExpand(new_zs->dict,dictSize(zs->dict));
         zbtree *t = zs->tree;
 
         /* The source is already ordered, so copy the elements into a buffer and
@@ -1200,7 +1141,6 @@ robj *zsetDup(robj *o) {
         }
         /* The source zset's members are unique, so index the copies in one
          * batch that skips the per-insert duplicate scan. */
-        zsetDictIndexElems(new_zs->dict, elems, cnt);
         zbtBuildFromSorted(new_zs->tree, elems, cnt);
         zfree(elems);
     } else {
@@ -1230,8 +1170,7 @@ void zsetReplyFromListpackEntry(client *c, listpackEntry *e) {
 void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, listpackEntry *key, double *score) {
     if (zsetobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zsetobj->ptr;
-        dictEntry *de = dictGetFairRandomKey(zs->dict);
-        zbtElem *znode = dictGetKey(de);
+        zbtElem *znode = zbtRandomElem(zs->tree);
         sds s = zbtGetEle(znode);
         key->sval = (unsigned char*)s;
         key->slen = sdslen(s);
@@ -1354,10 +1293,10 @@ void zaddGenericCommand(client *c, int flags) {
         oldsize = kvobjAllocSize(zobj);
     unsigned long llen = zsetLength(zobj);
 
-    /* Bulk-build an empty B+ tree: stage unique members in the dict, then pack
-     * the tree in one bottom-up pass. A repeated member is the only way NX, GT,
-     * or LT can matter against an empty destination; flush and finish those
-     * remaining pairs with zsetAdd() so flag logic stays in one place. */
+    /* Bulk-build an empty B+ tree: collect unique members, then pack the tree
+     * in one bottom-up pass. A repeated member is the only way NX, GT, or LT
+     * can matter against an empty destination; flush and finish those remaining
+     * pairs with zsetAdd() so flag logic stays in one place. */
     j = 0;
     if (zobj->encoding == OBJ_ENCODING_BTREE && llen == 0 &&
         !incr && !xx && elements > 1)
@@ -1365,6 +1304,7 @@ void zaddGenericCommand(client *c, int flags) {
         zset *zs = zobj->ptr;
         zbtElem **staged = zmalloc(sizeof(zbtElem *) * (size_t)elements);
         unsigned long staged_cnt = 0;
+        dict *seen = dictCreate(&zsetStageDictType);
 
         for (; j < elements; j++) {
             dictEntryLink bucket, link;
@@ -1372,7 +1312,7 @@ void zaddGenericCommand(client *c, int flags) {
             score = scores[j];
             ele = c->argv[scoreidx+1+j*2]->ptr;
             uint64_t elehash = dictSdsHash(ele);
-            link = dictFindLinkByHash(zs->dict, ele, elehash, &bucket);
+            link = dictFindLinkByHash(seen, ele, elehash, &bucket);
             if (link != NULL) {
                 zsetBuildTreeFromElems(zs, staged, staged_cnt);
                 zfree(staged);
@@ -1382,7 +1322,7 @@ void zaddGenericCommand(client *c, int flags) {
 
             zbtElem *znode = zbtCreateElemWithHash(score, ele, sdslen(ele), 0,
                                                    NULL, &elehash);
-            dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
+            dictSetKeyAtLink(seen, znode, &bucket, 1);
             staged[staged_cnt++] = znode;
             added++;
             processed++;
@@ -1392,6 +1332,7 @@ void zaddGenericCommand(client *c, int flags) {
             zsetBuildTreeFromElems(zs, staged, staged_cnt);
             zfree(staged);
         }
+        dictRelease(seen);
     }
 
     for (; j < elements; j++) {
@@ -1455,8 +1396,6 @@ void zremCommand(client *c) {
     int64_t oldlen = (int64_t) zsetLength(zobj);
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(zobj);
-    if (zobj->encoding == OBJ_ENCODING_BTREE)
-        dictPauseAutoResize(((zset*)zobj->ptr)->dict);
     for (j = 2; j < c->argc; j++) {
         if (zsetDel(zobj, c->argv[j]->ptr)) deleted++;
         if (zsetLength(zobj) == 0) {
@@ -1469,8 +1408,7 @@ void zremCommand(client *c) {
         }
     }
     if (!keyremoved && zobj->encoding == OBJ_ENCODING_BTREE) {
-        dictResumeAutoResize(((zset*)zobj->ptr)->dict);
-        dictShrinkIfNeededAndComplete(((zset*)zobj->ptr)->dict);
+        zbtIndexMaintenance(((zset *)zobj->ptr)->tree, 16);
     }
 
     if (server.memory_tracking_enabled && !keyremoved)
@@ -1574,27 +1512,23 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = zobj->ptr;
-        dictPauseAutoResize(zs->dict);
         switch(rangetype) {
         case ZRANGE_AUTO:
         case ZRANGE_RANK:
-            deleted = zbtDeleteRangeByRank(zs->tree,start+1,end+1,zs->dict);
+            deleted = zbtDeleteRangeByRank(zs->tree,start+1,end+1);
             break;
         case ZRANGE_SCORE:
-            deleted = zbtDeleteRangeByScore(zs->tree,&range,zs->dict);
+            deleted = zbtDeleteRangeByScore(zs->tree,&range);
             break;
         case ZRANGE_LEX:
-            deleted = zbtDeleteRangeByLex(zs->tree,&lexrange,zs->dict);
+            deleted = zbtDeleteRangeByLex(zs->tree,&lexrange);
             break;
         }
-        dictResumeAutoResize(zs->dict);
-        if (dictSize(zs->dict) == 0) {
+        if (zsetLength(zobj) == 0) {
             if (server.memory_tracking_enabled)
                 updateSlotAllocSize(c->db, getKeySlot(key->ptr), zobj, oldsize, kvobjAllocSize(zobj));
             dbDeleteSkipKeysizesUpdate(c->db, key);
             keyremoved = 1;
-        } else {
-            dictShrinkIfNeededAndComplete(zs->dict);
         }
     } else {
         serverPanic("Unknown sorted set encoding");
@@ -1990,13 +1924,8 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
             }
         } else if (op->encoding == OBJ_ENCODING_BTREE) {
             zset *zs = op->subject->ptr;
-            dictEntry *de;
-            if (val->flags & OPVAL_HAS_HASH)
-                de = dictFindByHash(zs->dict, val->ele, val->hash);
-            else
-                de = dictFind(zs->dict, val->ele);
-            if (de != NULL) {
-                zbtElem *znode = dictGetKey(de);
+            zbtElem *znode = zbtFindMember(zs->tree, val->ele, NULL);
+            if (znode != NULL) {
                 *score = zbtGetScore(znode);
                 return 1;
             } else {
@@ -2165,6 +2094,7 @@ static robj *zsetCreateListpackFromElems(zbtElem **elems, unsigned long n) {
  * of the element array always stays with the caller. */
 robj *zsetCreateFromElems(robj *reuse, zbtElem **elems, unsigned long n,
                           size_t maxelelen, size_t totelelen, int dict_indexed) {
+    UNUSED(dict_indexed);
     serverAssert(!dict_indexed || reuse != NULL);
 
     zsetSortElems(elems, n);
@@ -2178,11 +2108,6 @@ robj *zsetCreateFromElems(robj *reuse, zbtElem **elems, unsigned long n,
 
     robj *zobj = reuse ? reuse : createZsetObject();
     zset *zs = zobj->ptr;
-    if (!dict_indexed) {
-        dictExpand(zs->dict, n);
-        zsetDictIndexElems(zs->dict, elems, n);
-    }
-    /* Already sorted above; skip zsetBuildTreeFromElems()'s second check. */
     serverAssert(zs->tree->length == 0);
     zbtBuildFromSorted(zs->tree, elems, n);
     return zobj;
@@ -2207,19 +2132,6 @@ void zsetBuildTreeFromElems(zset *zs, zbtElem **elems, unsigned long n) {
 
     zsetSortElems(elems, n);
     zbtBuildFromSorted(zs->tree, elems, n);
-}
-
-/* Same, for the elements registered in 'zs->dict', used where the discovery
- * order could not be recorded because elements are also removed again while the
- * result is assembled. A dict walk yields them in member-hash order, so this
- * variant always pays the sort. */
-void zsetBuildTreeFromDict(zset *zs) {
-    unsigned long n = dictSize(zs->dict);
-    if (n == 0) return;
-
-    zbtElem **elems = zsetCollectDictElems(zs->dict, &n, NULL, NULL);
-    zsetBuildTreeFromElems(zs, elems, n);
-    zfree(elems);
 }
 
 static void zdiffAlgorithm1(zsetopsrc *src, long setnum, size_t *maxelelen, size_t *totelelen,
@@ -2289,7 +2201,7 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, size_t *maxelelen, size
 }
 
 
-static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen,
+static void zdiffAlgorithm2(zsetopsrc *src, long setnum, dict *stage, size_t *maxelelen, size_t *totelelen,
                             zbtElem ***staged_out, unsigned long *staged_cnt_out, int store) {
     /* DIFF Algorithm 2:
      *
@@ -2315,7 +2227,7 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     zbtElem **src0elems = src0len ? zmalloc(sizeof(zbtElem *) * src0len) : NULL;
     unsigned long src0cnt = 0;
 
-    dictExpand(dstzset->dict, src0len);
+    dictExpand(stage, src0len);
 
     for (j = 0; j < setnum; j++) {
         if (zuiLength(&src[j]) == 0) continue;
@@ -2334,13 +2246,13 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
                 cardinality++;
                 sdsfree(tmp); /* zbtCreateElem copied it, we can free our copy */
             } else {
-                dictPauseAutoResize(dstzset->dict);
+                dictPauseAutoResize(stage);
                 tmp = zuiSdsFromValue(&zval);
-                if (zsetRemoveDetached(dstzset, tmp,
+                if (zsetRemoveDetached(stage, tmp,
                                        zval.flags & OPVAL_HAS_HASH, zval.hash)) {
                     cardinality--;
                 }
-                dictResumeAutoResize(dstzset->dict);
+                dictResumeAutoResize(stage);
             }
 
             /* Exit if result set is empty as any additional removal
@@ -2355,7 +2267,7 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
         /* Source 0 cannot empty the result (cardinality is incremented before
          * the zero check), so this is the unique-key batch of its members. */
         if (j == 0 && src0cnt > 0) {
-            zsetDictIndexElems(dstzset->dict, src0elems, src0cnt);
+            zsetStageIndexElems(stage, src0elems, src0cnt);
             zfree(src0elems);
             src0elems = NULL;
         }
@@ -2365,11 +2277,11 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
     zfree(src0elems);
 
     /* Resize dict if needed after removing multiple elements */
-    dictShrinkIfNeeded(dstzset->dict);
+    dictShrinkIfNeeded(stage);
 
     /* One walk both collects survivors and, for STORE, the listpack length
      * checks. Non-store replies never need those lengths. */
-    *staged_out = zsetCollectDictElems(dstzset->dict, staged_cnt_out,
+    *staged_out = zsetCollectDictElems(stage, staged_cnt_out,
                                        store ? maxelelen : NULL,
                                        store ? totelelen : NULL);
 }
@@ -2408,7 +2320,7 @@ static int zsetChooseDiffAlgorithm(zsetopsrc *src, long setnum) {
     return (algo_one_work <= algo_two_work) ? 1 : 2;
 }
 
-static void zdiff(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen,
+static void zdiff(zsetopsrc *src, long setnum, dict *stage, size_t *maxelelen, size_t *totelelen,
                   zbtElem ***staged_out, unsigned long *staged_cnt_out, int *dict_indexed, int store) {
     *staged_out = NULL;
     *staged_cnt_out = 0;
@@ -2421,7 +2333,7 @@ static void zdiff(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen,
             zdiffAlgorithm1(src, setnum, maxelelen, totelelen,
                             staged_out, staged_cnt_out);
         } else if (diff_algo == 2) {
-            zdiffAlgorithm2(src, setnum, dstzset, maxelelen, totelelen,
+            zdiffAlgorithm2(src, setnum, stage, maxelelen, totelelen,
                             staged_out, staged_cnt_out, store);
             *dict_indexed = 1;
         } else if (diff_algo != 0) {
@@ -2452,7 +2364,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     sds tmp;
     size_t maxelelen = 0, totelelen = 0;
     robj *dstobj = NULL;
-    zset *dstzset = NULL;
+    dict *stage = NULL;
     zbtElem *znode;
     zbtElem **staged = NULL;
     unsigned long staged_cnt = 0;
@@ -2579,7 +2491,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
      * In SINTERCARD case, we don't need the temp obj, so we can avoid creating it. */
     if (!cardinality_only) {
         dstobj = createZsetObject();
-        dstzset = dstobj->ptr;
+        stage = dictCreate(&zsetStageDictType);
     }
     memset(&zval, 0, sizeof(zval));
 
@@ -2651,7 +2563,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         if (setnum) {
             /* Our union is at least as large as the largest set.
              * Resize the dictionary ASAP to avoid useless rehashing. */
-            dictExpand(dstzset->dict,zuiLength(&src[setnum-1]));
+            dictExpand(stage,zuiLength(&src[setnum-1]));
         }
 
         /* Step 1: Iterate all sorted sets and aggregate scores.
@@ -2671,9 +2583,9 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 dictEntryLink bucket, link;
                 sds ele = zuiSdsFromValue(&zval);
                 if (zval.flags & OPVAL_HAS_HASH)
-                    link = dictFindLinkByHash(dstzset->dict, ele, zval.hash, &bucket);
+                    link = dictFindLinkByHash(stage, ele, zval.hash, &bucket);
                 else
-                    link = dictFindLink(dstzset->dict, ele, &bucket);
+                    link = dictFindLink(stage, ele, &bucket);
                 
                 if (link == NULL) {  /* if not exists */
                     /* New element: create node and insert into dict */
@@ -2688,7 +2600,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     znode = zbtCreateElemWithHash(score, tmp, sdslen(tmp), 1, NULL,
                                                   zuiHashPtr(&zval));
                     /* Add element pointer to dict using the bucket we already found */
-                    dictSetKeyAtLink(dstzset->dict, znode, &bucket, 1);
+                    dictSetKeyAtLink(stage, znode, &bucket, 1);
                     if (staged_cnt == staged_cap) {
                         staged_cap = staged_cap ? staged_cap * 2 : 64;
                         staged = zrealloc(staged, sizeof(zbtElem *) * staged_cap);
@@ -2709,7 +2621,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             zuiClearIterator(&src[i]);
         }
     } else if (op == SET_OP_DIFF) {
-        zdiff(src, setnum, dstzset, &maxelelen, &totelelen,
+        zdiff(src, setnum, stage, &maxelelen, &totelelen,
               &staged, &staged_cnt, &dict_indexed, dstkey != NULL);
     } else {
         serverPanic("Unknown operator");
@@ -2768,6 +2680,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         decrRefCount(dstobj);
         zsetFreeDetachedElems(staged, staged_cnt, server.lazyfree_lazy_server_del);
     }
+    if (stage) dictRelease(stage);
     zfree(src);
 }
 
@@ -3009,7 +2922,6 @@ static void zrangeResultBuildStagedTree(zrange_result_handler *handler)
     zset *zs = handler->dstobj->ptr;
     /* The range is taken from a sorted set, so members are unique: index them
      * in one batch that skips the per-insert duplicate scan. */
-    zsetDictIndexElems(zs->dict, elems, n);
     zbtBuildFromSortedWithSize(zs->tree, elems, n,
                                handler->staged_alloc_size);
     zfree(elems);
@@ -4106,17 +4018,13 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
             }
         }
 
-        dictPauseAutoResize(zs->dict);
         unsigned long deleted;
         if (where == ZSET_MAX) {
-            deleted = zbtDeleteRangeByRank(t, llen - result_count + 1, llen, zs->dict);
+            deleted = zbtDeleteRangeByRank(t, llen - result_count + 1, llen);
         } else {
-            deleted = zbtDeleteRangeByRank(t, 1, result_count, zs->dict);
+            deleted = zbtDeleteRangeByRank(t, 1, result_count);
         }
-        dictResumeAutoResize(zs->dict);
         serverAssertWithInfo(c, zobj, deleted == (unsigned long)result_count);
-
-        if (zsetLength(zobj) > 0) dictShrinkIfNeededAndComplete(zs->dict);
 
         char *events[2] = {"zpopmin","zpopmax"};
         notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
@@ -4360,8 +4268,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         if (zsetobj->encoding == OBJ_ENCODING_BTREE) {
             zset *zs = zsetobj->ptr;
             while (count--) {
-                dictEntry *de = dictGetFairRandomKey(zs->dict);
-                zbtElem *znode = dictGetKey(de);
+                zbtElem *znode = zbtRandomElem(zs->tree);
                 sds key = zbtGetEle(znode);
                 if (withscores && c->resp > 2)
                     addReplyArrayLen(c,2);

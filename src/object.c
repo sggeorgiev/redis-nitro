@@ -493,7 +493,6 @@ robj *createZsetObject(void) {
     zset *zs = zmalloc(sizeof(*zs));
     robj *o;
 
-    zs->dict = dictCreate(&zsetDictType);
     zs->tree = zbtCreate();
     o = createObject(OBJ_ZSET,zs);
     o->encoding = OBJ_ENCODING_BTREE;
@@ -586,7 +585,6 @@ void freeZsetObject(robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_BTREE:
         zs = o->ptr;
-        dictRelease(zs->dict);
         zbtFree(zs->tree);
         zfree(zs);
         break;
@@ -769,9 +767,7 @@ void dismissZsetObject(robj *o, size_t size_hint) {
                 zn = zbtIterNext(&it);
             }
         }
-
-        /* Dismiss hash table memory. */
-        dismissDictBucketsMemory(zs->dict);
+        zbtDismissIndex(t);
     } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
         dismissMemory(o->ptr, lpBytes((unsigned char*)o->ptr));
     } else {
