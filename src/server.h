@@ -1824,14 +1824,9 @@ struct zbtLeaf;     /* B+ tree leaf; private to zbtree.c */
  * stored because both the score encoding width and the sds header size vary,
  * so the member data does not sit at a fixed distance from the element start.
  *
- * 'leaf' is the leaf currently holding the element. Callers that reach an
- * element through the dict (ZRANK, ZREM, a score update) know what it is but
- * not where it sits, and re-deriving that with a root-to-leaf search costs a
- * bisection over sep[] per level, each probe dereferencing a separator in its
- * own allocation. The back-pointer turns those into an upward walk instead.
- * zbtree.c owns the field and re-stamps it whenever an element moves. */
+ * Element location in the tree is recorded in zbtreeInsertPosition after a
+ * member lookup, not in the element itself. */
 typedef struct zbtElem {
-    struct zbtLeaf *leaf;
     uint8_t enc;    /* ZBT_SCORE_* encoding tag */
     uint8_t moff;   /* offset from element start to member data */
     char data[];    /* [score bytes][sds header][member bytes] */
@@ -1918,6 +1913,23 @@ static inline uint64_t zbtElemHash(const zbtElem *e) {
     return dictGenHashFunction(ele, sdslen(ele));
 }
 
+/* Detached zbtElem values (bulk build, UNION/DIFF staging, RDB load) are not
+ * tree members until zbtBuildFromSorted* adopts them. */
+typedef struct zbtMemberView {
+    const unsigned char *ele;
+    size_t len;
+    double score;
+} zbtMemberView;
+
+static inline zbtMemberView zbtMemberViewFromElem(const zbtElem *e) {
+    sds ele = zbtGetEle(e);
+    zbtMemberView v;
+    v.ele = (const unsigned char *)ele;
+    v.len = sdslen(ele);
+    v.score = zbtGetScore(e);
+    return v;
+}
+
 /* B+ tree node is opaque outside zbtree.c. */
 typedef struct zbtNode zbtNode;
 
@@ -1960,6 +1972,8 @@ typedef struct zbtree {
     uint32_t free_score_leaf_id;
     uint32_t member_revision;
     zbtElem *pending_insert; /* not yet in the index (insert/split) */
+    struct zbtLeaf *pending_leaf;
+    int pending_leaf_idx;
 } zbtree;
 
 /* Lightweight position used for O(1) forward/backward range iteration. */
@@ -3358,6 +3372,8 @@ extern dictType BenchmarkDictType;
 typedef struct zbtreeInsertPosition {
     void *bucket;
     unsigned int pos;
+    void *leaf;            /* zbtLeaf* holding the member, when known */
+    unsigned int leaf_pos; /* index within that leaf's elems[] */
     uint32_t hash;
     uint32_t revision;
 } zbtreeInsertPosition;
@@ -3964,8 +3980,10 @@ zbtElem *zbtInsert(zbtree *t, double score, sds ele);
 zbtElem *zbtInsertWithHash(zbtree *t, double score, sds ele, const uint64_t *known_hash);
 zbtElem *zbtInsertWithHashAt(zbtree *t, double score, sds ele, const uint64_t *known_hash,
                              const zbtreeInsertPosition *position);
-void zbtDeleteElem(zbtree *t, zbtElem *e);
-zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore);
+void zbtDeleteElem(zbtree *t, zbtElem *e,
+                   const zbtreeInsertPosition *where);
+zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore,
+                        const zbtreeInsertPosition *where);
 int zbtCompare(double score, sds ele, const zbtElem *e);
 const void *zbtGetEleForDict(const void *elem);
 zbtElem *zbtFindMember(zbtree *t, sds ele, zbtreeInsertPosition *position);
@@ -3979,7 +3997,8 @@ zbtElem *zbtRandomElem(zbtree *t);
 uint64_t zbtScan(zbtree *t, uint64_t cursor, unsigned long count,
                  zbtScanFunction *fn, void *privdata);
 void zbtDismissIndex(zbtree *t);
-unsigned long zbtRankByElem(zbtree *t, zbtElem *e);
+unsigned long zbtRankByElem(zbtree *t, zbtElem *e,
+                            const zbtreeInsertPosition *where);
 unsigned long zbtGetRank(zbtree *t, double score, sds ele);
 zbtElem *zbtElemByRank(zbtree *t, unsigned long rank, zbtIter *it);
 zbtElem *zbtElemByEndOffset(zbtree *t, unsigned long offset, int reverse, zbtIter *it);
@@ -3993,7 +4012,8 @@ zbtElem *zbtNthInLexRange(zbtree *t, zlexrangespec *range, long n, unsigned long
 unsigned long zbtDeleteRangeByScore(zbtree *t, zrangespec *range);
 unsigned long zbtDeleteRangeByLex(zbtree *t, zlexrangespec *range);
 unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned long start, unsigned long end);
-void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe);
+void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe, struct zbtLeaf *lf,
+                    int idx);
 void zbtDefragNodes(zbtree *t, void *(*fn)(void *));
 int zbtDefragNodesIncremental(zbtree *t, void *(*fn)(void *), unsigned int budget);
 void zbtDefragIndex(zbtree *t, void *(*fn)(void *));

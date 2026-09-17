@@ -964,7 +964,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             if (newscore) *newscore = score;
 
             if (score != curscore) {
-                zbtUpdateScore(zs->tree, znode, score);
+                zbtUpdateScore(zs->tree, znode, score, &position);
                 *out_flags |= ZADD_OUT_UPDATED;
             }
             return 1;
@@ -986,9 +986,10 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 /* Deletes the element 'ele' from a B+ tree sorted set, returning 1 if the
  * element existed and was deleted, 0 otherwise. */
 static int zsetRemoveFromBtree(zset *zs, sds ele) {
-    zbtElem *znode = zbtFindMember(zs->tree, ele, NULL);
+    zbtreeInsertPosition position;
+    zbtElem *znode = zbtFindMember(zs->tree, ele, &position);
     if (znode == NULL) return 0;
-    zbtDeleteElem(zs->tree, znode);
+    zbtDeleteElem(zs->tree, znode, &position);
     return 1;
 }
 
@@ -1074,9 +1075,10 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
         zset *zs = zobj->ptr;
         zbtree *t = zs->tree;
 
-        zbtElem *n = zbtFindMember(t, ele, NULL);
+        zbtreeInsertPosition position;
+        zbtElem *n = zbtFindMember(t, ele, &position);
         if (n != NULL) {
-            rank = zbtRankByElem(t, n);
+            rank = zbtRankByElem(t, n, &position);
             /* Existing elements always have a rank. */
             serverAssert(rank != 0);
             if (output_score)

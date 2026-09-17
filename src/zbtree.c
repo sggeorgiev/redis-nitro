@@ -50,7 +50,9 @@
  * latency of) - not worth the extra branches in a hot path, so left out. */
 #define ZBT_LEAF_MAX   64
 #define ZBT_LEAF_MIN   (ZBT_LEAF_MAX/2)
-#define ZBT_INNER_MAX  64
+/* 62 keeps sizeof(zbtInner) at 1528 bytes (jemalloc 1536 class) instead of
+ * 1576 bytes rounding up to 1792. */
+#define ZBT_INNER_MAX  62
 #define ZBT_INNER_MIN  (ZBT_INNER_MAX/2)
 /* Offsets up to this many elements are reached by stepping along the leaf
  * chain, which stays cheaper than the root-to-leaf descent zbtElemByRank()
@@ -220,7 +222,6 @@ zbtElem *zbtCreateElemWithHash(double score, const char *buf, size_t len,
     size_t total = hdr + sds_buf_size;
 
     zbtElem *e = zmalloc_usable(total, usable);
-    e->leaf = NULL;   /* set when the element is placed in a leaf */
     e->enc = enc | (cache_hash ? ZBT_ELEM_CACHED_HASH : 0);
     memcpy(e->data, sbuf, score_sz);
     size_t sds_offset = hdr + sds_hdr_len;
@@ -248,7 +249,6 @@ zbtElem *zbtDupElem(const zbtElem *elem, size_t *usable) {
     size_t size = zbtGetOffset(elem) + sdslen(zbtGetEle(elem)) + 1;
     zbtElem *copy = zmalloc_usable(size, usable);
     memcpy(copy, elem, size);
-    copy->leaf = NULL;  /* the copy is not in a tree yet */
     return copy;
 }
 
@@ -358,7 +358,6 @@ static uint8_t zbtElemLeafTag(const zbtElem *e) {
 static void zbtLeafSetElem(zbtLeaf *lf, int idx, zbtElem *e) {
     lf->elems[idx] = e;
     lf->tags[idx] = zbtElemLeafTag(e);
-    e->leaf = lf;
 }
 
 static void *zbtAlloc(zbtree *t, size_t bytes) {
@@ -989,6 +988,33 @@ found:
     return 1;
 }
 
+/* Resolve the leaf slot holding 'e'. Uses 'where' from a recent find when
+ * revision matches; otherwise looks up via the member index. */
+static int zbtElemLocate(zbtree *t, zbtElem *e,
+                         const zbtreeInsertPosition *where,
+                         zbtLeaf **lf_out, int *idx_out)
+{
+    if (where && where->revision == t->member_revision && where->leaf) {
+        zbtLeaf *lf = (zbtLeaf *)where->leaf;
+        unsigned int pos = where->leaf_pos;
+        serverAssert(pos < lf->n.count && lf->elems[pos] == e);
+        *lf_out = lf;
+        *idx_out = (int)pos;
+        return 1;
+    }
+    sds ele = zbtGetEle(e);
+    uint32_t hash = (uint32_t)dictSdsHash(ele);
+    zbtLeaf *lf = NULL;
+    unsigned int leaf_pos = 0;
+    if (!zbtIndexFind(t, hash, (const unsigned char *)ele, sdslen(ele),
+                      &lf, &leaf_pos, NULL, NULL))
+        return 0;
+    serverAssert(lf->elems[leaf_pos] == e);
+    *lf_out = lf;
+    *idx_out = (int)leaf_pos;
+    return 1;
+}
+
 static int zbtIndexFindReference(zbtree *t, uint32_t hash,
                                  uint32_t leaf_id,
                                  zbtIndexBucket **found_bucket,
@@ -1118,11 +1144,11 @@ static void zbtIndexInsert(zbtree *t, uint32_t hash, uint32_t leaf_id,
     zbtIndexRehashStep(t, 1);
 }
 
-static void zbtIndexDeleteElem(zbtree *t, zbtElem *e) {
+static void zbtIndexDeleteElem(zbtree *t, zbtElem *e, zbtLeaf *lf) {
     uint32_t hash = zbtElemIndexHash(e);
     zbtIndexBucket *bucket;
     unsigned int pos;
-    serverAssert(zbtIndexFindReference(t, hash, e->leaf->id, &bucket, &pos));
+    serverAssert(zbtIndexFindReference(t, hash, lf->id, &bucket, &pos));
     zbtIndexDeleteAt(t, bucket, pos);
 }
 
@@ -1138,6 +1164,8 @@ zbtElem *zbtFindMemberHash(zbtree *t, sds ele, uint32_t hash,
     if (position) {
         position->bucket = bucket;
         position->pos = pos;
+        position->leaf = leaf;
+        position->leaf_pos = leaf_pos;
         position->hash = hash;
         position->revision = t->member_revision;
     }
@@ -1448,15 +1476,10 @@ static int zbtChildIdx(zbtInner *p, zbtNode *c) {
     serverPanic("zbtree: child not found in parent");
 }
 
-/* Record 'lf' as the owner of elems[from, to). Every path that puts an element
- * into a leaf slot it did not previously occupy has to call this, or the
- * element's back-pointer goes stale and zbtRankByElem() walks up from the
- * wrong leaf. zbtDebugVerify() checks the whole tree for exactly that. */
+/* Refresh hash tags for elems[from, to) after a bulk move into 'lf'. */
 static void zbtLeafClaim(zbtLeaf *lf, int from, int to) {
-    for (int i = from; i < to; i++) {
-        lf->elems[i]->leaf = lf;
+    for (int i = from; i < to; i++)
         lf->tags[i] = zbtElemLeafTag(lf->elems[i]);
-    }
 }
 
 /* Choose the child of inner node 'in' whose key range contains (score,ele).
@@ -1523,11 +1546,6 @@ static int zbtLeafSearch(zbtLeaf *lf, double score, sds ele, int *found,
 /* Locate an element already known to live in this leaf. The caller holds the
  * exact pointer (it came out of the ZSET dict), so identity over the packed
  * slot array answers the question without dereferencing any element. */
-static int zbtLeafFindPtr(zbtLeaf *lf, const zbtElem *e) {
-    for (uint32_t i = 0; i < lf->n.count; i++)
-        if (lf->elems[i] == e) return (int)i;
-    return -1;
-}
 
 /* Refresh csize/sep for every ancestor of 'n' up to the root. Used after an
  * insertion, deletion or in-place element replacement changed a subtree.
@@ -1801,6 +1819,19 @@ static void zbtInsertElem(zbtree *t, zbtElem *e, size_t usable) {
     } else {
         zbtUpdateToRoot(t, (zbtNode *)lf);
     }
+
+    if (t->pending_insert == e) {
+        for (zbtLeaf *scan = (zbtLeaf *)t->head; scan; scan = scan->next) {
+            for (uint32_t i = 0; i < scan->n.count; i++) {
+                if (scan->elems[i] == e) {
+                    t->pending_leaf = scan;
+                    t->pending_leaf_idx = (int)i;
+                    return;
+                }
+            }
+        }
+        serverAssert(0);
+    }
 }
 
 zbtElem *zbtInsertWithHashAt(zbtree *t, double score, sds ele,
@@ -1811,9 +1842,12 @@ zbtElem *zbtInsertWithHashAt(zbtree *t, double score, sds ele,
     zbtElem *e = zbtCreateElemWithHash(score, ele, sdslen(ele), 0, &usable, known_hash);
     zbtIndexExpandIfNeeded(t, 1);
     t->pending_insert = e;
+    t->pending_leaf = NULL;
     zbtInsertElem(t, e, usable);
-    zbtIndexInsert(t, zbtElemIndexHash(e), e->leaf->id, position);
+    serverAssert(t->pending_leaf != NULL);
+    zbtIndexInsert(t, zbtElemIndexHash(e), t->pending_leaf->id, position);
     t->pending_insert = NULL;
+    t->pending_leaf = NULL;
     zbtIndexInvalidateScan(t);
     return e;
 }
@@ -2072,12 +2106,14 @@ static void zbtRebalanceLeaf(zbtree *t, zbtLeaf *lf) {
 }
 
 /* Remove element 'e' from the tree and free it. */
-void zbtDeleteElem(zbtree *t, zbtElem *e) {
-    zbtLeaf *lf = e->leaf;
-    int idx = zbtLeafFindPtr(lf, e);
-    serverAssert(idx >= 0);
+void zbtDeleteElem(zbtree *t, zbtElem *e,
+                   const zbtreeInsertPosition *where)
+{
+    zbtLeaf *lf;
+    int idx;
+    serverAssert(zbtElemLocate(t, e, where, &lf, &idx));
 
-    zbtIndexDeleteElem(t, e);
+    zbtIndexDeleteElem(t, e, lf);
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
     memmove(&lf->tags[idx], &lf->tags[idx + 1],
@@ -2162,19 +2198,19 @@ static int zbtLeafMoveSlot(zbtLeaf *lf, int idx, zbtElem *e, double score,
         zbtLeafSetElem(lf, lo, e);
         return lo;
     }
-    lf->elems[idx] = e;
-    lf->tags[idx] = zbtElemLeafTag(e);
-    e->leaf = lf;
+    zbtLeafSetElem(lf, idx, e);
     return idx;
 }
 
 /* Move an existing element to reflect a new score. Returns the (possibly
  * reallocated) element. */
-zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
+zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore,
+                        const zbtreeInsertPosition *where)
+{
     sds ele = zbtGetEle(e);
-    zbtLeaf *lf = e->leaf;
-    int idx = zbtLeafFindPtr(lf, e);
-    serverAssert(idx >= 0);
+    zbtLeaf *lf;
+    int idx;
+    serverAssert(zbtElemLocate(t, e, where, &lf, &idx));
 
     uint8_t newenc;
     unsigned char newbuf[8];
@@ -2196,7 +2232,6 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
         } else {
             size_t new_usable;
             ne = zbtCreateElem(newscore, ele, sdslen(ele), 0, &new_usable);
-            ne->leaf = lf;
             zfree_with_size(e, old_usable);
             t->alloc_size = t->alloc_size - old_usable + new_usable;
             ele = zbtGetEle(ne);
@@ -2210,7 +2245,7 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
 
     /* Slow path: detach, rewrite the score, reinsert. Index slot is removed
      * first so a later rebalance cannot alias the leaf ID. */
-    zbtIndexDeleteElem(t, e);
+    zbtIndexDeleteElem(t, e, lf);
     memmove(&lf->elems[idx], &lf->elems[idx + 1],
             ((int)lf->n.count - idx - 1) * sizeof(zbtElem *));
     memmove(&lf->tags[idx], &lf->tags[idx + 1],
@@ -2235,9 +2270,12 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
     }
     zbtIndexExpandIfNeeded(t, 1);
     t->pending_insert = ne;
+    t->pending_leaf = NULL;
     zbtInsertElem(t, ne, old_usable);
-    zbtIndexInsert(t, zbtElemIndexHash(ne), ne->leaf->id, NULL);
+    serverAssert(t->pending_leaf != NULL);
+    zbtIndexInsert(t, zbtElemIndexHash(ne), t->pending_leaf->id, NULL);
     t->pending_insert = NULL;
+    t->pending_leaf = NULL;
     zbtIndexInvalidateScan(t);
     return ne;
 }
@@ -2254,11 +2292,12 @@ zbtElem *zbtUpdateScore(zbtree *t, zbtElem *e, double newscore) {
  * every level, and each probe there dereferences a separator element sitting
  * in its own allocation -- a chain of dependent cache misses that dominates
  * ZRANK. Climbing touches only the nodes themselves. */
-unsigned long zbtRankByElem(zbtree *t, zbtElem *e) {
-    UNUSED(t);
-    zbtLeaf *lf = e->leaf;
-    int idx = zbtLeafFindPtr(lf, e);
-    serverAssert(idx >= 0);
+unsigned long zbtRankByElem(zbtree *t, zbtElem *e,
+                            const zbtreeInsertPosition *where)
+{
+    zbtLeaf *lf;
+    int idx;
+    serverAssert(zbtElemLocate(t, e, where, &lf, &idx));
 
     unsigned long rank = (unsigned long)idx;
     for (zbtNode *n = (zbtNode *)lf; n->parent; n = n->parent) {
@@ -2704,14 +2743,23 @@ static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
 
         /* The element that takes over the position we are deleting from. */
         zbtElem *next = NULL;
+        zbtLeaf *next_lf = NULL;
+        int next_idx = 0;
         if ((unsigned long)take < want) {
-            if (idx + take < (int)lf->n.count) next = lf->elems[idx + take];
-            else if (lf->next) next = lf->next->elems[0];
+            if (idx + take < (int)lf->n.count) {
+                next = lf->elems[idx + take];
+                next_lf = lf;
+                next_idx = idx + take;
+            } else if (lf->next) {
+                next = lf->next->elems[0];
+                next_lf = lf->next;
+                next_idx = 0;
+            }
         }
 
         for (int k = 0; k < take; k++) {
             zbtElem *el = lf->elems[idx + k];
-            zbtIndexDeleteElem(t, el);
+            zbtIndexDeleteElem(t, el, lf);
             size_t usable;
             zfree_usable(el, &usable);
             t->alloc_size -= usable;
@@ -2731,9 +2779,13 @@ static unsigned long zbtDeleteSlices(zbtree *t, zbtLeaf *lf, int idx,
             zbtUpdateToRoot(t, (zbtNode *)lf);
 
         if (next == NULL) break;
-        lf = next->leaf;
-        idx = zbtLeafFindPtr(lf, next);
-        serverAssert(idx >= 0);
+        if (next_lf == lf)
+            idx = next_idx - take;
+        else {
+            lf = next_lf;
+            idx = next_idx;
+        }
+        serverAssert(lf->elems[idx] == next);
     }
     zbtIndexMaintenance(t, 16);
     zbtIndexInvalidateScan(t);
@@ -2793,13 +2845,12 @@ unsigned long zbtDeleteRangeByRank(zbtree *t, unsigned long start,
 
 /* Replace element 'olde' with the (content-identical) relocated 'newe' in its
  * leaf slot and fix any separator pointers that referenced it. */
-void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe) {
-    zbtLeaf *lf = olde->leaf;
-    int idx = zbtLeafFindPtr(lf, olde);
-    serverAssert(idx >= 0);
+void zbtReplaceElem(zbtree *t, zbtElem *olde, zbtElem *newe, struct zbtLeaf *lf,
+                    int idx)
+{
+    serverAssert(lf->elems[idx] == olde);
     lf->elems[idx] = newe;
     lf->tags[idx] = zbtElemLeafTag(newe);
-    newe->leaf = lf;
     /* Ancestors only ever reference a leaf through its minimum, so nothing
      * above can be holding 'olde' unless it sat in slot 0. */
     if (idx == 0) zbtUpdateToRoot(t, (zbtNode *)lf);
@@ -2989,7 +3040,6 @@ static unsigned long zbtVerifyNode(zbtree *t, zbtNode *n, int depth,
         if (*leafdepth == -1) *leafdepth = depth;
         else serverAssert(*leafdepth == depth); /* all leaves same depth */
         for (uint32_t i = 0; i < n->count; i++) {
-            serverAssert(lf->elems[i]->leaf == lf);
             serverAssert(lf->tags[i] == zbtElemLeafTag(lf->elems[i]));
             serverAssert(t->table_to_leaf[lf->id] == lf);
         }
@@ -3230,7 +3280,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
         unsigned long rank = zbtGetRank(t, score, ele);
         assert(rank != 0);
         assert(zbtElemByRank(t, rank, NULL) == e);
-        assert(zbtRankByElem(t, e) == rank);
+        assert(zbtRankByElem(t, e, NULL) == rank);
     }
     zbtDebugVerify(t);
     test_cond("Insert N elements", t->length == (unsigned long)N);
@@ -3291,7 +3341,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
     for (int i = 0; i < N; i += 2) {
         zbtElem *e = elements[i].elem;
         assert(zbtGetRank(t, zbtGetScore(e), zbtGetEle(e)) != 0);
-        zbtDeleteElem(t, e);
+        zbtDeleteElem(t, e, NULL);
         elements[i].deleted = 1;
         if (i % 101 == 0) zbtDebugVerify(t);
     }
@@ -3301,13 +3351,13 @@ int zbtreeTest(int argc, char **argv, int flags) {
     /* Update scores of the survivors. */
     for (int i = 1; i < N; i += 2) {
         zbtElem *e = elements[i].elem;
-        elements[i].elem = zbtUpdateScore(t, e, (double)(rand() % 300));
+        elements[i].elem = zbtUpdateScore(t, e, (double)(rand() % 300), NULL);
     }
     zbtDebugVerify(t);
 
     /* Delete the rest. */
     for (int i = 1; i < N; i += 2) {
-        zbtDeleteElem(t, elements[i].elem);
+        zbtDeleteElem(t, elements[i].elem, NULL);
         if (i % 103 == 0) zbtDebugVerify(t);
     }
     zbtDebugVerify(t);
@@ -3457,8 +3507,8 @@ int zbtreeTest(int argc, char **argv, int flags) {
             zbtDebugVerify(bt);
             serverAssert(got == hi - lo + 1);
             serverAssert(bt->length == before - got);
-            serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, 1, NULL)) == 1);
-            serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, bt->length, NULL))
+            serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, 1, NULL), NULL) == 1);
+            serverAssert(zbtRankByElem(bt, zbtElemByRank(bt, bt->length, NULL), NULL)
                          == bt->length);
         }
         zbtDeleteRangeByRank(bt, 1, bt->length);
@@ -3502,7 +3552,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
         for (int k = 0; k < 3 * ZBT_LEAF_MAX; k++) {
             unsigned long rank = desc ? 1 : at->length;
             zbtElem *e = zbtElemByRank(at, rank, NULL);
-            zbtDeleteElem(at, e);
+            zbtDeleteElem(at, e, NULL);
             zbtDebugVerify(at);
         }
         serverAssert(at->length == (unsigned long)M - 3 * ZBT_LEAF_MAX);
@@ -3674,9 +3724,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
         zbtDebugVerify(bt);
 
         /* Width changes in both directions. */
-        elems[1] = zbtUpdateScore(bt, elems[1], 128);           /* 127 I8 -> 128 I16 */
+        elems[1] = zbtUpdateScore(bt, elems[1], 128, NULL);           /* 127 I8 -> 128 I16 */
         serverAssert((elems[1]->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I16 && zbtGetScore(elems[1]) == 128);
-        elems[1] = zbtUpdateScore(bt, elems[1], 127);           /* back I16 -> I8 */
+        elems[1] = zbtUpdateScore(bt, elems[1], 127, NULL);           /* back I16 -> I8 */
         serverAssert((elems[1]->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I8 && zbtGetScore(elems[1]) == 127);
 
         zbtElem *one;
@@ -3685,9 +3735,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
             one = zbtInsert(bt, 1, s);
             sdsfree(s);
         }
-        one = zbtUpdateScore(bt, one, 1.5);                     /* 1 I8 -> 1.5 DBL */
+        one = zbtUpdateScore(bt, one, 1.5, NULL);                     /* 1 I8 -> 1.5 DBL */
         serverAssert((one->enc & ZBT_SCORE_MASK) == ZBT_SCORE_DBL && zbtGetScore(one) == 1.5);
-        one = zbtUpdateScore(bt, one, 1);                       /* 1.5 DBL -> 1 I8 */
+        one = zbtUpdateScore(bt, one, 1, NULL);                       /* 1.5 DBL -> 1 I8 */
         serverAssert((one->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I8 && zbtGetScore(one) == 1);
 
         zbtElem *big;
@@ -3697,9 +3747,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
             sdsfree(s);
         }
         serverAssert((big->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I32);
-        big = zbtUpdateScore(bt, big, (double)(1LL << 47));     /* I32 -> DBL via 2^47 */
+        big = zbtUpdateScore(bt, big, (double)(1LL << 47), NULL);     /* I32 -> DBL via 2^47 */
         serverAssert((big->enc & ZBT_SCORE_MASK) == ZBT_SCORE_DBL && zbtGetScore(big) == (double)(1LL << 47));
-        big = zbtUpdateScore(bt, big, 2147483648.0);            /* DBL -> I48 */
+        big = zbtUpdateScore(bt, big, 2147483648.0, NULL);            /* DBL -> I48 */
         serverAssert((big->enc & ZBT_SCORE_MASK) == ZBT_SCORE_I48 && zbtGetScore(big) == 2147483648.0);
 
         zbtDebugVerify(bt);
@@ -3735,9 +3785,9 @@ int zbtreeTest(int argc, char **argv, int flags) {
             double want = zbtGetScore(el[i]) + (double)(round % 8 ? span % 24 : span * 37);
             if (round % 7 == 0) want += 0.5;
 
-            el[i] = zbtUpdateScore(bt, el[i], want);
+            el[i] = zbtUpdateScore(bt, el[i], want, NULL);
             serverAssert(zbtGetScore(el[i]) == want);
-            serverAssert(zbtRankByElem(bt, el[i]) ==
+            serverAssert(zbtRankByElem(bt, el[i], NULL) ==
                          zbtGetRank(bt, want, zbtGetEle(el[i])));
             if (round % 512 == 0) zbtDebugVerify(bt);
         }
@@ -3749,7 +3799,7 @@ int zbtreeTest(int argc, char **argv, int flags) {
         unsigned long rank = 0;
         for (zbtElem *e = zbtFirst(bt, &it); e; e = zbtIterNext(&it)) {
             rank++;
-            serverAssert(zbtRankByElem(bt, e) == rank);
+            serverAssert(zbtRankByElem(bt, e, NULL) == rank);
             serverAssert(zbtElemByRank(bt, rank, NULL) == e);
         }
         serverAssert(rank == (unsigned long)M);

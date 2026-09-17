@@ -556,7 +556,8 @@ static void defragZsetElems(zset *zs) {
     while (e) {
         zbtElem *newelem = activeDefragAllocWithoutFree(e);
         if (newelem) {
-            zbtReplaceElem(zs->tree, e, newelem);
+            zbtReplaceElem(zs->tree, e, newelem, (struct zbtLeaf *)it.leaf,
+                           it.idx);
             activeDefragFree(e);
         }
         e = zbtIterNext(&it);
@@ -574,7 +575,8 @@ static int defragZsetElemsIncremental(zset *zs, unsigned long *cursor,
     zbtElem *e;
     if (zs->tree->defrag_resume) {
         sds bookmark = zs->tree->defrag_resume;
-        zbtElem *current = zbtFindMember(zs->tree, bookmark, NULL);
+        zbtreeInsertPosition pos;
+        zbtElem *current = zbtFindMember(zs->tree, bookmark, &pos);
         /* If the bookmarked member was rescored before the saved position,
          * handle it separately; the ordered resume below cannot reach it. */
         if (current &&
@@ -582,7 +584,8 @@ static int defragZsetElemsIncremental(zset *zs, unsigned long *cursor,
         {
             zbtElem *newelem = activeDefragAllocWithoutFree(current);
             if (newelem) {
-                zbtReplaceElem(zs->tree, current, newelem);
+                zbtReplaceElem(zs->tree, current, newelem,
+                               (struct zbtLeaf *)pos.leaf, (int)pos.leaf_pos);
                 activeDefragFree(current);
             }
             server.stat_active_defrag_scanned++;
@@ -599,7 +602,8 @@ static int defragZsetElemsIncremental(zset *zs, unsigned long *cursor,
     while (e) {
         zbtElem *newelem = activeDefragAllocWithoutFree(e);
         if (newelem) {
-            zbtReplaceElem(zs->tree, e, newelem);
+            zbtReplaceElem(zs->tree, e, newelem, (struct zbtLeaf *)it.leaf,
+                           it.idx);
             activeDefragFree(e);
         }
         server.stat_active_defrag_scanned++;
