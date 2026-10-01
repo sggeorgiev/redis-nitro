@@ -427,8 +427,9 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory 0
         r config set maxmemory-policy allkeys-random
 
-        # Next rehash size is 8192, that will eat 64k memory
-        populate 4095 "" 1
+        # 1024 buckets hold 7168 entries. The next rehash size is 2048
+        # buckets, that will eat 128k memory
+        populate 7167 "" 1
 
         set used [s used_memory]
         set limit [expr {$used + 10*1024}]
@@ -436,15 +437,15 @@ start_server {tags {"maxmemory external:skip"}} {
 
         # Adding a key to meet the 1:1 radio.
         r set k0 v0
-        # The dict has reached 4096, it can be resized in tryResizeHashTables in cron,
+        # The dict is full (7168), it can be resized in tryResizeHashTables in cron,
         # or we add a key to let it check whether it can be resized.
         r set k1 v1
         # Next writing command will trigger evicting some keys if last
         # command trigger DB dict rehash
         r set k2 v2
-        # There must be 4098 keys because redis doesn't evict keys.
+        # There must be 7170 keys because redis doesn't evict keys.
         r dbsize
-    } {4098}
+    } {7170}
 }
 
 start_server {tags {"maxmemory external:skip"}} {

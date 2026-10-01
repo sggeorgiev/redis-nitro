@@ -1381,11 +1381,14 @@ foreach type {single multiple single_multiple} {
         # We also check the size and members in the hash table.
         verify_rehashing_completed_key myset 64 30
 
-        # Now that we have a hash set with only one long chain bucket.
+        # Now that we have a hash set with only one long chain of buckets: the
+        # 30 entries fill a root bucket and 4 child buckets (6 entries in each
+        # chained bucket and the remaining 6 in the last one), and no other
+        # top-level bucket has a child.
         set htstats [r debug HTSTATS-KEY myset full]
-        assert {[regexp {different slots: ([0-9]+)} $htstats - different_slots]}
+        assert {[regexp {child buckets: ([0-9]+)} $htstats - child_buckets]}
         assert {[regexp {max chain length: ([0-9]+)} $htstats - max_chain_length]}
-        assert {$different_slots == 1 && $max_chain_length == 30}
+        assert {$child_buckets == $max_chain_length && $max_chain_length == 4}
 
         # 9) Use positive count (PATH 4) to get 10 elements (out of 30) each time.
         unset -nocomplain allkey
