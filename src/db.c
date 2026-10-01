@@ -881,7 +881,7 @@ robj *dbRandomKey(redisDb *db) {
 /* Helper for sync and async delete. */
 int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
     dictEntryLink link;
-    int table;
+    dictPosition table;
     int slot = getKeySlot(key->ptr);
     link = kvstoreDictTwoPhaseUnlinkFind(db->keys, slot, key->ptr, &table);
 
@@ -927,7 +927,7 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
             /* Set the key to NULL in the main dictionary. */
             kvstoreDictSetAtLink(db->keys, slot, NULL, &link, 0);
         }
-        kvstoreDictTwoPhaseUnlinkFree(db->keys, slot, link, table);
+        kvstoreDictTwoPhaseUnlinkFree(db->keys, slot, link, &table);
 
         /* remove key from histogram */
         if(!(flags & DB_FLAG_NO_UPDATE_KEYSIZES))
@@ -2768,7 +2768,7 @@ void swapdbCommand(client *c) {
  *  Remove the object from db->expires and set to -1 attached TTL to KV
  */
 int removeExpire(redisDb *db, robj *key) {
-    int table;
+    dictPosition table;
     int slot = getKeySlot(key->ptr);
     dictEntryLink link = kvstoreDictTwoPhaseUnlinkFind(db->expires, slot, key->ptr, &table);
 
@@ -2777,7 +2777,7 @@ int removeExpire(redisDb *db, robj *key) {
     kvobj *kv = dictGetKV(de);
     kvobj *newkv = kvobjSetExpire(kv, -1);
     serverAssert(newkv == kv);
-    kvstoreDictTwoPhaseUnlinkFree(db->expires, slot, link, table);
+    kvstoreDictTwoPhaseUnlinkFree(db->expires, slot, link, &table);
     return 1;
 }
 

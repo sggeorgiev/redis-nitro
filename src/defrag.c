@@ -362,24 +362,8 @@ luaScript *activeDefragLuaScript(luaScript *script) {
  * Returns NULL in case the allocation wasn't moved.
  * When it returns a non-null value, the old pointer was already released
  * and should NOT be accessed. */
-dict *dictDefragTables(dict *d) {
-    dict *ret = NULL;
-    dictEntry **newtable;
-    /* handle the dict struct */
-    if ((ret = activeDefragAlloc(d)))
-        d = ret;
-    /* handle the first hash table */
-    if (!d->ht_table[0]) return ret; /* created but unused */
-    newtable = activeDefragAlloc(d->ht_table[0]);
-    if (newtable)
-        d->ht_table[0] = newtable;
-    /* handle the second hash table */
-    if (d->ht_table[1]) {
-        newtable = activeDefragAlloc(d->ht_table[1]);
-        if (newtable)
-            d->ht_table[1] = newtable;
-    }
-    return ret;
+dict *activeDefragDictTables(dict *d) {
+    return dictDefragTables(d, activeDefragAlloc);
 }
 
 /* Internal function used by activeDefragZsetNode */
@@ -724,7 +708,7 @@ void defragZsetSkiplist(defragKeysCtx *ctx, kvobj *ob) {
         } while (cursor != 0);
     }
     /* defrag the dict struct and tables */
-    if ((newdict = dictDefragTables(zs->dict)))
+    if ((newdict = activeDefragDictTables(zs->dict)))
         zs->dict = newdict;
 }
 
@@ -737,7 +721,7 @@ void defragHash(defragKeysCtx *ctx, kvobj *ob) {
     else
         activeDefragHfieldDict(d);
     /* defrag the dict struct and tables */
-    if ((newd = dictDefragTables(ob->ptr)))
+    if ((newd = activeDefragDictTables(ob->ptr)))
         ob->ptr = newd;
 }
 
@@ -750,7 +734,7 @@ void defragSet(defragKeysCtx *ctx, kvobj *ob) {
     else
         activeDefragSdsDict(d, DEFRAG_SDS_DICT_NO_VAL);
     /* defrag the dict struct and tables */
-    if ((newd = dictDefragTables(ob->ptr)))
+    if ((newd = activeDefragDictTables(ob->ptr)))
         ob->ptr = newd;
 }
 
@@ -1002,7 +986,7 @@ void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {
 static void defragIdmpProducer(idmpProducer *producer) {
     if (producer->idmp_dict == NULL) return;
 
-    dict *newdict = dictDefragTables(producer->idmp_dict);
+    dict *newdict = activeDefragDictTables(producer->idmp_dict);
     if (newdict)
         producer->idmp_dict = newdict;
 
@@ -1336,7 +1320,7 @@ void defragPubsubScanCallback(void *privdata, const dictEntry *de, dictEntryLink
     }
 
     /* Try to defrag the dictionary of clients that is stored as the value part. */
-    if ((newclients = dictDefragTables(clients)))
+    if ((newclients = activeDefragDictTables(clients)))
         kvstoreDictSetVal(pubsub_channels, ctx->kvstate.slot, (dictEntry *)de, newclients);
 
     server.stat_active_defrag_scanned++;
@@ -1525,7 +1509,7 @@ static doneStatus defragStageKvstoreHelper(monotime endtime,
     if (state->slot == ITER_SLOT_DEFRAG_LUT) {
         /* Before we start scanning the kvstore, handle the main structures */
         do {
-            state->cursor = kvstoreDictLUTDefrag(state->kvs, state->cursor, dictDefragTables);
+            state->cursor = kvstoreDictLUTDefrag(state->kvs, state->cursor, activeDefragDictTables);
             if (getMonotonicUs() >= endtime) return DEFRAG_NOT_DONE;
         } while (state->cursor != 0);
         state->slot = ITER_SLOT_UNASSIGNED;
@@ -1746,7 +1730,7 @@ static doneStatus defragRegistryDict(dict **dref, unsigned long *cursor,
                 return DEFRAG_NOT_DONE;
         }
     } while (*cursor != 0);
-    dict *newd = dictDefragTables(*dref);
+    dict *newd = activeDefragDictTables(*dref);
     if (newd) *dref = newd;
     return DEFRAG_DONE;
 }

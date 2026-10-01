@@ -102,9 +102,9 @@ typedef struct dictType {
     /* Invoked at the end of dict initialization/rehashing of all the entries from old to new ht. Both ht still exists
      * and are cleaned up after this callback.  */
     void (*rehashingCompleted)(dict *d);
-    /* Invoked when the size of the dictionary changes.
-     * The `delta` parameter can be positive (size increase) or negative (size decrease). */
-    void (*bucketChanged)(dict *d, long long delta);
+    /* Invoked when the memory used by the dict's hash tables changes.
+     * `delta_bytes` can be positive (growth) or negative (shrink). */
+    void (*tableMemChanged)(dict *d, long long delta_bytes);
     /* Allow a dict to carry extra caller-defined metadata. The
      * extra memory is initialized to 0 when a dict is allocated. */
     size_t (*dictMetadataBytes)(dict *d);
@@ -157,7 +157,12 @@ typedef struct dictType {
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
-#define DICTHT_SIZE_MASK(exp) ((exp) == -1 ? 0 : (DICTHT_SIZE(exp))-1)
+
+/* Opaque position handed from dictTwoPhaseUnlinkFind() to
+ * dictTwoPhaseUnlinkFree(). Callers must not look inside. */
+typedef struct dictPosition {
+    int table;
+} dictPosition;
 
 struct dict {
     dictType *type;
@@ -209,6 +214,8 @@ typedef struct {
 } dictDefragFunctions;
 
 /* This is the initial size of every hash table */
+/* Size in bytes of one hash table bucket, the unit of dictBuckets(). */
+#define DICT_BUCKET_BYTES        (sizeof(dictEntry *))
 #define DICT_HT_INITIAL_EXP      2
 #define DICT_HT_INITIAL_SIZE     (1<<(DICT_HT_INITIAL_EXP))
 
@@ -230,8 +237,6 @@ typedef struct {
 #define dictSize(d) ((d)->ht_used[0]+(d)->ht_used[1])
 #define dictIsEmpty(d) ((d)->ht_used[0] == 0 && (d)->ht_used[1] == 0)
 #define dictIsRehashing(d) ((d)->rehashidx != -1)
-#define dictPauseRehashing(d) ((d)->pauserehash++)
-#define dictResumeRehashing(d) ((d)->pauserehash--)
 #define dictIsRehashingPaused(d) ((d)->pauserehash > 0)
 #define dictPauseAutoResize(d) ((d)->pauseAutoResize++)
 #define dictResumeAutoResize(d) ((d)->pauseAutoResize--)
@@ -262,8 +267,15 @@ int dictReplace(dict *d, void *key __stored_key, void *val);
 int dictDelete(dict *d, const void *key);
 dictEntry *dictUnlink(dict *d, const void *key);
 void dictFreeUnlinkedEntry(dict *d, dictEntry *he);
-dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index);
-void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink llink, int table_index);
+dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, dictPosition *pos);
+void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink llink, dictPosition *pos);
+void dictPauseRehashing(dict *d);
+void dictResumeRehashing(dict *d);
+unsigned long dictSlots(const dict *d);
+size_t dictTableMemUsage(const dict *d);
+size_t dictRehashingMemUsage(const dict *d);
+dict *dictDefragTables(dict *d, void *(*defragfn)(void *));
+void dictDismissTables(dict *d, void (*fn)(void *ptr, size_t size));
 void dictRelease(dict *d);
 dictEntry * dictFind(dict *d, const void *key);
 dictEntry *dictFindByHashAndPtr(dict *d, const void *oldptr, const uint64_t hash);
@@ -280,7 +292,6 @@ void dictInitIterator(dictIterator *iter, dict *d);
 void dictInitSafeIterator(dictIterator *iter, dict *d);
 void dictResetIterator(dictIterator *iter);
 dictEntry *dictNext(dictIterator *iter);
-dictEntry *dictGetNext(const dictEntry *de);
 void dictReleaseIterator(dictIterator *iter);
 dictEntry *dictGetRandomKey(dict *d);
 dictEntry *dictGetFairRandomKey(dict *d);
@@ -317,6 +328,28 @@ void *dictFetchValue(dict *d, const void *key);
 void dictSetUnsignedIntegerVal(dictEntry *de, uint64_t val);
 uint64_t dictIncrUnsignedIntegerVal(dictEntry *de, uint64_t val);
 uint64_t dictGetUnsignedIntegerVal(const dictEntry *de);
+
+/* Per-key state of a software-pipelined dictFind used by the memory prefetcher
+ * (memory_prefetch.c). The caller owns the storage; the contents are private
+ * to dict.c. Usage:
+ *     dictPrefetchInit(&st, d, key);
+ *     while (!st.done) { void *a = dictPrefetchNext(&st); if (a) prefetch(a); ... }
+ * dictPrefetchNext() returns the next address worth prefetching, or NULL once
+ * the lookup is complete (st.done is then set). Interleave several states to
+ * overlap their memory stalls. */
+typedef struct dictPrefetchState {
+    dict *d;
+    const void *key;
+    uint64_t hash;
+    uint64_t bucket_idx;
+    dictEntry *current_entry;
+    int8_t ht_idx;
+    uint8_t stage;
+    uint8_t done;
+} dictPrefetchState;
+
+void dictPrefetchInit(dictPrefetchState *st, dict *d, const void *key);
+void *dictPrefetchNext(dictPrefetchState *st);
 
 #ifdef REDIS_TEST
 int dictTest(int argc, char *argv[], int flags);

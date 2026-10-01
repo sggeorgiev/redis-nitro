@@ -138,8 +138,8 @@ unsigned long kvstoreDictLUTDefrag(kvstore *kvs, unsigned long cursor, kvstoreDi
 void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key);
 dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key);
 dictEntry *kvstoreDictAddRaw(kvstore *kvs, int didx, void *key, dictEntry **existing);
-dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, int *table_index);
-void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink plink, int table_index);
+dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, dictPosition *pos);
+void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink plink, dictPosition *pos);
 void kvstoreDictPauseRehashing(kvstore *kvs, int didx);
 void kvstoreDictResumeRehashing(kvstore *kvs, int didx);
 int kvstoreDictDelete(kvstore *kvs, int didx, const void *key);

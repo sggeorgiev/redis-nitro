@@ -7827,8 +7827,7 @@ void dismissClientMemory(client *c) {
 /* Dismiss the hash table bucket arrays of a dict. */
 void dismissDictBucketsMemory(dict *d) {
     if (!d) return;
-    dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0]) * sizeof(dictEntry*));
-    dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1]) * sizeof(dictEntry*));
+    dictDismissTables(d, dismissMemory);
 }
 
 /* Dismiss the hash table bucket arrays for all dicts in the given kvstore. */

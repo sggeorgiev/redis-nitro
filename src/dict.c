@@ -73,6 +73,14 @@ static void _dictRehashStepIfNeeded(dict *d, uint64_t visitedIdx);
 static signed char _dictNextExp(unsigned long size);
 static int _dictInit(dict *d, dictType *type);
 static dictEntryLink dictGetNextLink(dictEntry *de);
+static dictEntry *dictGetNext(const dictEntry *de);
+#define DICTHT_SIZE_MASK(exp) ((exp) == -1 ? 0 : (DICTHT_SIZE(exp))-1)
+
+/* Report a change in hash table size (in buckets) as a change in bytes. */
+static inline void dictTableMemChanged(dict *d, long long delta_buckets) {
+    if (d->type->tableMemChanged)
+        d->type->tableMemChanged(d, delta_buckets * (long long)DICT_BUCKET_BYTES);
+}
 static void dictSetNext(dictEntry *de, dictEntry *next);
 static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void *key2);
 static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket);
@@ -275,16 +283,14 @@ int _dictResize(dict *d, unsigned long size, int* malloc_failed)
     d->ht_table[1] = new_ht_table;
     d->rehashidx = 0;
     if (d->type->rehashingStarted) d->type->rehashingStarted(d);
-    if (d->type->bucketChanged)
-        d->type->bucketChanged(d, DICTHT_SIZE(d->ht_size_exp[1]));
+    dictTableMemChanged(d, DICTHT_SIZE(d->ht_size_exp[1]));
 
     /* Is this the first initialization or is the first hash table empty? If so
      * it's not really a rehashing, we can just set the first hash table so that
      * it can accept keys. */
     if (d->ht_table[0] == NULL || d->ht_used[0] == 0) {
         if (d->type->rehashingCompleted) d->type->rehashingCompleted(d);
-        if (d->type->bucketChanged)
-            d->type->bucketChanged(d, -(long long)DICTHT_SIZE(d->ht_size_exp[0]));
+        dictTableMemChanged(d, -(long long)DICTHT_SIZE(d->ht_size_exp[0]));
         if (d->ht_table[0]) zfree(d->ht_table[0]);
         d->ht_size_exp[0] = new_ht_size_exp;
         d->ht_used[0] = new_ht_used;
@@ -382,8 +388,7 @@ static int dictCheckRehashingCompleted(dict *d) {
     if (d->ht_used[0] != 0) return 0;
     
     if (d->type->rehashingCompleted) d->type->rehashingCompleted(d);
-    if (d->type->bucketChanged)
-        d->type->bucketChanged(d, -(long long)DICTHT_SIZE(d->ht_size_exp[0]));
+    dictTableMemChanged(d, -(long long)DICTHT_SIZE(d->ht_size_exp[0]));
     zfree(d->ht_table[0]);
     /* Copy the new ht onto the old one */
     d->ht_table[0] = d->ht_table[1];
@@ -746,8 +751,7 @@ void dictRelease(dict *d)
         d->type->rehashingCompleted(d);
 
     /* Subtract the size of all buckets. */
-    if (d->type->bucketChanged)
-        d->type->bucketChanged(d, -(long long)dictBuckets(d));
+    dictTableMemChanged(d, -(long long)dictBuckets(d));
 
     if (d->type->onDictRelease)
         d->type->onDictRelease(d);
@@ -942,7 +946,7 @@ void *dictFetchValue(dict *d, const void *key) {
  * dictFind followed by dictDelete. i.e. the first API is a find, and it gives some info
  * to the second one to avoid repeating the lookup
  */
-dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index) {
+dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, dictPosition *pos) {
     dictCmpCache cmpCache = {0};
     uint64_t h, idx, table;
 
@@ -959,7 +963,7 @@ dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index)
         while (ref && *ref) {
             const void *de_key = dictStoredKey2Key(d, dictGetKey(*ref));
             if (key == de_key || cmpFunc(&cmpCache, key, de_key)) {
-                *table_index = table;
+                pos->table = table;
                 dictPauseRehashing(d);
                 return ref;
             }
@@ -970,10 +974,10 @@ dictEntryLink dictTwoPhaseUnlinkFind(dict *d, const void *key, int *table_index)
     return NULL;
 }
 
-void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink plink, int table_index) {
+void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink plink, dictPosition *pos) {
     if (plink == NULL || *plink == NULL) return;
     dictEntry *de = *plink;
-    d->ht_used[table_index]--;
+    d->ht_used[pos->table]--;
 
     *plink = dictGetNext(de);
     dictFreeKey(d, de);
@@ -1066,7 +1070,7 @@ double *dictGetDoubleValPtr(dictEntry *de) {
 
 /* Returns the 'next' field of the entry or NULL if the entry doesn't have a
  * 'next' field. */
-dictEntry *dictGetNext(const dictEntry *de) {
+static dictEntry *dictGetNext(const dictEntry *de) {
     if (entryIsKey(de)) return NULL; /* there's no next */
     /* Must come after entryIsKey() check */
     return de->next;
@@ -1790,8 +1794,7 @@ void dictEmpty(dict *d, void(callback)(dict*)) {
         d->type->rehashingCompleted(d);
 
     /* Subtract the size of all buckets. */
-    if (d->type->bucketChanged)
-        d->type->bucketChanged(d, -(long long)dictBuckets(d));
+    dictTableMemChanged(d, -(long long)dictBuckets(d));
 
     _dictClear(d,0,callback);
     _dictClear(d,1,callback);
@@ -1933,6 +1936,140 @@ static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void 
 }
 
 /* ------------------------------- Benchmark ---------------------------------*/
+
+/* ------------------------------ Misc API ---------------------------------- */
+
+void dictPauseRehashing(dict *d) {
+    d->pauserehash++;
+}
+
+void dictResumeRehashing(dict *d) {
+    d->pauserehash--;
+}
+
+/* Number of entry slots the tables can hold before the load factor reaches 1.
+ * Used by callers (e.g. expire sampling) to estimate how full a dict is. */
+unsigned long dictSlots(const dict *d) {
+    return dictBuckets(d);
+}
+
+/* Defrag the dict struct and its hash tables with `defragfn`, which receives an
+ * allocation and returns a new one, or NULL if it was not moved.
+ *
+ * Returns the new dict pointer if the dict struct itself was moved (the old
+ * pointer was released and must not be accessed), NULL otherwise. */
+dict *dictDefragTables(dict *d, void *(*defragfn)(void *)) {
+    dict *ret = NULL;
+    void *newtable;
+    if ((ret = defragfn(d)))
+        d = ret;
+    if (!d->ht_table[0]) return ret; /* created but unused */
+    if ((newtable = defragfn(d->ht_table[0])))
+        d->ht_table[0] = newtable;
+    if (d->ht_table[1] && (newtable = defragfn(d->ht_table[1])))
+        d->ht_table[1] = newtable;
+    return ret;
+}
+
+/* Bytes used by the hash table bucket arrays (both tables while rehashing). */
+size_t dictTableMemUsage(const dict *d) {
+    return dictBuckets(d) * DICT_BUCKET_BYTES;
+}
+
+/* Bytes of the table being rehashed away from. Only meaningful while
+ * rehashing (and valid inside the rehashingStarted/Completed callbacks). */
+size_t dictRehashingMemUsage(const dict *d) {
+    return DICTHT_SIZE(d->ht_size_exp[0]) * DICT_BUCKET_BYTES;
+}
+
+/* Call fn(ptr, size) for every hash table allocation of the dict. */
+void dictDismissTables(dict *d, void (*fn)(void *ptr, size_t size)) {
+    if (!d) return;
+    fn(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0]) * DICT_BUCKET_BYTES);
+    fn(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1]) * DICT_BUCKET_BYTES);
+}
+
+/* ------------------------- Prefetch state machine -------------------------- */
+
+enum { PF_BUCKET, PF_ENTRY, PF_ENTRY_KEY, PF_ENTRY_VALUE, PF_DONE };
+
+void dictPrefetchInit(dictPrefetchState *st, dict *d, const void *key) {
+    st->d = d;
+    st->key = key;
+    st->ht_idx = -1;
+    st->current_entry = NULL;
+    st->bucket_idx = 0;
+    st->hash = 0;
+    if (!d || dictSize(d) == 0) {
+        st->stage = PF_DONE;
+        st->done = 1;
+        return;
+    }
+    /* Prefetch is skipped during loading, so ht_table[0] is never NULL when
+     * dictSize() > 0 (that only happens mid-dictEmpty via _dictReset). */
+    assert(d->ht_table[0]);
+    st->hash = dictGetHash(d, key);
+    st->stage = PF_BUCKET;
+    st->done = 0;
+}
+
+/* Advance the lookup until a useful address to prefetch is produced.
+ * Returns NULL, and sets st->done, when the lookup is complete. */
+void *dictPrefetchNext(dictPrefetchState *st) {
+    dict *d = st->d;
+    for (;;) {
+        switch (st->stage) {
+        case PF_BUCKET:
+            /* Pick the next hash table; none left means done. */
+            if (st->ht_idx == -1) st->ht_idx = 0;
+            else if (st->ht_idx == 0 && dictIsRehashing(d)) st->ht_idx = 1;
+            else { st->stage = PF_DONE; st->done = 1; return NULL; }
+            st->bucket_idx = st->hash & DICTHT_SIZE_MASK(d->ht_size_exp[st->ht_idx]);
+            st->current_entry = NULL;
+            st->stage = PF_ENTRY;
+            return &d->ht_table[st->ht_idx][st->bucket_idx];
+        case PF_ENTRY:
+            if (st->current_entry)
+                st->current_entry = dictGetNext(st->current_entry);
+            else
+                st->current_entry = d->ht_table[st->ht_idx][st->bucket_idx];
+            if (st->current_entry) {
+                st->stage = PF_ENTRY_KEY;
+                return st->current_entry;
+            }
+            st->stage = PF_BUCKET; /* nothing here, try the next table */
+            break;
+        case PF_ENTRY_KEY:
+            st->stage = PF_ENTRY_VALUE;
+            if (d->type->prefetchEntryKey) {
+                void *addr = d->type->prefetchEntryKey(st->current_entry);
+                if (addr) return addr;
+            }
+            break;
+        case PF_ENTRY_VALUE: {
+            const void *stored_key = dictGetKey(st->current_entry);
+            const void *cmp_key = d->type->keyFromStoredKey ?
+                d->type->keyFromStoredKey(stored_key) : stored_key;
+            /* Last entry of the chain and not rehashing: assume a hit without
+             * comparing. Otherwise compare keys. */
+            if ((!dictGetNext(st->current_entry) && !dictIsRehashing(d)) ||
+                dictCompareKeys(d, st->key, cmp_key))
+            {
+                st->stage = PF_DONE;
+                st->done = 1;
+                if (d->type->prefetchEntryValue)
+                    return d->type->prefetchEntryValue(st->current_entry);
+                return NULL;
+            }
+            st->stage = PF_ENTRY;
+            break;
+        }
+        default:
+            st->done = 1;
+            return NULL;
+        }
+    }
+}
 
 #ifdef REDIS_TEST
 #include "testhelp.h"
