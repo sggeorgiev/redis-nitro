@@ -916,6 +916,20 @@ dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *
     return dictTwoPhaseUnlinkFind(kvstoreGetDict(kvs, didx), key, table_index);
 }
 
+/* Pause/resume incremental rehashing of a dict, so that a dictEntryLink held by
+ * the caller is not invalidated by rehash steps while it runs code that may
+ * look up keys in the same dict. Resume tolerates a dict that was freed in
+ * the meantime. */
+void kvstoreDictPauseRehashing(kvstore *kvs, int didx) {
+    dict *d = kvstoreGetDict(kvs, didx);
+    if (d) dictPauseRehashing(d);
+}
+
+void kvstoreDictResumeRehashing(kvstore *kvs, int didx) {
+    dict *d = kvstoreGetDict(kvs, didx);
+    if (d) dictResumeRehashing(d);
+}
+
 void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, int table_index) {
     dict *d = kvstoreGetDict(kvs, didx);
     dictTwoPhaseUnlinkFree(d, link, table_index);

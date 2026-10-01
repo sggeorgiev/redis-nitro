@@ -633,6 +633,10 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
          * need to incr to retain old */
         incrRefCount(old);
 
+        /* The hooks below may run module code that looks up keys in this dict.
+         * Keep rehashing paused so `link` stays valid. */
+        kvstoreDictPauseRehashing(db->keys, slot);
+
         /* Free related metadata. Ignore builtin metadata (currently only expire) */
         if (getModuleMetaBits(old->metabits)) {
             keyMetaOnUnlink(db, key, old);
@@ -648,6 +652,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         decrRefCount(old);
         /* Because of RM_StringDMA, old may be changed, so we need get old again */
         old = dictGetKV(*link);
+        kvstoreDictResumeRehashing(db->keys, slot);
     }
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(old);
@@ -3137,16 +3142,11 @@ kvobj *dbFind(redisDb *db, sds key) {
  */
 kvobj *dbFindByLink(redisDb *db, sds key, dictEntryLink *plink) {
     int slot = getKeySlot(key);
-    dictEntryLink link, bucket;
-
-    link = kvstoreDictFindLink(db->keys, slot, key, &bucket);
-    if (link == NULL) {
-        if (plink) *plink = bucket;
-        return NULL;
-    } else {
-        if (plink) *plink = link;
-        return dictGetKV(*link);
-    }
+    /* Read paths (plink == NULL) don't need the insert bucket. */
+    dictEntryLink link = kvstoreDictFindLink(db->keys, slot, key, plink);
+    if (link == NULL) return NULL;
+    if (plink) *plink = link; /* hit: report the link, not the bucket */
+    return dictGetKV(*link);
 }
 
 kvobj *dbFindExpires(redisDb *db, sds key) {
