@@ -66,6 +66,7 @@
 #define __stored_key
 
 typedef struct dictEntry dictEntry; /* opaque */
+struct dictBucket; /* opaque, defined in dict.c */
 typedef struct dict dict;
 typedef dictEntry **dictEntryLink; /* See description of dictFindLink() */
 
@@ -161,24 +162,29 @@ typedef struct dictType {
 /* Opaque position handed from dictTwoPhaseUnlinkFind() to
  * dictTwoPhaseUnlinkFree(). Callers must not look inside. */
 typedef struct dictPosition {
-    int table;
+    struct dictBucket *bucket;
+    uint16_t pos;
+    uint16_t table;
 } dictPosition;
 
 struct dict {
     dictType *type;
 
-    dictEntry **ht_table[2];
-    unsigned long ht_used[2];
+    struct dictBucket *ht_table[2]; /* arrays of 1<<ht_size_exp top-level buckets */
+    unsigned long ht_used[2];       /* number of entries in each table */
+    unsigned long child_buckets[2]; /* allocated child (overflow) buckets */
 
     long rehashidx; /* rehashing not in progress if rehashidx == -1 */
 
-    /* Note: pauserehash is a full unsigned so iterator increments
+    /* Note: the pause counters are full unsigneds so iterator increments
      * don't perform RMW on the same storage unit as other bitfields. */
-    unsigned pauserehash; /* If >0 rehashing is paused */
+    unsigned pauserehash;  /* If >0 rehashing is paused */
+    unsigned pausecompact; /* If >0 bucket chains are not compacted on delete */
 
     /* Keep small vars at end for optimal (minimal) struct padding */
-    signed char ht_size_exp[2]; /* exponent of size. (size = 1<<exp) */
+    signed char ht_size_exp[2]; /* exponent of top-level bucket count (buckets = 1<<exp) */
     int16_t pauseAutoResize;  /* If >0 automatic resizing is disallowed (<0 indicates coding error) */
+    uint8_t pending_shrink;   /* A delete wanted to shrink while paused */
     void *metadata[];
 };
 
@@ -188,21 +194,29 @@ struct dict {
  * should be called while iterating. */
 typedef struct dictIterator {
     dict *d;
-    long index;
-    int table, safe;
-    dictEntry *entry, *nextEntry;
+    struct dictBucket *bucket; /* current bucket within the chain */
+    long index;                /* top-level bucket index, -1 before the first call */
+    int table, pos;            /* table and slot position within bucket */
+    uint8_t safe;
+    uint8_t done;
+    /* The last returned entry sat in the last slot of an unchained bucket. If
+     * the bucket became chained since, that entry moved to the child's slot 0
+     * and must not be returned again. */
+    uint8_t ret_last_unchained;
+    uint8_t skip_pos0;
+    unsigned long last_seen_size; /* safe iterator: ht_used at chain entry */
     /* unsafe iterator fingerprint for misuse detection. */
     unsigned long long fingerprint;
 } dictIterator;
 
 typedef struct dictStats {
     int htidx;
-    unsigned long buckets;
-    unsigned long maxChainLen;
-    unsigned long totalChainLen;
-    unsigned long htSize;
+    unsigned long toplevelBuckets;
+    unsigned long childBuckets;
+    unsigned long maxChainLen; /* in child buckets */
+    unsigned long htSize;      /* capacity in entry slots */
     unsigned long htUsed;
-    unsigned long *clvector;
+    unsigned long *clvector;   /* entry i counts bucket chains with i child buckets */
 } dictStats;
 
 typedef void (dictScanFunction)(void *privdata, const dictEntry *de, dictEntry **plink);
@@ -213,11 +227,19 @@ typedef struct {
     dictDefragAllocFunction *defragVal;   /* Defrag-realloc values (optional) */
 } dictDefragFunctions;
 
-/* This is the initial size of every hash table */
-/* Size in bytes of one hash table bucket, the unit of dictBuckets(). */
-#define DICT_BUCKET_BYTES        (sizeof(dictEntry *))
-#define DICT_HT_INITIAL_EXP      2
-#define DICT_HT_INITIAL_SIZE     (1<<(DICT_HT_INITIAL_EXP))
+/* Swiss-style 64-byte buckets: a bucket holds DICT_BUCKET_SLOTS entries with a
+ * one byte hash tag each. When a bucket overflows its last slot becomes a
+ * pointer to a child bucket. dictBuckets() counts top-level buckets. */
+#if SIZE_MAX == UINT64_MAX
+#define DICT_BUCKET_SLOTS        7
+#else
+#define DICT_BUCKET_SLOTS        12
+#endif
+#define DICT_BUCKET_BYTES        64
+
+/* Every table starts as a single bucket, which is also the shrink floor. */
+#define DICT_HT_INITIAL_EXP      0
+#define DICT_HT_INITIAL_SIZE     DICT_BUCKET_SLOTS
 
 /* ------------------------------- Macros ------------------------------------*/
 #define dictFreeVal(d, entry) do {                     \
@@ -341,11 +363,13 @@ typedef struct dictPrefetchState {
     dict *d;
     const void *key;
     uint64_t hash;
-    uint64_t bucket_idx;
+    struct dictBucket *bucket;
     dictEntry *current_entry;
+    uint16_t candidates; /* tag-matching, not yet visited positions */
     int8_t ht_idx;
     uint8_t stage;
     uint8_t done;
+    uint8_t lone;        /* single candidate in an unchained bucket */
 } dictPrefetchState;
 
 void dictPrefetchInit(dictPrefetchState *st, dict *d, const void *key);
