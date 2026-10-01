@@ -516,78 +516,28 @@ run_solo {defrag} {
             r config set active-defrag-ignore-bytes 1500kb
             r config set maxmemory 0
 
-            # Populate memory with interleaving pubsub-key pattern of same size
+            # Interleave two disposable allocations with each pair of channel
+            # subscriptions. This leaves enough holes even with bucket overhead.
             set n 50000
             set dummy_channel "[string repeat x 400]"
             set rd [redis_deferring_client]
             set rd_pubsub [redis_deferring_client]
-            for {set j 0} {$j < $n} {incr j} {
-                set channel_name "$dummy_channel[format "%06d" $j]"
-                $rd_pubsub subscribe $channel_name
-                $rd_pubsub read ; # Discard subscribe replies
-                $rd_pubsub ssubscribe $channel_name
-                $rd_pubsub read ; # Discard ssubscribe replies
-                # Pub/Sub clients are handled in the main thread, so their memory is
-                # allocated there. Using the SETBIT command avoids the main thread
-                # referencing argv from IO threads.
-                $rd setbit k$j [expr {[string length $channel_name] * 8}] 1
-                $rd read ; # Discard set replies
-            }
-
-            after 120 ;# serverCron only updates the info once in 100ms
-            if {$::verbose} {
-                puts "used [s allocator_allocated]"
-                puts "rss [s allocator_active]"
-                puts "frag [s allocator_frag_ratio]"
-                puts "frag_bytes [s allocator_frag_bytes]"
-            }
-            assert_lessthan [s allocator_frag_ratio] 1.05
-
-            # Delete all the keys to create fragmentation
-            # Use batching to avoid TCP deadlock
-            set batch_size 1000
-            for {set j 0} {$j < $n} {incr j} {
-                $rd del k$j
-                if {($j + 1) % $batch_size == 0} {
-                    for {set i 0} {$i < $batch_size} {incr i} {
-                        $rd read
-                    }
-                }
-            }
-            set remaining [expr {$n % $batch_size}]
-            for {set j 0} {$j < $remaining} {incr j} { $rd read }
-            if {$type eq "cluster"} {
-                $rd config resetstat
-                $rd read ; # Discard config resetstat reply
-            }
-            $rd close
-            after 120 ;# serverCron only updates the info once in 100ms
-            if {$::verbose} {
-                puts "used [s allocator_allocated]"
-                puts "rss [s allocator_active]"
-                puts "frag [s allocator_frag_ratio]"
-                puts "frag_bytes [s allocator_frag_bytes]"
-            }
-            assert_morethan [s allocator_frag_ratio] 1.35
-
-            catch {r config set activedefrag yes} e
-            if {[r config get activedefrag] eq "activedefrag yes"} {
-            
-                # wait for the active defrag to start working (decision once a second)
-                wait_for_condition 50 100 {
-                    [s total_active_defrag_time] ne 0
-                } else {
-                    after 120 ;# serverCron only updates the info once in 100ms
-                    puts [r info memory]
-                    puts [r info stats]
-                    puts [r memory malloc-stats]
-                    fail "defrag not started."
+            try {
+                for {set j 0} {$j < $n} {incr j} {
+                    set channel_name "$dummy_channel[format "%06d" $j]"
+                    $rd_pubsub subscribe $channel_name
+                    $rd_pubsub read ; # Discard subscribe replies
+                    $rd_pubsub ssubscribe $channel_name
+                    $rd_pubsub read ; # Discard ssubscribe replies
+                    # Pub/Sub clients are handled in the main thread, so their memory is
+                    # allocated there. Using the SETBIT command avoids the main thread
+                    # referencing argv from IO threads.
+                    $rd setbit k$j [expr {[string length $channel_name] * 8}] 1
+                    $rd read ; # Discard set replies
+                    $rd setbit spare$j [expr {[string length $channel_name] * 8}] 1
+                    $rd read
                 }
 
-                # wait for the active defrag to stop working
-                wait_for_defrag_stop 500 100 1.05
-
-                # test the fragmentation is lower
                 after 120 ;# serverCron only updates the info once in 100ms
                 if {$::verbose} {
                     puts "used [s allocator_allocated]"
@@ -595,22 +545,81 @@ run_solo {defrag} {
                     puts "frag [s allocator_frag_ratio]"
                     puts "frag_bytes [s allocator_frag_bytes]"
                 }
-            }
+                assert_lessthan [s allocator_frag_ratio] 1.05
 
-            # Publishes some message to all the pubsub clients to make sure that
-            # we didn't break the data structure.
-            for {set j 0} {$j < $n} {incr j} {
-                set channel "$dummy_channel[format "%06d" $j]"
-                r publish $channel "hello"
-                assert_equal "message $channel hello" [$rd_pubsub read] 
-                $rd_pubsub unsubscribe $channel
-                $rd_pubsub read
-                r spublish $channel "hello"
-                assert_equal "smessage $channel hello" [$rd_pubsub read] 
-                $rd_pubsub sunsubscribe $channel
-                $rd_pubsub read
+                # Delete all the keys to create fragmentation
+                # Use batching to avoid TCP deadlock
+                set batch_size 1000
+                for {set j 0} {$j < $n} {incr j} {
+                    $rd del k$j
+                    $rd del spare$j
+                    if {($j + 1) % $batch_size == 0} {
+                        for {set i 0} {$i < 2 * $batch_size} {incr i} {
+                            $rd read
+                        }
+                    }
+                }
+                set remaining [expr {2 * ($n % $batch_size)}]
+                for {set j 0} {$j < $remaining} {incr j} { $rd read }
+                if {$type eq "cluster"} {
+                    $rd config resetstat
+                    $rd read ; # Discard config resetstat reply
+                }
+                $rd close
+                after 120 ;# serverCron only updates the info once in 100ms
+                if {$::verbose} {
+                    puts "used [s allocator_allocated]"
+                    puts "rss [s allocator_active]"
+                    puts "frag [s allocator_frag_ratio]"
+                    puts "frag_bytes [s allocator_frag_bytes]"
+                }
+                assert_morethan [s allocator_frag_ratio] 1.35
+
+                catch {r config set activedefrag yes} e
+                if {[r config get activedefrag] eq "activedefrag yes"} {
+
+                    # wait for the active defrag to start working (decision once a second)
+                    wait_for_condition 50 100 {
+                        [s total_active_defrag_time] ne 0
+                    } else {
+                        after 120 ;# serverCron only updates the info once in 100ms
+                        puts [r info memory]
+                        puts [r info stats]
+                        puts [r memory malloc-stats]
+                        fail "defrag not started."
+                    }
+
+                    # wait for the active defrag to stop working
+                    wait_for_defrag_stop 500 100 1.05
+
+                    # test the fragmentation is lower
+                    after 120 ;# serverCron only updates the info once in 100ms
+                    if {$::verbose} {
+                        puts "used [s allocator_allocated]"
+                        puts "rss [s allocator_active]"
+                        puts "frag [s allocator_frag_ratio]"
+                        puts "frag_bytes [s allocator_frag_bytes]"
+                    }
+                }
+
+                # Publishes some message to all the pubsub clients to make sure that
+                # we didn't break the data structure.
+                for {set j 0} {$j < $n} {incr j} {
+                    set channel "$dummy_channel[format "%06d" $j]"
+                    r publish $channel "hello"
+                    assert_equal "message $channel hello" [$rd_pubsub read]
+                    $rd_pubsub unsubscribe $channel
+                    $rd_pubsub read
+                    r spublish $channel "hello"
+                    assert_equal "smessage $channel hello" [$rd_pubsub read]
+                    $rd_pubsub sunsubscribe $channel
+                    $rd_pubsub read
+                }
+                $rd_pubsub close
+            } finally {
+                catch {$rd close}
+                catch {$rd_pubsub close}
             }
-            $rd_pubsub close
         }
 
         test "Active defrag IDMP streams: $type" {

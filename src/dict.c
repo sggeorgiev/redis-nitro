@@ -90,6 +90,24 @@ static_assert(sizeof(dictBucket) == DICT_BUCKET_BYTES, "dictBucket must be one c
 
 typedef BUCKET_BITS_TYPE bucketBits;
 
+/* Scan callbacks can delete their entry and insert another one without
+ * changing the dict size. Track compaction into the actual slot so it
+ * cannot hide an entry from the scan. The stack also handles nested scans. */
+typedef struct dictScanState {
+    struct dictScanState *prev;
+    dict *d;
+    dictEntryLink link;
+    int compacted;
+} dictScanState;
+
+static __thread dictScanState *activeScan;
+
+static inline void scanSlotCompacted(dict *d, dictEntryLink link) {
+    for (dictScanState *scan = activeScan; scan; scan = scan->prev) {
+        if (scan->d == d && scan->link == link) scan->compacted = 1;
+    }
+}
+
 /* -------------------------- private prototypes ---------------------------- */
 
 static int _dictExpandIfNeeded(dict *d);
@@ -305,6 +323,7 @@ static void pruneLastBucket(dict *d, dictBucket *before_last, dictBucket *last, 
     if (last->presence != 0) {
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(before_last, DICT_BUCKET_SLOTS - 1, last, pos_in_last);
+        scanSlotCompacted(d, &before_last->slots[DICT_BUCKET_SLOTS - 1]);
     }
     freeChildBucket(d, table, last);
 }
@@ -323,6 +342,7 @@ static void fillBucketHole(dict *d, dictBucket *b, int pos, int table) {
     if (last->presence != 0) {
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(b, pos, last, pos_in_last);
+        scanSlotCompacted(d, &b->slots[pos]);
     }
     if (last->presence == 0 || __builtin_popcount(last->presence) == 1) {
         pruneLastBucket(d, before_last, last, table);
@@ -558,8 +578,12 @@ static inline int rehashAllowedByPolicy(dict *d) {
     if (can_resize == DICT_RESIZE_AVOID) {
         size_t s0 = numBuckets(d->ht_size_exp[0]);
         size_t s1 = numBuckets(d->ht_size_exp[1]);
+        /* Bucket sizing leaves some spare capacity, so a forced shrink at
+         * 1/32 occupancy can select a target only 16 times smaller. Allow
+         * that shrink to progress using the same occupancy threshold. */
         if ((s1 > s0 && s1 < dict_force_resize_ratio * s0) ||
-            (s1 < s0 && s0 < HASHTABLE_MIN_FILL * dict_force_resize_ratio * s1))
+            (s1 < s0 && s0 < HASHTABLE_MIN_FILL * dict_force_resize_ratio * s1 &&
+             dictSize(d) > s0 * DICT_BUCKET_SLOTS / (HASHTABLE_MIN_FILL * dict_force_resize_ratio)))
             return 0;
     }
     return 1;
@@ -943,7 +967,13 @@ static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
 
     dictEntry *he = b->slots[pos];
     removeSlot(d, b, pos, table);
-    if (!nofree) dictFreeUnlinkedEntry(d, he);
+    if (!nofree) {
+        /* Destructors run while the entry is still counted in dictSize(), as
+         * they always did (t_hash.c template registry relies on it). */
+        d->ht_used[table]++;
+        dictFreeUnlinkedEntry(d, he);
+        d->ht_used[table]--;
+    }
     _dictShrinkIfNeeded(d);
     return he;
 }
@@ -1778,8 +1808,8 @@ static unsigned long rev(unsigned long v) {
  *
  * Scan callback rules: the callback may delete the entry that was passed to it
  * (which compacts the bucket chain right away; the entry that takes its place
- * is then emitted too) and may insert or replace entries. Deleting other
- * entries leaves holes that are compacted after the chain has been scanned.
+ * is then emitted too) and may insert or replace entries. Deleting entries
+ * other than the one passed to the callback is not supported.
  *
  * HOW IT WORKS.
  *
@@ -1873,13 +1903,15 @@ static void dictScanChain(dict *d, int table, size_t idx, dictScanFunction *fn,
         for (int pos = 0; pos < numBucketPositions(b); pos++) {
             while (isPositionFilled(b, pos)) {
                 dictEntry *de = b->slots[pos];
-                size_t used = d->ht_used[table];
+                dictScanState scan = {activeScan, d, &b->slots[pos], 0};
+                activeScan = &scan;
                 fn(privdata, de, &b->slots[pos]);
+                activeScan = scan.prev;
                 /* If the callback deleted the entry and the chain was compacted,
                  * the slot may hold a different, not yet emitted, entry. A
-                 * callback that merely replaces the entry (same count) is not
+                 * callback that merely replaces the entry is not
                  * emitted again. */
-                if (d->ht_used[table] >= used || !isPositionFilled(b, pos)) break;
+                if (!scan.compacted || !isPositionFilled(b, pos)) break;
             }
         }
         b = getChildBucket(b);
@@ -2627,6 +2659,50 @@ static void modelScanCb(void *privdata, const dictEntry *de, dictEntryLink plink
     }
 }
 
+typedef struct scanMutationCtx {
+    dict *d;
+    int seen[DICT_BUCKET_SLOTS + 3];
+    int deletion; /* dictDelete, dictUnlink, or two-phase unlink */
+    int additions;
+    int nested;
+} scanMutationCtx;
+
+static void scanMutationCb(void *privdata, const dictEntry *de, dictEntryLink plink) {
+    scanMutationCtx *ctx = privdata;
+    int id = keyId(dictGetKey(de));
+    UNUSED(plink);
+    assert(id >= 0 && id < DICT_BUCKET_SLOTS + 3);
+    ctx->seen[id]++;
+    if (ctx->deletion == 3) {
+        /* Refilling an unchained hole is an insertion, not compaction. */
+        assert(ctx->seen[id] == 1);
+        assert(dictDelete(ctx->d, dictGetKey(de)) == DICT_OK);
+        assert(dictAdd(ctx->d, keyForId(id), NULL) == DICT_OK);
+        return;
+    }
+    if (id != 0) return;
+
+    if (ctx->nested == 1) {
+        ctx->nested = 2;
+        assert(dictScan(ctx->d, 0, scanMutationCb, ctx) == 0);
+        return;
+    }
+    if (ctx->deletion == 0) {
+        assert(dictDelete(ctx->d, "k0") == DICT_OK);
+    } else if (ctx->deletion == 1) {
+        dictEntry *unlinked = dictUnlink(ctx->d, "k0");
+        assert(unlinked != NULL);
+        dictFreeUnlinkedEntry(ctx->d, unlinked);
+    } else {
+        dictPosition pos;
+        dictEntryLink link = dictTwoPhaseUnlinkFind(ctx->d, "k0", &pos);
+        assert(link != NULL);
+        dictTwoPhaseUnlinkFree(ctx->d, link, &pos);
+    }
+    for (int i = 0; i < ctx->additions; i++)
+        assert(dictAdd(ctx->d, keyForId(DICT_BUCKET_SLOTS + 1 + i), NULL) == DICT_OK);
+}
+
 #define start_benchmark() start = timeInMilliseconds()
 #define end_benchmark(msg) do { \
     elapsed = timeInMilliseconds()-start; \
@@ -2906,12 +2982,39 @@ int dictTest(int argc, char **argv, int flags) {
         new_buckets = numBuckets(d->ht_size_exp[1]);
 
         /* Wait for rehashing. */
-        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
-        drainRehash(d);
+        for (int steps = 0; dictIsRehashing(d) && steps < 1000; steps++)
+            dictRehash(d, 100);
+        assert(!dictIsRehashing(d));
         assert(dictSize(d) == current_dict_used);
         assert(numBuckets(d->ht_size_exp[0]) == new_buckets);
         assert(d->ht_size_exp[1] == -1);
         dictVerify(d);
+    }
+
+    TEST("Forced shrink at 1/32 occupancy finishes under DICT_RESIZE_AVOID") {
+        dictType type = BenchmarkDictType;
+        type.hashFunction = constHashCallback;
+        dict *ds = dictCreate(&type);
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
+        assert(dictExpand(ds, 800) == DICT_OK);
+        for (int i = 0; i < 100; i++)
+            assert(dictAdd(ds, stringFromLongLong(i), NULL) == DICT_OK);
+        size_t threshold = dictSlots(ds) / (HASHTABLE_MIN_FILL * dict_force_resize_ratio);
+        dictSetResizeEnabled(DICT_RESIZE_AVOID);
+        for (int i = 99; i >= (int)threshold; i--) {
+            char *key = stringFromLongLong(i);
+            assert(dictDelete(ds, key) == DICT_OK);
+            zfree(key);
+            if (dictSize(ds) > threshold) assert(!dictIsRehashing(ds));
+        }
+        assert(dictIsRehashing(ds));
+        assert(numBuckets(ds->ht_size_exp[0]) == 16 * numBuckets(ds->ht_size_exp[1]));
+        for (int steps = 0; dictIsRehashing(ds) && steps < 1000; steps++)
+            dictRehash(ds, 100);
+        assert(!dictIsRehashing(ds));
+        assert(dictSize(ds) == threshold);
+        dictVerify(ds);
+        dictRelease(ds);
     }
 
     TEST("Restore to original state") {
@@ -2933,7 +3036,7 @@ int dictTest(int argc, char **argv, int flags) {
          * the n elements that the no_value dict does not allocate. */
         assert(dictSize(dn) == (unsigned long)n && dictSize(dv) == (unsigned long)n);
         assert(dictBuckets(dn) == dictBuckets(dv));
-        assert(dictEntryMemUsage(1) == 0 && dictEntryMemUsage(0) == 2 * sizeof(void *));
+        assert(dictEntryMemUsage(1) == 0 && dictEntryMemUsage(0) == sizeof(dictEntry));
         assert(dictMemUsage(dn) - dictMemUsage(dv) == (size_t)n * dictEntryMemUsage(0));
         assert(dictMemUsage(dv) == dictTableMemUsage(dv));
 
@@ -3051,6 +3154,47 @@ int dictTest(int argc, char **argv, int flags) {
         dictRelease(dc);
         assert(test_table_bytes == 0);
         zfree(m);
+    }
+
+    TEST("Scan preserves surviving keys when callbacks delete and insert, including nested scans") {
+        for (int no_value = 0; no_value <= 1; no_value++) {
+            dictType type = chainDictType;
+            type.no_value = no_value;
+            test_table_bytes = 0;
+            dict *unchained = dictCreate(&type);
+            dictSetResizeEnabled(DICT_RESIZE_FORBID);
+            for (int i = 0; i < DICT_BUCKET_SLOTS; i++)
+                assert(dictAdd(unchained, keyForId(i), NULL) == DICT_OK);
+            scanMutationCtx replacement = {.d = unchained, .deletion = 3};
+            assert(dictScan(unchained, 0, scanMutationCb, &replacement) == 0);
+            for (int i = 0; i < DICT_BUCKET_SLOTS; i++) assert(replacement.seen[i] == 1);
+            dictVerify(unchained);
+            dictRelease(unchained);
+            assert(test_table_bytes == 0);
+            for (int deletion = 0; deletion < 3; deletion++) {
+                for (int additions = 1; additions <= 2; additions++) {
+                    for (int nested = 0; nested <= 1; nested++) {
+                        dictType type = chainDictType;
+                        type.no_value = no_value;
+                        test_table_bytes = 0;
+                        dict *dc = dictCreate(&type);
+                        dictSetResizeEnabled(DICT_RESIZE_FORBID);
+                        for (int i = 0; i <= DICT_BUCKET_SLOTS; i++)
+                            assert(dictAdd(dc, keyForId(i), NULL) == DICT_OK);
+                        scanMutationCtx ctx = {.d = dc, .deletion = deletion,
+                                               .additions = additions, .nested = nested};
+                        assert(dictScan(dc, 0, scanMutationCb, &ctx) == 0);
+                        for (int i = 1; i <= DICT_BUCKET_SLOTS; i++) assert(ctx.seen[i] >= 1);
+                        assert(dictFind(dc, "k0") == NULL);
+                        assert(dictSize(dc) == DICT_BUCKET_SLOTS + (unsigned long)additions);
+                        dictVerify(dc);
+                        dictRelease(dc);
+                        assert(test_table_bytes == 0);
+                    }
+                }
+            }
+        }
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
     }
 
     TEST("Randomized operations against a reference model (no_value)") {

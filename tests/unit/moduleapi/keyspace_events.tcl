@@ -7,6 +7,34 @@ tags "modules external:skip" {
         r config set maxmemory-policy allkeys-lru
         r config set maxmemory 1gb
 
+        test {SCAN preserves keys when expiration notifications insert a key} {
+            r flushall sync
+            r debug set-active-expire 0
+            r debug dict-resizing 0
+            try {
+                set expected {}
+                # Overflow a single bucket so removing k0 compacts its chain.
+                for {set i 0} {$i <= [dict_bucket_slots]} {incr i} {
+                    r set k$i value
+                    if {$i > 0} {lappend expected k$i}
+                }
+                r pexpire k0 10
+                after 20
+                # The module increments testkeyspace:expired in its callback,
+                # keeping the dictionary size unchanged when k0 expires.
+                set scan [r scan 0 count 100]
+                assert_equal 0 [lindex $scan 0]
+                foreach key $expected {
+                    assert {[lsearch -exact [lindex $scan 1] $key] >= 0}
+                }
+                assert_equal 1 [r get testkeyspace:expired]
+            } finally {
+                r debug dict-resizing 1
+                r debug set-active-expire 1
+                r flushall sync
+            }
+        } {} {needs:debug}
+
         test {Test loaded key space event} {
             r set x 1
             r hset y f v

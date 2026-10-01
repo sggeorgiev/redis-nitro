@@ -653,17 +653,15 @@ start_server {tags {"info" "external:skip"}} {
     test {memory: database and pubsub overhead and rehashing dict count} {
         r flushall
 
-        # A bucket has 7 entry slots (64 bytes in all, including its metadata).
-        # A table of 8 buckets has 56 slots and expands (to 16 buckets) when an
-        # entry is added to it while it is full. Fill it with one entry less
-        # than 56, so the next entry fills it and the one after that triggers
+        # Fill an 8-bucket table with one entry less than its slot capacity,
+        # so the next entry fills it and the one after that triggers
         # rehashing. Don't use a table with a single bucket, since then all the
         # keys end up in the same bucket and rehashing ends instantly.
         set bucket_size 64
         set ht0_buckets 8
         set ht1_buckets 16
 
-        populate [expr $ht0_buckets * 7 - 1]
+        populate [expr {$ht0_buckets * [dict_bucket_slots] - 1}]
 
         # Verify rehashing is not ongoing
         wait_for_condition 100 10 {
