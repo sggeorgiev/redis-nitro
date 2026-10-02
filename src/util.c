@@ -1536,6 +1536,10 @@ int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...) {
 #include <assert.h>
 #include <sys/mman.h>
 #include "testhelp.h"
+#if defined(__linux__)
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#endif
 
 static void test_string2ll(void) {
     char buf[32];
@@ -1814,37 +1818,53 @@ static void test_fixedpoint_d2string(void) {
 #if defined(__linux__)
 /* Since fadvise and mincore is only supported in specific platforms like
  * Linux, we only verify the fadvise mechanism works in Linux */
-static int cache_exist(int fd) {
+static int cache_exist(int fd, size_t pagesize) {
     unsigned char flag;
-    void *m = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
-    assert(m);
-    assert(mincore(m, 4096, &flag) == 0);
-    munmap(m, 4096);
+    void *m = mmap(NULL, pagesize, PROT_READ, MAP_SHARED, fd, 0);
+    assert(m != MAP_FAILED);
+    assert(mincore(m, pagesize, &flag) == 0);
+    assert(munmap(m, pagesize) == 0);
     /* the least significant bit of the byte will be set if the corresponding
      * page is currently resident in memory */
     return flag&1;
 }
 
 static void test_reclaimFilePageCache(void) {
-    char *tmpfile = "/tmp/redis-reclaim-cache-test";
-    int fd = open(tmpfile, O_RDWR|O_CREAT, 0644);
+    /* /tmp may be tmpfs, where DONTNEED cannot evict file contents. Use the
+     * working directory so a disk-backed checkout can exercise reclamation. */
+    char tmpfile[] = "redis-reclaim-cache-test-XXXXXX";
+    int fd = mkstemp(tmpfile);
     assert(fd >= 0);
+    assert(unlink(tmpfile) == 0);
+
+    struct statfs fs;
+    assert(fstatfs(fd, &fs) == 0);
+    unsigned long fs_type = (unsigned long)fs.f_type;
+    if (fs_type == TMPFS_MAGIC || fs_type == RAMFS_MAGIC) {
+        assert(close(fd) == 0);
+        printf("reclaimFilePageCache test skipped on a memory-backed filesystem\n");
+        return;
+    }
+
+    long pagesize = sysconf(_SC_PAGESIZE);
+    assert(pagesize > 0);
+    char *buf = zcalloc(pagesize);
 
     /* test write file */
-    char buf[4] = "foo";
-    assert(write(fd, buf, sizeof(buf)) > 0);
-    assert(cache_exist(fd));
+    assert(write(fd, buf, pagesize) == pagesize);
+    assert(cache_exist(fd, pagesize));
     assert(redis_fsync(fd) == 0);
     assert(reclaimFilePageCache(fd, 0, 0) == 0);
-    assert(!cache_exist(fd));
+    assert(!cache_exist(fd, pagesize));
 
     /* test read file */
-    assert(pread(fd, buf, sizeof(buf), 0) > 0);
-    assert(cache_exist(fd));
+    assert(pread(fd, buf, pagesize, 0) == pagesize);
+    assert(cache_exist(fd, pagesize));
     assert(reclaimFilePageCache(fd, 0, 0) == 0);
-    assert(!cache_exist(fd));
+    assert(!cache_exist(fd, pagesize));
 
-    unlink(tmpfile);
+    zfree(buf);
+    assert(close(fd) == 0);
     printf("reclaimFilePageCache test is ok\n");
 }
 #endif

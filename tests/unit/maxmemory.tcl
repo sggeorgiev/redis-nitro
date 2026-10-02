@@ -427,15 +427,15 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory 0
         r config set maxmemory-policy allkeys-random
 
-        # The next rehash size is 2048 buckets, which will eat 128k memory.
-        set capacity [expr {1024 * [dict_bucket_slots]}]
-        populate [expr {$capacity - 1}] "" 1
+        # The next rehash size is 2048 groups, which will eat 256k memory.
+        set fill [dict_max_fill 1024]
+        populate [expr {$fill - 1}] "" 1
 
         set used [s used_memory]
         set limit [expr {$used + 10*1024}]
         r config set maxmemory $limit
 
-        # Adding a key to meet the 1:1 radio.
+        # Adding a key to reach 7/8 fill.
         r set k0 v0
         # The dict is full, it can be resized in tryResizeHashTables in cron,
         # or we add a key to let it check whether it can be resized.
@@ -443,7 +443,7 @@ start_server {tags {"maxmemory external:skip"}} {
         # Next writing command will trigger evicting some keys if last
         # command trigger DB dict rehash
         r set k2 v2
-        assert_equal [expr {$capacity + 2}] [r dbsize]
+        assert_equal [expr {$fill + 2}] [r dbsize]
     }
 }
 

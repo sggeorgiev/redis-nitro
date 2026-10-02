@@ -38,6 +38,7 @@ struct _kvstore {
     int non_empty_dicts;                   /* The number of non-empty dicts. */
     unsigned long long key_count;          /* Total number of keys in this kvstore. */
     unsigned long long table_bytes;        /* Total bytes of hash tables in this kvstore across dictionaries. */
+    unsigned long long stash_bytes;        /* Overflow stash allocations, including deleted nodes. */
     fenwickTree *dict_sizes;               /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
     size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
     void *metadata[];                      /* conditionally allocated based on "flags" */
@@ -177,6 +178,11 @@ static void kvstoreDictTableMemChanged(dict *d, long long delta_bytes) {
     kvs->table_bytes += delta_bytes;
 }
 
+static void kvstoreDictStashMemChanged(dict *d, long long delta_bytes) {
+    kvstore *kvs = d->type->userdata;
+    kvs->stash_bytes += delta_bytes;
+}
+
 /* Returns the size of the DB dict extended metadata in bytes. */
 static size_t kvstoreDictBaseMetaSize(dict *d) {
     UNUSED(d);
@@ -219,6 +225,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     kvs->dtype.rehashingStarted = kvstoreDictRehashingStarted;
     kvs->dtype.rehashingCompleted = kvstoreDictRehashingCompleted;
     kvs->dtype.tableMemChanged = kvstoreDictTableMemChanged;
+    kvs->dtype.stashMemChanged = kvstoreDictStashMemChanged;
 
     kvs->num_dicts_bits = num_dicts_bits;
     kvs->num_dicts = 1 << kvs->num_dicts_bits;
@@ -234,6 +241,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     kvs->resize_cursor = 0;
     kvs->dict_sizes = kvs->num_dicts > 1 ? fwTreeCreate(kvs->num_dicts_bits) : NULL;
     kvs->table_bytes = 0;
+    kvs->stash_bytes = 0;
     kvs->overhead_hashtable_rehashing = 0;
     return kvs;
 }
@@ -259,6 +267,7 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
     kvs->non_empty_dicts = 0;
     kvs->resize_cursor = 0;
     kvs->table_bytes = 0;
+    kvs->stash_bytes = 0;
     if (kvs->dict_sizes)
         fwTreeClear(kvs->dict_sizes);
     kvs->overhead_hashtable_rehashing = 0;
@@ -292,7 +301,7 @@ unsigned long long int kvstoreSize(kvstore *kvs) {
  * across dictionaries in a database. */
 unsigned long kvstoreBuckets(kvstore *kvs) {
     if (kvs->num_dicts != 1) {
-        return kvs->table_bytes / DICT_BUCKET_BYTES;
+        return kvs->table_bytes / DICT_GROUP_BYTES;
     } else {
         return kvs->dicts[0]? dictBuckets(kvs->dicts[0]) : 0;
     }
@@ -310,7 +319,7 @@ size_t kvstoreMemUsage(kvstore *kvs) {
     size_t metaSize = kvs->dtype.dictMetadataBytes(NULL);
     unsigned long long keys_count = kvstoreSize(kvs);
     mem += keys_count * dictEntryMemUsage(kvs->dtype.no_value) +
-           kvstoreTableBytes(kvs) +
+           kvstoreTableBytes(kvs) + kvs->stash_bytes +
            kvs->allocated_dicts * (sizeof(dict) + metaSize);
 
     /* Values are dict* shared with kvs->dicts */
@@ -569,6 +578,7 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     kvs->allocated_dicts -= 1;
     cumulativeKeyCountAdd(kvs, didx, -((long long)dictSize(d)));
     kvstoreDictTableMemChanged(d, -((long long) dictTableMemUsage(d)));
+    kvstoreDictStashMemChanged(d, -((long long)dictStashMemUsage(d)));
     /* If rehashing, stop it. */
     if (dictIsRehashing(d))
         kvstoreDictRehashingCompleted(d);
@@ -583,6 +593,7 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     dst->allocated_dicts += 1;
     cumulativeKeyCountAdd(dst, didx, dictSize(d));
     kvstoreDictTableMemChanged(d, dictTableMemUsage(d));
+    kvstoreDictStashMemChanged(d, dictStashMemUsage(d));
     if (dictIsRehashing(dst->dicts[didx]))
         kvstoreDictRehashingStarted(dst->dicts[didx]);
 }
@@ -698,7 +709,7 @@ uint64_t kvstoreIncrementallyRehash(kvstore *kvs, uint64_t threshold_us) {
 }
 
 size_t kvstoreOverheadHashtableLut(kvstore *kvs) {
-    return kvs->table_bytes;
+    return kvs->table_bytes + kvs->stash_bytes;
 }
 
 size_t kvstoreOverheadHashtableRehashing(kvstore *kvs) {
@@ -1179,6 +1190,47 @@ int kvstoreTest(int argc, char **argv, int flags) {
             kvstoreResetDictIterator(&kvs_di);
         }
         kvstoreRelease(kvs);
+    }
+
+    TEST("Stash overhead is tracked separately from buckets through move, drain and empty") {
+        for (int bits = 0; bits <= 2; bits += 2) {
+            kvstore *src = kvstoreCreate(&KvstoreTestType, &KvstoreDictNovalTestType, bits,
+                                        KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+            kvstore *dst = kvstoreCreate(&KvstoreTestType, &KvstoreDictNovalTestType, bits,
+                                        KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+            dict *d = createDictIfNeeded(src, 0);
+            size_t baseline = kvstoreMemUsage(src);
+            dictPauseRehashing(d);
+            for (i = 0; i < 100; i++)
+                assert(kvstoreDictAddRaw(src, 0, stringFromInt(i), NULL));
+            assert(dictStashMemUsage(d) > 0);
+            assert(kvstoreMemUsage(src) == baseline + dictMemUsage(d) + sizeof(listNode));
+            assert(kvstoreOverheadHashtableLut(src) == dictTableMemUsage(d) + dictStashMemUsage(d));
+            assert(kvstoreBuckets(src) == dictBuckets(d));
+            kvstoreMoveDict(src, dst, 0);
+            assert(kvstoreOverheadHashtableLut(src) == 0 && src->stash_bytes == 0);
+            assert(kvstoreSize(src) == 0 && kvstoreSize(dst) == 100);
+            assert(kvstoreOverheadHashtableLut(dst) == dictTableMemUsage(d) + dictStashMemUsage(d));
+            assert(kvstoreBuckets(dst) == dictBuckets(d));
+            dictResumeRehashing(d);
+            assert(dst->stash_bytes == 0);
+            assert(kvstoreOverheadHashtableLut(dst) == dictTableMemUsage(d));
+
+            /* Empty and release must also uncharge a stash without resuming. */
+            dictPauseRehashing(d);
+            for (i = 100; i < 1000; i++)
+                assert(kvstoreDictAddRaw(dst, 0, stringFromInt(i), NULL));
+            assert(dictStashMemUsage(d) > 0);
+            kvstoreEmpty(dst, NULL);
+            assert(dst->stash_bytes == 0 && kvstoreOverheadHashtableLut(dst) == 0);
+            assert(kvstoreBuckets(dst) == 0);
+            dictPauseRehashing(d);
+            for (i = 0; i < 100; i++)
+                assert(kvstoreDictAddRaw(dst, 0, stringFromInt(i), NULL));
+            assert(dictStashMemUsage(d) > 0);
+            kvstoreRelease(src);
+            kvstoreRelease(dst);
+        }
     }
 
     kvstoreRelease(kvs1);

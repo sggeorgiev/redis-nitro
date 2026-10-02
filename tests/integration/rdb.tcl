@@ -92,10 +92,11 @@ start_server {overrides {loglevel verbose}} {
 
         restart_server 0 true false
 
-        # Verify DB resize log message
-        set key_buckets [expr {[s arch_bits] == 32 ? 128 : 256}]
-        set expire_buckets [expr {$key_buckets / 2}]
-        verify_log_message 0 "*DB $dbid resized*$key_buckets key*$expire_buckets expire*" 0
+        # Verify DB resize log message: tables are sized to hold their entries
+        # at 7/8 fill, 1000 keys need 128 groups and 500 expires 64 groups.
+        set key_groups 128
+        set expire_groups [expr {$key_groups / 2}]
+        verify_log_message 0 "*DB $dbid resized*$key_groups key*$expire_groups expire*" 0
     }
 }
 

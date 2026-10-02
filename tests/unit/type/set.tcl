@@ -1314,9 +1314,12 @@ foreach type {single multiple single_multiple} {
         for {set i 0} {$i < 800} {incr i} {lappend members member:$i}
         create_set forced-shrink $members
         while {[is_rehashing forced-shrink]} {r srandmember forced-shrink}
-        set slots [dict_bucket_slots]
+        # 800 members fill 128 groups; 1/32 of their slots is 4 groups' worth
+        # of members, and the shrunk table (sized for twice the members) is 16
+        # groups.
+        set slots [dict_group_slots]
         assert_match "*table size: [expr {128 * $slots}]*" [r debug HTSTATS-KEY forced-shrink]
-        set remaining [expr {4 * $slots}]
+        set remaining [expr {128 * $slots / 32}]
         r bgsave
         try {
             r srem forced-shrink {*}[lrange $members $remaining end]
@@ -1327,7 +1330,7 @@ foreach type {single multiple single_multiple} {
                 fail "Forced shrink stalled during BGSAVE"
             }
             assert_equal 1 [s rdb_bgsave_in_progress]
-            verify_rehashing_completed_key forced-shrink [expr {8 * $slots}] $remaining
+            verify_rehashing_completed_key forced-shrink [expr {16 * $slots}] $remaining
             assert_equal [lsort [lrange $members 0 [expr {$remaining - 1}]]] [lsort [r smembers forced-shrink]]
         } finally {
             catch {exec kill -9 [get_child_pid 0]}
@@ -1410,20 +1413,19 @@ foreach type {single multiple single_multiple} {
         rem_hash_set_top_N myset [expr {[r scard myset] - 30}]
         assert_equal [r scard myset] 30
         
-        # Hash set rehashing would be completed while removing members from the `myset`
-        # We also check the size and members in the hash table.
-        set slots [dict_bucket_slots]
-        set capacity [expr {[s arch_bits] == 32 ? 16 * $slots : 32 * $slots}]
-        verify_rehashing_completed_key myset $capacity 30
-
-        # Now that we have a hash set with only one long chain of buckets: the
-        # 30 entries fill a root bucket and its children, and no other
-        # top-level bucket has a child.
+        # Finish the shrinks this started. The members left are the last ones
+        # in SSCAN order, so their home groups share their low bits: in a small
+        # table they crowd into a few home groups and spill into the groups
+        # after them, while most groups stay empty.
+        while {[is_rehashing myset]} {
+            r srandmember myset 1
+        }
         set htstats [r debug HTSTATS-KEY myset full]
-        assert {[regexp {child buckets: ([0-9]+)} $htstats - child_buckets]}
-        assert {[regexp {max chain length: ([0-9]+)} $htstats - max_chain_length]}
-        set expected_children [expr {(30 - 2) / ($slots - 1)}]
-        assert {$child_buckets == $max_chain_length && $max_chain_length == $expected_children}
+        assert {![string match {*rehashing target*} $htstats]}
+        assert_match "*number of elements: 30*" $htstats
+        if {$::verbose} {
+            puts $htstats
+        }
 
         # 9) Use positive count (PATH 4) to get 10 elements (out of 30) each time.
         unset -nocomplain allkey

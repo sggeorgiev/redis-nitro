@@ -255,9 +255,9 @@ start_server {tags {"bless"}} {
     test {BLESS index completes rehashing in the background} {
         r flushall
         r config set activerehashing no
-        set count [expr {256 * [dict_bucket_slots] + 8}]
+        set count [expr {[dict_max_fill 256] + 8}]
         r eval {
-            -- Stop shortly after expanding a 256-bucket table.
+            -- Stop shortly after expanding a 256-group table.
             for i = 1, tonumber(ARGV[1]) do
                 local key = 'blessed:' .. i
                 redis.call('SET', key, 'value')

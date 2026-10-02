@@ -13,8 +13,8 @@ tags "modules external:skip" {
             r debug dict-resizing 0
             try {
                 set expected {}
-                # Overflow a single bucket so removing k0 compacts its chain.
-                for {set i 0} {$i <= [dict_bucket_slots]} {incr i} {
+                # Overflow the first group, so some keys are displaced.
+                for {set i 0} {$i <= [dict_group_slots]} {incr i} {
                     r set k$i value
                     if {$i > 0} {lappend expected k$i}
                 }

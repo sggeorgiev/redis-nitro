@@ -3,7 +3,8 @@
  * This file implements in-memory hash tables with insert/del/replace/find/
  * get-random-element operations. Hash tables will auto-resize if needed
  * tables of power of two in size are used, collisions are handled by
- * chaining. See the source code for more information... :)
+ * open addressing over groups of slots (a Swiss table). See the source code
+ * for more information... :)
  *
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
@@ -14,12 +15,11 @@
  *
  * Dict usage of pointer tagging
  * -----------------------------
- * In the "normal" case (no_value=0), a dict slot contains only a pointer to a 
- * dictEntry, and dictEntry holds untagged pointers to key and value. But when a 
- * dict is used as a set (no_value=1), we optimize by storing direct key pointers 
- * when possible, avoiding dictEntry allocation. This happens when A bucket contains 
- * only one key, or at the tail of a collision chain. Redis dicts uses pointer 
- * tagging, to identify direct key pointers from dictEntry pointers, i.e embedding 
+ * In the "normal" case (no_value=0), a dict slot contains only a pointer to a
+ * dictEntry, and dictEntry holds untagged pointers to key and value. But when a
+ * dict is used as a set (no_value=1), every slot stores the key pointer directly,
+ * avoiding dictEntry allocation. Redis dicts uses pointer
+ * tagging, to identify direct key pointers from dictEntry pointers, i.e embedding
  * metadata in the lowest three bits of pointers. This requires 8-byte alignment, 
  * which zmalloc() guarantees on both 32-bit and 64-bit systems (via jemalloc/tcmalloc, 
  * or standard malloc with explicit PREFIX_SIZE=8).
@@ -66,7 +66,7 @@
 #define __stored_key
 
 typedef struct dictEntry dictEntry; /* opaque */
-struct dictBucket; /* opaque, defined in dict.c */
+struct dictStashEntry; /* opaque, defined in dict.c */
 typedef struct dict dict;
 typedef dictEntry **dictEntryLink; /* See description of dictFindLink() */
 
@@ -118,7 +118,7 @@ typedef struct dictType {
      * dict is a set. When this flag is set, it's not possible to access the
      * value of a dictEntry and it's also impossible to use dictSetKey(). It 
      * enables an optimization to store a key directly without an allocating 
-     * dictEntry in between, if it is the only key in the bucket. */
+     * dictEntry in between. */
     unsigned int no_value:1;
     /* This flag is required for `no_value` optimization since the optimization
      * reuses LSB bits as metadata */ 
@@ -139,7 +139,7 @@ typedef struct dictType {
 
     /* Optional prefetch hooks used by the memory_prefetch state machine.
      * Both default to NULL; when both are NULL the state machine just
-     * prefetches the bucket + dictEntry chain and stops there.
+     * prefetches the group, slot and dictEntry and stops there.
      *
      * prefetchEntryKey: called after a dictEntry has been brought into
      *   cache. Returns an address to issue redis_prefetch_read on (so the
@@ -148,13 +148,16 @@ typedef struct dictType {
      *   the entry).
      * prefetchEntryValue: called when the entry is the *presumed* match
      *   for the lookup key — either keyCompare returned equal, or the
-     *   state machine took the "last entry in chain, not rehashing"
+     *   state machine took the "lone tag match, not rehashing"
      *   shortcut and is betting on a hit without comparing. Callbacks
      *   must therefore not assume the key has been verified equal; the
      *   prefetch is advisory. Returns an address to prefetch for the
      *   value-side payload, or NULL. */
     void *(*prefetchEntryKey)(const dictEntry *de);
     void *(*prefetchEntryValue)(const dictEntry *de);
+    /* Invoked when overflow stash allocations change. Deleted stash nodes
+     * remain charged until rehashing resumes and their allocations are freed. */
+    void (*stashMemChanged)(dict *d, long long delta_bytes);
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
@@ -162,27 +165,30 @@ typedef struct dictType {
 /* Opaque position handed from dictTwoPhaseUnlinkFind() to
  * dictTwoPhaseUnlinkFree(). Callers must not look inside. */
 typedef struct dictPosition {
-    struct dictBucket *bucket;
-    uint16_t pos;
-    uint16_t table;
+    size_t slot;   /* slot index within the table, or the stash entry */
+    uint64_t hash; /* mixed hash of the key, see dict.c */
+    int table;     /* 0, 1, or 2 for the stash */
 } dictPosition;
 
 struct dict {
     dictType *type;
 
-    struct dictBucket *ht_table[2]; /* arrays of 1<<ht_size_exp top-level buckets */
-    unsigned long ht_used[2];       /* number of entries in each table */
-    unsigned long child_buckets[2]; /* allocated child (overflow) buckets */
+    /* Each table is one allocation of 1<<ht_size_exp groups, each holding
+     * its control bytes followed by its entry slots (see dict.c). */
+    uint8_t *ht_table[2];
+    unsigned long ht_used[2]; /* number of entries in each table (ht_used[1] includes stashed ones) */
+    /* Inserts that didn't fit while rehashing was paused (see dict.c). */
+    struct dictStashEntry *stash;
+    unsigned long stash_count; /* allocated nodes, including deleted entries */
 
     long rehashidx; /* rehashing not in progress if rehashidx == -1 */
 
-    /* Note: the pause counters are full unsigneds so iterator increments
+    /* Note: the pause counter is a full unsigned so iterator increments
      * don't perform RMW on the same storage unit as other bitfields. */
-    unsigned pauserehash;  /* If >0 rehashing is paused */
-    unsigned pausecompact; /* If >0 bucket chains are not compacted on delete */
+    unsigned pauserehash; /* If >0 rehashing is paused */
 
     /* Keep small vars at end for optimal (minimal) struct padding */
-    signed char ht_size_exp[2]; /* exponent of top-level bucket count (buckets = 1<<exp) */
+    signed char ht_size_exp[2]; /* exponent of group count (groups = 1<<exp) */
     int16_t pauseAutoResize;  /* If >0 automatic resizing is disallowed (<0 indicates coding error) */
     uint8_t pending_shrink;   /* A delete wanted to shrink while paused */
     void *metadata[];
@@ -194,29 +200,25 @@ struct dict {
  * should be called while iterating. */
 typedef struct dictIterator {
     dict *d;
-    struct dictBucket *bucket; /* current bucket within the chain */
-    long index;                /* top-level bucket index, -1 before the first call */
-    int table, pos;            /* table and slot position within bucket */
+    long index;     /* group index, -1 before the first call */
+    int table, pos; /* table (2 = the stash) and slot position within the group */
+    struct dictStashEntry *stash_next;
     uint8_t safe;
     uint8_t done;
-    /* The last returned entry sat in the last slot of an unchained bucket. If
-     * the bucket became chained since, that entry moved to the child's slot 0
-     * and must not be returned again. */
-    uint8_t ret_last_unchained;
-    uint8_t skip_pos0;
-    unsigned long last_seen_size; /* safe iterator: ht_used at chain entry */
     /* unsafe iterator fingerprint for misuse detection. */
     unsigned long long fingerprint;
 } dictIterator;
 
 typedef struct dictStats {
     int htidx;
-    unsigned long toplevelBuckets;
-    unsigned long childBuckets;
-    unsigned long maxChainLen; /* in child buckets */
-    unsigned long htSize;      /* capacity in entry slots */
+    unsigned long groups;
+    unsigned long overflowGroups;      /* groups that some entry probed past */
+    unsigned long displaced;           /* entries stored outside their home group */
+    unsigned long maxProbeLen;         /* in groups */
+    unsigned long long totalProbeLen;  /* sum over entries, in groups */
+    unsigned long htSize;              /* capacity in entry slots */
     unsigned long htUsed;
-    unsigned long *clvector;   /* entry i counts bucket chains with i child buckets */
+    unsigned long *clvector;           /* entry i counts entries found after probing i groups */
 } dictStats;
 
 typedef void (dictScanFunction)(void *privdata, const dictEntry *de, dictEntry **plink);
@@ -227,19 +229,23 @@ typedef struct {
     dictDefragAllocFunction *defragVal;   /* Defrag-realloc values (optional) */
 } dictDefragFunctions;
 
-/* Swiss-style 64-byte buckets: a bucket holds DICT_BUCKET_SLOTS entries with a
- * one byte hash tag each. When a bucket overflows its last slot becomes a
- * pointer to a child bucket. dictBuckets() counts top-level buckets. */
+/* Swiss table: entries live in groups of DICT_GROUP_SLOTS slots with a control
+ * byte (hash tag) each, plus one overflow counter byte per group. A full group
+ * overflows into the next group of the key's probe sequence. dictBuckets()
+ * counts groups. A group is 16 control bytes plus the slots, a power of two
+ * (128 or 64 bytes), so tables match allocator size classes exactly. */
 #if SIZE_MAX == UINT64_MAX
-#define DICT_BUCKET_SLOTS        7
+#define DICT_GROUP_SLOTS         14
 #else
-#define DICT_BUCKET_SLOTS        12
+#define DICT_GROUP_SLOTS         12
 #endif
-#define DICT_BUCKET_BYTES        64
+#define DICT_GROUP_BYTES         (16 + DICT_GROUP_SLOTS * sizeof(void *))
 
-/* Every table starts as a single bucket, which is also the shrink floor. */
+/* Every table starts as a single group, which is also the shrink floor.
+ * DICT_HT_INITIAL_SIZE is the number of entries it takes before growing
+ * (tables grow at 7/8 of their slots). */
 #define DICT_HT_INITIAL_EXP      0
-#define DICT_HT_INITIAL_SIZE     DICT_BUCKET_SLOTS
+#define DICT_HT_INITIAL_SIZE     (DICT_GROUP_SLOTS * 7 / 8)
 
 /* ------------------------------- Macros ------------------------------------*/
 #define dictFreeVal(d, entry) do {                     \
@@ -295,6 +301,7 @@ void dictPauseRehashing(dict *d);
 void dictResumeRehashing(dict *d);
 unsigned long dictSlots(const dict *d);
 size_t dictTableMemUsage(const dict *d);
+size_t dictStashMemUsage(const dict *d);
 size_t dictRehashingMemUsage(const dict *d);
 dict *dictDefragTables(dict *d, void *(*defragfn)(void *));
 void dictDismissTables(dict *d, void (*fn)(void *ptr, size_t size));
@@ -362,14 +369,16 @@ uint64_t dictGetUnsignedIntegerVal(const dictEntry *de);
 typedef struct dictPrefetchState {
     dict *d;
     const void *key;
-    uint64_t hash;
-    struct dictBucket *bucket;
+    uint64_t hash;       /* mixed hash */
+    dictEntry **slot;
     dictEntry *current_entry;
+    size_t group;
+    uint32_t step;       /* probe step within the current table */
     uint16_t candidates; /* tag-matching, not yet visited positions */
     int8_t ht_idx;
     uint8_t stage;
     uint8_t done;
-    uint8_t lone;        /* single candidate in an unchained bucket */
+    uint8_t lone;        /* single candidate in a group nothing probed past */
 } dictPrefetchState;
 
 void dictPrefetchInit(dictPrefetchState *st, dict *d, const void *key);

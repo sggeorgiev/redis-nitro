@@ -940,8 +940,12 @@ start_cluster 1 0 {tags {"expire external:skip cluster"}} {
         # Enable resizing
         r debug dict-resizing 1
 
-        # put some data into slot 12182 and trigger the resize
+        # put some data into slot 12182 and trigger the resize: deleting a key
+        # with a TTL shrinks the mostly empty keys and expires dicts, so that
+        # the expires dict is worth scanning again
         r psetex "{foo}0" 500 a
+        r psetex "{foo}tmp" 100000 a
+        r del "{foo}tmp"
 
         # Verify all keys have expired
         wait_for_condition 400 100 {

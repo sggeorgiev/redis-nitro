@@ -12,9 +12,21 @@
 # Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
 #
 
-# Dict buckets are one cache line on both supported pointer widths.
-proc dict_bucket_slots {} {
-    expr {[s arch_bits] == 32 ? 12 : 7}
+# Geometry of the server's dict hash tables (src/dict.h): a table is a power of
+# two number of groups of 14 entry slots (12 on 32-bit builds). A group takes 16
+# control bytes plus its slot pointers: 128 bytes (64 on 32-bit). A table grows
+# when it reaches 7/8 of its slots.
+proc dict_group_slots {} {
+    expr {[s arch_bits] == 32 ? 12 : 14}
+}
+
+proc dict_group_bytes {} {
+    expr {[s arch_bits] == 32 ? 64 : 128}
+}
+
+# Entries a table of `groups` groups takes before it grows.
+proc dict_max_fill {groups} {
+    expr {$groups * [dict_group_slots] * 7 / 8}
 }
 
 proc randstring {min max {type binary}} {
