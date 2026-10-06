@@ -86,26 +86,6 @@ static_assert(sizeof(dictBucket) == DICT_BUCKET_BYTES, "dictBucket must be one c
 
 typedef BUCKET_BITS_TYPE bucketBits;
 
-/* Scan callbacks can delete their entry and insert another one without
- * changing the dict size. Track compaction into the actual slot so it
- * cannot hide an entry from the scan. The stack also handles nested scans. */
-typedef struct dictScanState {
-    struct dictScanState *prev;
-    dict *d;
-    dictBucket *bucket;
-    dictEntryLink link;
-    int compacted;
-    int prune_pending;
-} dictScanState;
-
-static __thread dictScanState *active_scan;
-
-static inline void scanSlotCompacted(dict *d, dictEntryLink link) {
-    for (dictScanState *scan = active_scan; scan; scan = scan->prev) {
-        if (scan->d == d && scan->link == link) scan->compacted = 1;
-    }
-}
-
 /* -------------------------- private prototypes ---------------------------- */
 
 static int _dictExpandIfNeeded(dict *d);
@@ -305,22 +285,11 @@ static void pruneLastBucket(dict *d, dictBucket *before_last, dictBucket *last, 
     assert(before_last->chained && getChildBucket(before_last) == last);
     assert(!last->chained);
     assert(last->presence == 0 || __builtin_popcount(last->presence) == 1);
-    /* A callback may delete the entry being scanned in the last bucket. Keep
-     * that bucket alive until its scan finishes, including nested scans. */
-    int scanning = 0;
-    for (dictScanState *scan = active_scan; scan; scan = scan->prev) {
-        if (scan->d == d && scan->bucket == last) {
-            scan->prune_pending = 1;
-            scanning = 1;
-        }
-    }
-    if (scanning) return;
     before_last->chained = 0;
     assert(!isPositionFilled(before_last, DICT_BUCKET_SLOTS - 1));
     if (last->presence != 0) {
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(before_last, DICT_BUCKET_SLOTS - 1, last, pos_in_last);
-        scanSlotCompacted(d, &before_last->slots[DICT_BUCKET_SLOTS - 1]);
     }
     freeChildBucket(d, table, last);
 }
@@ -339,7 +308,6 @@ static void fillBucketHole(dict *d, dictBucket *b, int pos, int table) {
     if (last->presence != 0) {
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(b, pos, last, pos_in_last);
-        scanSlotCompacted(d, &b->slots[pos]);
     }
     if (last->presence == 0 || __builtin_popcount(last->presence) == 1) {
         pruneLastBucket(d, before_last, last, table);
@@ -457,20 +425,7 @@ static void dictResumeFinalize(dict *d) {
     }
 }
 
-/* Used by scan: stops the tables from being rehashed (entries moving between
- * tables) while the callbacks run, but still allows compaction of the chain
- * being scanned. */
-static inline void pauseRehashOnly(dict *d) {
-    d->pauserehash++;
-}
-
-static void resumeRehashOnly(dict *d) {
-    debugAssert(d->pauserehash > 0);
-    d->pauserehash--;
-    dictResumeFinalize(d);
-}
-
-/* Used by safe iterators, two-phase delete and callers that hold a link:
+/* Used by scan, safe iterators, two-phase delete and callers that hold a link:
  * entries must not move at all, so rehashing and bucket compaction are both
  * paused. */
 void dictPauseRehashing(dict *d) {
@@ -1793,10 +1748,11 @@ static unsigned long rev(unsigned long v) {
  * called with 'privdata' as first argument, the dictionary entry
  * 'de' as second argument and a link to the slot of the entry as third.
  *
- * Scan callback rules: the callback may delete the entry that was passed to it
- * (which compacts the bucket chain right away; the entry that takes its place
- * is then emitted too) and may insert or replace entries. Deleting entries
- * other than the one passed to the callback is not supported.
+ * Scan callback rules: the callback may delete, insert or replace entries.
+ * Bucket chains are not compacted while a callback runs, so deletes leave
+ * holes and never move an entry that is yet to be emitted. The chain being
+ * scanned is compacted once its callbacks are done; holes left in other
+ * chains are refilled by later inserts, scans, safe iterators or rehashing.
  *
  * HOW IT WORKS.
  *
@@ -1878,43 +1834,27 @@ static void dictScanChain(dict *d, int table, size_t idx, dictScanFunction *fn,
                           dictDefragFunctions *defragfns, void *privdata)
 {
     dictBucket *root = &d->ht_table[table][idx];
-    size_t used_before = d->ht_used[table];
-    int prune_pending = 0;
 
     if (defragfns) dictDefragBucket(d, root, defragfns);
 
-    dictBucket *b = root;
-    while (b) {
-        /* presence is re-read each time: a callback that deletes its entry
-         * compacts the chain, which may move an entry from the end of the
-         * chain into the slot just visited (and possibly turn this bucket into
-         * an unchained one, setting the bit of its last slot). Either way that
-         * entry hasn't been emitted yet, so we look at the same position
-         * again. The child slot of a chained bucket never has its bit set. */
+    /* Compaction is paused, so a callback's deletes only clear presence bits:
+     * no entry moves and no bucket is freed while the chain is walked. Inserts
+     * may fill holes or chain a full bucket, and such entries may or may not
+     * be emitted. presence is re-read after each callback. The child slot of a
+     * chained bucket never has its bit set. */
+    for (dictBucket *b = root; b; b = getChildBucket(b)) {
         bucketBits rest;
         for (int pos = 0; (rest = b->presence >> pos) != 0; pos++) {
             pos += __builtin_ctz(rest);
-            while (isPositionFilled(b, pos)) {
-                dictEntry *de = b->slots[pos];
-                dictScanState scan = {.prev = active_scan, .d = d, .bucket = b,
-                                      .link = &b->slots[pos]};
-                active_scan = &scan;
-                fn(privdata, de, &b->slots[pos]);
-                active_scan = scan.prev;
-                prune_pending |= scan.prune_pending;
-                /* If the callback deleted the entry and the chain was compacted,
-                 * the slot may hold a different, not yet emitted, entry. A
-                 * callback that merely replaces the entry is not
-                 * emitted again. */
-                if (!scan.compacted || !isPositionFilled(b, pos)) break;
-            }
+            fn(privdata, b->slots[pos], &b->slots[pos]);
         }
-        b = getChildBucket(b);
     }
 
-    /* If callbacks deleted entries, make sure no holes are left in the chain. */
-    if ((d->ht_used[table] < used_before || prune_pending) && d->pausecompact == 0)
-        compactBucketChain(d, idx, table);
+    /* Fill the holes deletes left in this chain. The dict size alone can't
+     * tell, as a callback may delete its entry and insert another one. Skip it
+     * if anything else (an outer scan or iterator of this dict, a held link)
+     * also pauses compaction: entries must not move under it. */
+    if (d->pausecompact == 1) compactBucketChain(d, idx, table);
 }
 
 /* Like dictScan, but additionally reallocates the memory used by the dict
@@ -1937,7 +1877,7 @@ unsigned long dictScanDefrag(dict *d,
     if (dictSize(d) == 0) return 0;
 
     /* This is needed in case the scan callback tries to do dictFind or alike. */
-    pauseRehashOnly(d);
+    dictPauseRehashing(d);
 
     if (!dictIsRehashing(d)) {
         htidx0 = 0;
@@ -1983,7 +1923,7 @@ unsigned long dictScanDefrag(dict *d,
         } while (v & (m0 ^ m1));
     }
 
-    resumeRehashOnly(d);
+    dictResumeRehashing(d);
 
     return v;
 }
@@ -2708,6 +2648,31 @@ static void scanMutationCb(void *privdata, const dictEntry *de, dictEntryLink pl
         assert(dictAdd(ctx->d, keyForId(DICT_BUCKET_SLOTS + 1 + i), NULL) == DICT_OK);
 }
 
+#define SCAN_DELETE_PREV_KEYS (3 * DICT_BUCKET_SLOTS)
+
+typedef struct scanDeletePrevCtx {
+    dict *d;
+    int seen[SCAN_DELETE_PREV_KEYS];
+    int prev_id;
+} scanDeletePrevCtx;
+
+/* Deletes the entry emitted before this one, which is not the entry passed
+ * to the callback. Compacting right away would move an entry from the end of
+ * the chain into that already scanned slot. */
+static void scanDeletePrevCb(void *privdata, const dictEntry *de, dictEntryLink plink) {
+    scanDeletePrevCtx *ctx = privdata;
+    int id = keyId(dictGetKey(de));
+    UNUSED(plink);
+    assert(id >= 0 && id < SCAN_DELETE_PREV_KEYS);
+    ctx->seen[id]++;
+    if (ctx->prev_id >= 0) {
+        char *key = keyForId(ctx->prev_id);
+        assert(dictDelete(ctx->d, key) == DICT_OK);
+        zfree(key);
+    }
+    ctx->prev_id = id;
+}
+
 #define start_benchmark() start = timeInMilliseconds()
 #define end_benchmark(msg) do { \
     elapsed = timeInMilliseconds()-start; \
@@ -3287,6 +3252,23 @@ int dictTest(int argc, char **argv, int flags) {
                 }
             }
         }
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
+    }
+
+    TEST("Scan emits every entry when callbacks delete already emitted entries") {
+        test_buckets = 0;
+        dict *dc = dictCreate(&chainDictType);
+        dictSetResizeEnabled(DICT_RESIZE_FORBID);
+        for (int i = 0; i < SCAN_DELETE_PREV_KEYS; i++)
+            assert(dictAdd(dc, keyForId(i), NULL) == DICT_OK);
+        assert(dictChildBuckets(dc) > 1);
+        scanDeletePrevCtx ctx = {.d = dc, .prev_id = -1};
+        assert(dictScan(dc, 0, scanDeletePrevCb, &ctx) == 0);
+        for (int i = 0; i < SCAN_DELETE_PREV_KEYS; i++) assert(ctx.seen[i] == 1);
+        assert(dictSize(dc) == 1 && dictChildBuckets(dc) == 0);
+        dictVerify(dc);
+        dictRelease(dc);
+        assert(test_buckets == 0);
         dictSetResizeEnabled(DICT_RESIZE_ENABLE);
     }
 
