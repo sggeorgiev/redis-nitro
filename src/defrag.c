@@ -364,7 +364,7 @@ luaScript *activeDefragLuaScript(luaScript *script) {
  * and should NOT be accessed. */
 dict *dictDefragTables(dict *d) {
     dict *ret = NULL;
-    dictEntry **newtable;
+    void *newtable;
     /* handle the dict struct */
     if ((ret = activeDefragAlloc(d)))
         d = ret;

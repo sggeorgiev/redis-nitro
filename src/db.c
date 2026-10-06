@@ -633,6 +633,11 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
          * need to incr to retain old */
         incrRefCount(old);
 
+        /* The hooks below may run module code that looks up keys in this dict.
+         * Keep rehashing paused so `link` stays valid. */
+        dict *keys = kvstoreGetDict(db->keys, slot);
+        dictPauseRehashing(keys);
+
         /* Free related metadata. Ignore builtin metadata (currently only expire) */
         if (getModuleMetaBits(old->metabits)) {
             keyMetaOnUnlink(db, key, old);
@@ -648,6 +653,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         decrRefCount(old);
         /* Because of RM_StringDMA, old may be changed, so we need get old again */
         old = dictGetKV(*link);
+        dictResumeRehashing(keys);
     }
     if (server.memory_tracking_enabled)
         oldsize = kvobjAllocSize(old);
@@ -876,9 +882,9 @@ robj *dbRandomKey(redisDb *db) {
 /* Helper for sync and async delete. */
 int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
     dictEntryLink link;
-    int table;
+    dictTwoPhaseUnlinkState state;
     int slot = getKeySlot(key->ptr);
-    link = kvstoreDictTwoPhaseUnlinkFind(db->keys, slot, key->ptr, &table);
+    link = kvstoreDictTwoPhaseUnlinkFind(db->keys, slot, key->ptr, &state);
 
     if (link) {
         kvobj *kv = dictGetKV(*link);
@@ -922,7 +928,7 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
             /* Set the key to NULL in the main dictionary. */
             kvstoreDictSetAtLink(db->keys, slot, NULL, &link, 0);
         }
-        kvstoreDictTwoPhaseUnlinkFree(db->keys, slot, link, table);
+        kvstoreDictTwoPhaseUnlinkFree(db->keys, slot, link, &state);
 
         /* remove key from histogram */
         if(!(flags & DB_FLAG_NO_UPDATE_KEYSIZES))
@@ -2763,16 +2769,16 @@ void swapdbCommand(client *c) {
  *  Remove the object from db->expires and set to -1 attached TTL to KV
  */
 int removeExpire(redisDb *db, robj *key) {
-    int table;
+    dictTwoPhaseUnlinkState state;
     int slot = getKeySlot(key->ptr);
-    dictEntryLink link = kvstoreDictTwoPhaseUnlinkFind(db->expires, slot, key->ptr, &table);
+    dictEntryLink link = kvstoreDictTwoPhaseUnlinkFind(db->expires, slot, key->ptr, &state);
 
     if (link == NULL) return 0;
     dictEntry *de = *link;
     kvobj *kv = dictGetKV(de);
     kvobj *newkv = kvobjSetExpire(kv, -1);
     serverAssert(newkv == kv);
-    kvstoreDictTwoPhaseUnlinkFree(db->expires, slot, link, table);
+    kvstoreDictTwoPhaseUnlinkFree(db->expires, slot, link, &state);
     return 1;
 }
 

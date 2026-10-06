@@ -37,7 +37,7 @@ struct _kvstore {
     int allocated_dicts;                   /* The number of allocated dicts. */
     int non_empty_dicts;                   /* The number of non-empty dicts. */
     unsigned long long key_count;          /* Total number of keys in this kvstore. */
-    unsigned long long bucket_count;       /* Total number of buckets in this kvstore across dictionaries. */
+    unsigned long long bucket_count;       /* Total number of buckets (incl. child buckets) in this kvstore across dictionaries. */
     fenwickTree *dict_sizes;               /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
     size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
     void *metadata[];                      /* conditionally allocated based on "flags" */
@@ -307,7 +307,7 @@ size_t kvstoreMemUsage(kvstore *kvs) {
     size_t metaSize = kvs->dtype.dictMetadataBytes(NULL);
     unsigned long long keys_count = kvstoreSize(kvs);
     mem += keys_count * dictEntryMemUsage(kvs->dtype.no_value) +
-           kvstoreBuckets(kvs) * sizeof(dictEntry*) +
+           kvs->bucket_count * DICT_BUCKET_BYTES +
            kvs->allocated_dicts * (sizeof(dict) + metaSize);
 
     /* Values are dict* shared with kvs->dicts */
@@ -565,7 +565,7 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     /* Adjust source kvstore */
     kvs->allocated_dicts -= 1;
     cumulativeKeyCountAdd(kvs, didx, -((long long)dictSize(d)));
-    kvstoreDictBucketChanged(d, -((long long) dictBuckets(d)));
+    kvstoreDictBucketChanged(d, -((long long) (dictBuckets(d) + dictChildBuckets(d))));
     /* If rehashing, stop it. */
     if (dictIsRehashing(d))
         kvstoreDictRehashingCompleted(d);
@@ -579,7 +579,7 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     dst->dicts[didx]->type = &dst->dtype;
     dst->allocated_dicts += 1;
     cumulativeKeyCountAdd(dst, didx, dictSize(d));
-    kvstoreDictBucketChanged(d, dictBuckets(d));
+    kvstoreDictBucketChanged(d, dictBuckets(d) + dictChildBuckets(d));
     if (dictIsRehashing(dst->dicts[didx]))
         kvstoreDictRehashingStarted(dst->dicts[didx]);
 }
@@ -695,11 +695,11 @@ uint64_t kvstoreIncrementallyRehash(kvstore *kvs, uint64_t threshold_us) {
 }
 
 size_t kvstoreOverheadHashtableLut(kvstore *kvs) {
-    return kvs->bucket_count * sizeof(dictEntry *);
+    return kvs->bucket_count * DICT_BUCKET_BYTES;
 }
 
 size_t kvstoreOverheadHashtableRehashing(kvstore *kvs) {
-    return kvs->overhead_hashtable_rehashing * sizeof(dictEntry *);
+    return kvs->overhead_hashtable_rehashing * DICT_BUCKET_BYTES;
 }
 
 unsigned long kvstoreDictRehashingCount(kvstore *kvs) {
@@ -909,16 +909,16 @@ void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val) {
     dictSetVal(d, de, val);
 }
 
-dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, int *table_index) {
+dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, dictTwoPhaseUnlinkState *state) {
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
-    return dictTwoPhaseUnlinkFind(kvstoreGetDict(kvs, didx), key, table_index);
+    return dictTwoPhaseUnlinkFind(d, key, state);
 }
 
-void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, int table_index) {
+void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, const dictTwoPhaseUnlinkState *state) {
     dict *d = kvstoreGetDict(kvs, didx);
-    dictTwoPhaseUnlinkFree(d, link, table_index);
+    dictTwoPhaseUnlinkFree(d, link, state);
     cumulativeKeyCountAdd(kvs, didx, -1);
     freeDictIfNeeded(kvs, didx);
 }

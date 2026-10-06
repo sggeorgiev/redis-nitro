@@ -333,7 +333,12 @@ static hashTemplate *hashTemplateArrayGetTemplate(hashTemplateArray *hta);
  * Later, it is applied on main thread in cron, key refs are actually dropped. */
 static redisAtomic uintptr_t bio_pending_drops = 0;
 
-static uint64_t pendingDropHash(const void *key) { return (uint64_t)(uintptr_t)key; }
+/* The id is mixed, as the dict takes its per-slot tag from the top byte of
+ * the hash. */
+static uint64_t pendingDropHash(const void *key) {
+    uint64_t id = (uint64_t)(uintptr_t)key;
+    return dictGenHashFunction(&id, sizeof(id));
+}
 static dictType pendingDropDictType = { pendingDropHash, NULL, NULL, NULL, NULL, NULL, NULL };
 
 /* BIO thread: Increment deleted key count for the template id. */

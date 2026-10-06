@@ -451,9 +451,12 @@ uint64_t dictCStrCaseHash(const void *key) {
     return dictGenCaseHashFunction((unsigned char*)key, strlen((char*)key));
 }
 
-/* Dict hash function for client */
+/* Dict hash function for client. The id is mixed, as client ids are small
+ * sequential integers and the dict takes its per-slot tag from the top byte
+ * of the hash. */
 uint64_t dictClientHash(const void *key) {
-    return ((client *)key)->id;
+    uint64_t id = ((client *)key)->id;
+    return dictGenHashFunction(&id, sizeof(id));
 }
 
 /* Dict compare function for client */
@@ -7827,8 +7830,8 @@ void dismissClientMemory(client *c) {
 /* Dismiss the hash table bucket arrays of a dict. */
 void dismissDictBucketsMemory(dict *d) {
     if (!d) return;
-    dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0]) * sizeof(dictEntry*));
-    dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1]) * sizeof(dictEntry*));
+    dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0]) * DICT_BUCKET_BYTES);
+    dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1]) * DICT_BUCKET_BYTES);
 }
 
 /* Dismiss the hash table bucket arrays for all dicts in the given kvstore. */

@@ -129,7 +129,7 @@ void expireScanCallback(void *privdata, const dictEntry *de, dictEntryLink plink
 
 static inline int expirySamplingShouldSkipDict(dict *d, int didx) {
     long long numkeys = dictSize(d);
-    unsigned long buckets = dictBuckets(d);
+    unsigned long buckets = dictBuckets(d) * DICT_BUCKET_SLOTS;
     /* When there are less than 1% filled buckets, sampling the key
      * space is expensive, so stop here waiting for better times...
      * The dictionary will be resized asap. */
