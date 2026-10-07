@@ -94,7 +94,6 @@ static void _dictRehashStepIfNeeded(dict *d, uint64_t hash);
 static signed char _dictNextExp(unsigned long size);
 static int _dictInit(dict *d, dictType *type);
 static int dictDefaultCompare(dictCmpCache *cache, const void *key1, const void *key2);
-static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket);
 
 /* -------------------------- unused  --------------------------- */
 void dictSetSignedIntegerVal(dictEntry *de, int64_t val);
@@ -1013,40 +1012,9 @@ void dictRelease(dict *d)
     zfree(d);
 }
 
-/* Finds a given key. Like dictFindLink(), yet search bucket even if dict is empty. 
- * 
- * Returns dictEntryLink reference if found. Otherwise, return NULL.
- * 
- * bucket - return pointer to bucket that the key was mapped. unless dict is empty.
- */
-static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLink *bucket) {
-    int pos, table;
-    
-    if (bucket) {
-        *bucket = NULL;
-    } else {
-        /* If dict is empty and no need to find bucket, return NULL */
-        if (dictSize(d) == 0) return NULL; 
-    }
-
-    const uint64_t hash = dictGetHash(d, key);
-
-    /* Rehash the hash table if needed */
-    _dictRehashStepIfNeeded(d, hash);
-
-    if (bucket) {
-        int itable = dictIsRehashing(d) ? 1 : 0;
-        if (d->ht_table[itable])
-            *bucket = (dictEntryLink)&d->ht_table[itable][hash & DICTHT_SIZE_MASK(d->ht_size_exp[itable])].slots[0];
-    }
-
-    dictBucket *b = findBucketForKey(d, hash, key, &pos, &table, NULL);
-    return b ? (dictEntryLink)&b->slots[pos] : NULL;
-}
-
 dictEntry *dictFind(dict *d, const void *key)
 {
-    dictEntryLink link = dictFindLink(d, key, NULL);
+    dictEntryLink link = dictFindLink(d, key);
     return (link) ? *link : NULL;
 }
 
@@ -1094,38 +1062,42 @@ dictEntry *dictFindByHashAndPtr(dict *d, const void *oldptr, const uint64_t hash
  * insert can still invalidate it.
  * 
  * After calling link = dictFindLink(...), any necessary updates based on returned 
- * link or bucket must be performed immediately after by calling dictSetKeyAtLink() 
+ * link must be performed immediately after by calling dictSetKeyAtLink() 
  * without any intervening operations on given dict. Otherwise, `dictEntryLink` may 
  * become invalid. Example with kvobj of replacing key with new key:
  * 
- *      link = dictFindLink(d, key, &bucket);
+ *      link = dictFindLink(d, key);
  *      ... Do something, but don't modify the dict ...
  *      // assert(link != NULL);
  *      dictSetKeyAtLink(d, kv, &link, 0);
  *      
- * To add new value (If no space for the new key, dict will be expanded by
- * dictSetKeyAtLink() and bucket will be looked up again.):
+ * To add new value (the insert position is computed by dictSetKeyAtLink(),
+ * which also expands the dict if needed):
  *   
- *      link = dictFindLink(d, key, &bucket);
+ *      link = dictFindLink(d, key);
  *      ... Do something, but don't modify the dict ...
  *      // assert(link == NULL);
- *      dictSetKeyAtLink(d, kv, &bucket, 1);
- *  
- *  bucket - return link to bucket that the key was mapped. unless dict is empty.
+ *      dictSetKeyAtLink(d, kv, &link, 1);
  */
-dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket) {
-    if (bucket) *bucket = NULL;
+dictEntryLink dictFindLink(dict *d, const void *key) {
+    int pos, table;
+
     if (unlikely(dictSize(d) == 0))
         return NULL;
-    
-    return dictFindLinkInternal(d, key, bucket);
+
+    const uint64_t hash = dictGetHash(d, key);
+
+    /* Rehash the hash table if needed */
+    _dictRehashStepIfNeeded(d, hash);
+
+    dictBucket *b = findBucketForKey(d, hash, key, &pos, &table, NULL);
+    return b ? (dictEntryLink)&b->slots[pos] : NULL;
 }
 
 /* Set the key with link 
  *
- * link:    - When `newItem` is set, `link` is ignored (it may be NULL or the
- *            bucket token from dictFindLink()). The insert position is always
- *            computed again on the current table.
+ * link:    - When `newItem` is set, the input value of `link` is ignored (it
+ *            may be NULL). The insert position is computed on the current table.
  *          - When `newItem` is not set, `link` points to the link of the key.
  *          - If *link is NULL, dictFindLink() will be called to locate the key.
  *          - On return, get updated, by need, to the inserted key. 
@@ -1153,7 +1125,7 @@ void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int 
     /* Setting key of existing dictEntry (newItem == 0)*/
     
     if (*link == NULL) {
-        *link = dictFindLink(d, key, NULL);
+        *link = dictFindLink(d, key);
         assert(*link != NULL);
     }
     
@@ -3494,7 +3466,7 @@ int dictTest(int argc, char **argv, int flags) {
         dict *d = dictCreate(&dt);
         
         /* find in empty dict */
-        dictEntryLink link = dictFindLink(d, "key", NULL);
+        dictEntryLink link = dictFindLink(d, "key");
         assert(link == NULL);
 
         /* Add keys to dict and test */
@@ -3504,7 +3476,7 @@ int dictTest(int argc, char **argv, int flags) {
             retval = dictAdd(d, key, (void*)j);
             assert(retval == DICT_OK);
             /* find existing keys with dictFindLink() */
-            dictEntryLink link = dictFindLink(d, key, NULL);
+            dictEntryLink link = dictFindLink(d, key);
             assert(link != NULL);
             assert(*link != NULL);
             assert(dictGetKey(*link) != NULL);
@@ -3515,19 +3487,8 @@ int dictTest(int argc, char **argv, int flags) {
 
             /* Test finding a non-existing key */
             char *nonExistingKey = stringFromLongLong(j + 10);
-            link = dictFindLink(d, nonExistingKey, NULL);
+            link = dictFindLink(d, nonExistingKey);
             assert(link == NULL);
-
-            /* Test with bucket parameter */
-            dictEntryLink bucket = NULL;
-            link = dictFindLink(d, key, &bucket);
-            assert(link != NULL);
-            assert(bucket != NULL);
-
-            /* Test bucket parameter with non-existing key */
-            link = dictFindLink(d, nonExistingKey, &bucket);
-            assert(link == NULL);
-            assert(bucket != NULL); /* Bucket should still be set even for non-existing keys */
 
             /* Clean up */
             zfree(nonExistingKey);
@@ -3541,14 +3502,14 @@ int dictTest(int argc, char **argv, int flags) {
         dict *dl = dictCreate(&verifyDictType);
         for (int i = 0; i < 2000; i++) {
             char *key = stringFromLongLong(i);
-            dictEntryLink bucket = NULL;
-            dictEntryLink link = dictFindLink(dl, key, &bucket);
+            dictEntryLink link = dictFindLink(dl, key);
             assert(link == NULL);
-            dictSetKeyAtLink(dl, key, &bucket, 1);
-            /* bucket now points at the inserted entry. */
-            assert(bucket != NULL && dictGetKey(*bucket) == key);
-            link = dictFindLink(dl, key, NULL);
-            assert(link == bucket || dictGetKey(*link) == key);
+            dictSetKeyAtLink(dl, key, &link, 1);
+            /* link now points at the inserted entry. */
+            assert(link != NULL && dictGetKey(*link) == key);
+            dictEntryLink found = dictFindLink(dl, key);
+            assert(found == link || dictGetKey(*found) == key);
+            link = found;
             if (i % 5 == 0) {
                 /* Replace the key object with an equal one. */
                 char *key2 = stringFromLongLong(i);

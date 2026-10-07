@@ -277,7 +277,7 @@ void *activeDefragHfieldAndUpdateRef(void *ptr, void *privdata) {
 
     /* Before the key is released, obtain the link to
      * ensure we can safely access and update the key. */
-    link = dictFindLink(d, ptr, NULL);
+    link = dictFindLink(d, ptr);
     serverAssert(link);
 
     Entry *newEntry = activeDefragEntry(ptr);
@@ -1153,7 +1153,7 @@ void defragKey(defragKeysCtx *ctx, dictEntry *de, dictEntryLink link) {
      * the pointer it holds, since it won't be able to do the string
      * compare. Search it before, if needed. */ 
      if (expire != -1) {
-         exlink = kvstoreDictFindLink(db->expires, slot, kvobjGetKey(ob), NULL);
+         exlink = kvstoreDictFindLink(db->expires, slot, kvobjGetKey(ob));
          serverAssert(exlink != NULL);
      }
 
@@ -1633,13 +1633,13 @@ void *activeDefragSubexpiresOB(void *ptr, void *privdata) {
      * the pointer it holds, since it won't be able to do the string
      * compare. Search it before, if needed. */
     if (expire != -1) {
-        exlink = kvstoreDictFindLink(db->expires, slot, keystr, NULL);
+        exlink = kvstoreDictFindLink(db->expires, slot, keystr);
         serverAssert(exlink != NULL);
     }
 
     if ((newkv = activeDefragKvobj(kv, 1))) {
         /* Update its reference in the DB keys. */
-        link = kvstoreDictFindLink(db->keys, slot, keystr, NULL);
+        link = kvstoreDictFindLink(db->keys, slot, keystr);
         serverAssert(link != NULL);
         kvstoreDictSetAtLink(db->keys, slot, newkv, &link, 0);
         if (expire != -1)

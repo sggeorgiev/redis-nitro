@@ -1675,11 +1675,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
         zset *zs = zobj->ptr;
         zskiplistNode *znode;
         dictEntry *de;
-        dictEntryLink bucket, link;
+        dictEntryLink link;
 
-        /* Use dictFindLink to find the element and get the bucket for potential insertion.
-         * This avoids a second lookup in dictAdd() if the element doesn't exist. */
-        link = dictFindLink(zs->dict, ele, &bucket);
+        /* Use dictFindLink to find the element. If it doesn't exist, insert with
+         * dictSetKeyAtLink(), which avoids the second lookup done by dictAdd(). */
+        link = dictFindLink(zs->dict, ele);
 
         if (link != NULL) {
             /* Element exists - get the dictEntry from the link */
@@ -1725,8 +1725,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             /* Element doesn't exist - create node with embedded sds and add to skiplist */
             znode = zslInsert(zs->zsl, score, ele);
 
-            /* Add node pointer to dict using the bucket we already found */
-            dictSetKeyAtLink(zs->dict, znode, &bucket, 1);
+            /* Add node pointer to dict without looking up the key again */
+            dictSetKeyAtLink(zs->dict, znode, NULL, 1);
 
             *out_flags |= ZADD_OUT_ADDED;
             if (newscore) *newscore = score;
@@ -3092,8 +3092,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (isnan(score)) score = 0;
 
                 /* Search for this element in the dict (which stores node pointers). */
-                dictEntryLink bucket, link;
-                link = dictFindLink(dstzset->dict, zuiSdsFromValue(&zval), &bucket);
+                dictEntryLink link;
+                link = dictFindLink(dstzset->dict, zuiSdsFromValue(&zval));
                 
                 if (link == NULL) {  /* if not exists */
                     /* New element: create node and insert into dict */
@@ -3106,8 +3106,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
 
                     /* Create node with embedded sds and score */
                     znode = zslCreateNode(dstzset->zsl, zslRandomLevel(), score, tmp);
-                    /* Add node pointer to dict using the bucket we already found */
-                    dictSetKeyAtLink(dstzset->dict, znode, &bucket, 1);
+                    /* Add node pointer to dict without looking up the key again */
+                    dictSetKeyAtLink(dstzset->dict, znode, NULL, 1);
                     sdsfree(tmp); /* zslCreateNode copied it, we can free our copy */
                 } else {
                     /* Existing element: aggregate score */

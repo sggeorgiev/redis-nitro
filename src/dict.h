@@ -334,7 +334,7 @@ dictStats* dictGetStatsHt(dict *d, int htidx, int full);
 void dictCombineStats(dictStats *from, dictStats *into);
 void dictFreeStats(dictStats *stats);
 
-dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket);
+dictEntryLink dictFindLink(dict *d, const void *key);
 void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int newItem);
 
 /* API relevant only when dict is used as a hash-map (no_value=0) */ 

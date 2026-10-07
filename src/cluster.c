@@ -306,24 +306,16 @@ void restoreCommand(client *c) {
         return;
     }
 
-    /* Resolve the key's existence and its insertion link. On the common new-key
-     * path dbAddInternal() below reuses the link instead of probing again. */
-    dictEntryLink link = NULL;
-    kvobj *oldval = lookupKeyWriteWithLink(c->db, key, &link);
+    kvobj *oldval = lookupKeyWrite(c->db, key);
     int oldtype = oldval ? oldval->type : -1;
 
     /* RESTORE REPLACE keeps the destination's NO-EVICT flag. */
     spec.no_evict = replace && oldval && blessIsNoEvict(oldval);
 
-    /* Call dbDelete() only when a key is actually present:
-     *   oldval != NULL -> key exists.
-     *   link  == NULL  -> an expired key might still be physically present and 
-     *                     must be deleted. */
+    /* Even if oldval is NULL, an expired key might still be physically present
+     * and must be deleted. dbDelete() is a no-op if the key is absent. */
     int deleted = 0;
-    if (replace && (oldval || !link)) {
-        deleted = dbDelete(c->db,key);
-        link = NULL; /* dbDelete invalidated the link */
-    }
+    if (replace) deleted = dbDelete(c->db,key);
 
     if (ttl && checkAlreadyExpired(ttl)) {
         if (deleted) {
@@ -342,7 +334,7 @@ void restoreCommand(client *c) {
     }
 
     /* Create the key and set the TTL if any */
-    kvobj *kv = dbAddInternal(c->db, key, &obj, &link, &spec);
+    kvobj *kv = dbAddInternal(c->db, key, &obj, NULL, &spec);
 
     /* Save type: kv may be reallocated by module callbacks during notifyKeyspaceEvent below. */
     int kvtype = kv->type;

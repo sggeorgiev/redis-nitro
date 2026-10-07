@@ -143,11 +143,11 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         /* Avoid duping the string if it is an sds string. */
         sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
         dict *ht = set->ptr;
-        dictEntryLink bucket, link = dictFindLink(ht, sdsval, &bucket);
+        dictEntryLink link = dictFindLink(ht, sdsval);
         if (link == NULL) {
             /* Key doesn't already exist in the set. Add it but dup the key. */
             if (sdsval == str) sdsval = sdsdup(sdsval);
-            dictSetKeyAtLink(ht, sdsval, &bucket, 1);
+            dictSetKeyAtLink(ht, sdsval, NULL, 1);
             *htGetMetadataSize(ht) += sdsAllocSize(sdsval);
             return 1;
         } else if (sdsval != str) {

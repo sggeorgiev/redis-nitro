@@ -146,7 +146,7 @@ void kvstoreFreeDictIfNeeded(kvstore *kvs, int didx);
 void *kvstoreGetDictMeta(kvstore *kvs, int didx, int createIfNeeded);
 void *kvstoreGetMetadata(kvstore *kvs);
 
-dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLink *bucket);
+dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key);
 void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link, int newItem);
 
 /* dict with distinct key & value (no_value=1) currently is used only by pubsub. */

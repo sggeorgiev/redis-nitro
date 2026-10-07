@@ -839,30 +839,26 @@ dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
  * This function is a wrapper around dictFindLink(), used to locate a key in a dict
  * from a kvstore. 
  *
- * The caller may provide a bucket pointer to receive the reference to the bucket 
- * where the key is stored or need to be added.
- *
  * Returns:
  *   A reference to the dictEntry if found, otherwise NULL.
  *   
  * Important: 
  * After calling kvstoreDictFindLink(), any necessary updates based on returned 
- * link or bucket must be made immediately after, commonly by kvstoreDictSetAtLink() 
+ * link must be made immediately after, commonly by kvstoreDictSetAtLink() 
  * without any operations in between that might modify the dict. Otherwise, 
- * the link or bucket may become invalid. Example usage:
+ * the link may become invalid. Example usage:
  *
- *      link = kvstoreDictFindLink(kvs, didx, key, &bucket);
+ *      link = kvstoreDictFindLink(kvs, didx, key);
  *      ... Do something, but don't modify kvs->dicts[didx] ...
  *      if (link)
  *          kvstoreDictSetAtLink(kvs, didx, kv, &link, 0);   // Update existing entry
  *      else
- *          kvstoreDictSetAtLink(kvs, didx, kv, &bucket, 1); // Insert new entry
+ *          kvstoreDictSetAtLink(kvs, didx, kv, &link, 1);   // Insert new entry
  */
-dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLink *bucket) {
-    if (bucket) *bucket = NULL;    
+dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key) {
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d) return NULL;
-    return dictFindLink(d, key, bucket);
+    return dictFindLink(d, key);
 }
 
 /* Set a key (or key-value) in the specified kvstore. 
@@ -871,9 +867,10 @@ dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLi
  * the `newItem` flag.
  *
  * Parameters:
- * link:      - When `newItem` is set, `link` points to the bucket of the key.
+ * link:      - When `newItem` is set, the input value of `link` is ignored (it
+ *              may be NULL). On return it points to the inserted key.
  *            - When `newItem` is not set, `link` points to the link of the key.
- *            - If link is NULL, dictFindLink() will be called to locate the link.
+ *              If *link is NULL, dictFindLink() will be called to locate it.
  *          
  * newItem: - If set, add a new key with a new dictEntry.
  *          - If not set, update the key of an existing dictEntry.

@@ -2355,7 +2355,7 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
     } else if (o->encoding == OBJ_ENCODING_HT) {
         dict *ht = o->ptr;
         /* check if field already exists */
-        dictEntryLink bucket, link = dictFindLink(ht, field, &bucket);
+        dictEntryLink link = dictFindLink(ht, field);
         size_t *alloc_size = htGetMetadataSize(ht);
 
         /* take ownership of value if requested */
@@ -2367,7 +2367,7 @@ int hashTypeSet(redisDb *db, kvobj *o, sds field, sds value, int flags) {
             size_t usable;
             Entry *newEntry = entryCreate(field, value, newEntryFlags, &usable);
 
-            dictSetKeyAtLink(ht, newEntry, &bucket, 1);
+            dictSetKeyAtLink(ht, newEntry, NULL, 1);
             *alloc_size += usable;
         } else {
             /* Existing field - update value in entry */
@@ -2460,7 +2460,7 @@ SetExRes hashTypeSetExpiryHT(HashTypeSetEx *exInfo, sds field, uint64_t expireAt
     dictEntryLink link = NULL;
     Entry *entryNew = NULL;
 
-    link = dictFindLink(ht, field, NULL);
+    link = dictFindLink(ht, field);
     if (link == NULL)
         return HSETEX_NO_FIELD;
 

@@ -822,13 +822,13 @@ kvobj *keyMetaSetMetadata(redisDb *db, kvobj *kv, KeyMetaClassId id, uint64_t me
     long long old_expire_val = kvobjGetExpire(kv);
     
     /* We'll need the key's link in the main dictionary to update pointer if reallocated. */
-    dictEntryLink keyLink = kvstoreDictFindLink(db->keys, slot, key, NULL);
+    dictEntryLink keyLink = kvstoreDictFindLink(db->keys, slot, key);
     serverAssert(keyLink != NULL);
 
     /* If the key has an actual TTL (expire != -1), also preserve the expires dict link. */
     dictEntryLink exLink = NULL;
     if (old_expire_val != -1) {
-        exLink = kvstoreDictFindLink(db->expires, slot, key, NULL);
+        exLink = kvstoreDictFindLink(db->expires, slot, key);
         serverAssert(exLink != NULL);
     }
 

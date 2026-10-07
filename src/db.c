@@ -266,9 +266,7 @@ void dbgRunAssertions(redisDb *db) {
  * found in the specified DB. This function implements the functionality of
  * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
  *
- * link - If key found, return the link of the key.
- *        If key not found, return the bucket link, where the key should be added.
- *        Or NULL if dict wasn't allocated yet.
+ * link - If key found, return the link of the key. Otherwise NULL.
  *
  * Side-effects of calling this function:
  *
@@ -391,9 +389,8 @@ kvobj *lookupKeyWrite(redisDb *db, robj *key) {
 /* Like lookupKeyWrite(), but accepts ref to optional `link`
  *
  *   found & valid    -> returns the kvobj; link = the key's entry.
- *   absent           -> returns NULL;      link = the bucket to add it to.
+ *   absent           -> returns NULL;      link = NULL.
  *   expired/trimmed  -> returns NULL;      link = NULL (key may still remain in the dict).
- *   empty dict       -> returns NULL;      link = NULL.
  */
 kvobj *lookupKeyWriteWithLink(redisDb *db, robj *key, dictEntryLink *link) {
     return lookupKey(db, key, LOOKUP_NONE | LOOKUP_WRITE, link);
@@ -425,8 +422,8 @@ kvobj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  * so the caller should not free the value using decrRefcount after calling this
  * function.
  *
- * link - Optional link to bucket where the key should be added.
- *          On return, get updated, by need, to the inserted key.
+ * link - Optional. Its input value is ignored. On return, it points to the
+ *          inserted key.
  *          
  * spec - Defines attributes and metadata of the new key, including NO-EVICT,
  *           optional expiration and module metadata (REQUIRED).
@@ -539,8 +536,7 @@ kvobj *dbAddRDBLoad(redisDb *db, sds key, robj **valref, const kvSpec *spec) {
     /* Add new kvobj to the db. */
     int slot = getKeySlot(key);
 
-    dictEntryLink link, bucket;
-    link = kvstoreDictFindLink(db->keys, slot, key, &bucket);
+    dictEntryLink link = kvstoreDictFindLink(db->keys, slot, key);
 
     /* If already exists, return NULL */
     if (link != NULL)
@@ -550,14 +546,14 @@ kvobj *dbAddRDBLoad(redisDb *db, sds key, robj **valref, const kvSpec *spec) {
     robj *val = *valref;
     kvobj *kv = kvobjSet(key, val, spec->metabits);
     initObjectLRUOrLFU(kv);
-    kvstoreDictSetAtLink(db->keys, slot, kv, &bucket, 1);
+    kvstoreDictSetAtLink(db->keys, slot, kv, &link, 1);
 
     /* Handle metadata (expiration and modules metadata) */
     if (spec->metabits) {
         if (spec->metabits & KEY_META_MASK_EXPIRE) {
             /* Expiry is always the first meta (from last) */
             long long expire = spec->meta[KEY_META_ID_MAX - 1];
-            kvobj *newkv = setExpireByLink(NULL, db, key, expire, bucket);
+            kvobj *newkv = setExpireByLink(NULL, db, key, expire, link);
             serverAssert(newkv == kv);
         }
 
@@ -601,7 +597,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
     int slot = getKeySlot(key->ptr);
     size_t oldsize = 0;
     if (!link) {
-        link = kvstoreDictFindLink(db->keys, slot, key->ptr, NULL);
+        link = kvstoreDictFindLink(db->keys, slot, key->ptr);
         serverAssertWithInfo(NULL, key, link != NULL); /* expected to exist */
     }
     kvobj *old = dictGetKV(*link);
@@ -690,7 +686,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
             if (keepTTL) {
                 kvobjSetExpire(kvNew, oldExpire); /* kvNew not reallocated here */
                 dictEntryLink exLink = kvstoreDictFindLink(db->expires, slot,
-                                                           key->ptr, NULL);
+                                                           key->ptr);
                 serverAssertWithInfo(NULL, key, exLink != NULL);
                 kvstoreDictSetAtLink(db->expires, slot, kvNew, &exLink, 0);
             } else {
@@ -775,8 +771,8 @@ void setKey(client *c, redisDb *db, robj *key, robj **valref, int flags) {
 /* Like setKey(), but accepts an optional link
  *
  * - If flags is set with SETKEY_ALREADY_EXIST, then `link` must be provided
- * - If flags is set with SETKEY_DOESNT_EXIST, then `link` is optional. If
- *   provided, it will point to the bucket where the key should be added.
+ * - If flags is set with SETKEY_DOESNT_EXIST, then `link` is optional and its
+ *   input value is ignored.
  * - If flag is not set (0) then add or update key, and `link` must be NULL
  * On return, link get updated, by need, to the inserted kvobj.
  */
@@ -2799,7 +2795,7 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
     int slot = getKeySlot(key);
     size_t oldsize = 0;
     if (!keyLink) {
-        keyLink = kvstoreDictFindLink(db->keys, slot, key, NULL);
+        keyLink = kvstoreDictFindLink(db->keys, slot, key);
         serverAssert(keyLink != NULL);
     }
     kvobj *kv = dictGetKV(*keyLink);
@@ -3137,22 +3133,14 @@ kvobj *dbFind(redisDb *db, sds key) {
 
 /* Find a KV in the main db. Return also link to it.
  *
- * plink - If found, set to the link of the key in the dict.
- *         If not found, set to the bucket where the key should be added.
- *         If set to NULL, then HT of dict not allocated yet.
+ * plink - If found, set to the link of the key in the dict. Otherwise NULL.
  */
 kvobj *dbFindByLink(redisDb *db, sds key, dictEntryLink *plink) {
     int slot = getKeySlot(key);
-    dictEntryLink link, bucket;
+    dictEntryLink link = kvstoreDictFindLink(db->keys, slot, key);
 
-    link = kvstoreDictFindLink(db->keys, slot, key, &bucket);
-    if (link == NULL) {
-        if (plink) *plink = bucket;
-        return NULL;
-    } else {
-        if (plink) *plink = link;
-        return dictGetKV(*link);
-    }
+    if (plink) *plink = link;
+    return link ? dictGetKV(*link) : NULL;
 }
 
 kvobj *dbFindExpires(redisDb *db, sds key) {
