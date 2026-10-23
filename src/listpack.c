@@ -1789,9 +1789,10 @@ static inline void lpAssertValidEntry(unsigned char* lp, size_t lpbytes, unsigne
 }
 
 /* Validate the integrity of the data structure.
- * when `deep` is 0, only the integrity of the header is validated.
+ * when `deep` is 0, only the integrity of the header and the first entry is
+ * validated.
  * when `deep` is 1, we scan all the entries one by one. */
-int lpValidateIntegrity(unsigned char *lp, size_t size, int deep, 
+int lpValidateIntegrity(unsigned char *lp, size_t size, int deep,
                         listpackValidateEntryCB entry_cb, void *cb_userdata) {
     /* Check that we can actually read the header. (and EOF) */
     if (size < LP_HDR_SIZE + 1)
@@ -1806,12 +1807,23 @@ int lpValidateIntegrity(unsigned char *lp, size_t size, int deep,
     if (lp[size-1] != LP_EOF)
         return 0;
 
-    if (!deep)
-        return 1;
+    uint32_t numele = lpGetNumElements(lp);
+
+    if (!deep) {
+        /* Validate the first entry too, so that a corrupt first entry is
+         * rejected here rather than asserting in lpFirst() later on. */
+        unsigned char *p = lpValidateFirst(lp);
+        /* An empty listpack holds nothing but the header and the EOF. */
+        if (p == NULL)
+            return size == LP_HDR_SIZE + 1 &&
+                   (numele == 0 || numele == LP_HDR_NUMELE_UNKNOWN);
+        if (numele == 0)
+            return 0;
+        return lpValidateNext(lp, &p, bytes);
+    }
 
     /* Validate the individual entries. */
     uint32_t count = 0;
-    uint32_t numele = lpGetNumElements(lp);
     unsigned char *p = lp + LP_HDR_SIZE;
     while(p && p[0] != LP_EOF) {
         unsigned char *prev = p;
@@ -3370,6 +3382,28 @@ int listpackTest(int argc, char *argv[], int flags) {
         long count = 0;
         assert(lpValidateIntegrity(lp, lpBytes(lp), 1, lpValidation, &count) == 1);
         lpFree(lp);
+    }
+
+    TEST("Test shallow lpValidateIntegrity validates the first entry") {
+        lp = createList();
+        assert(lpValidateIntegrity(lp, lpBytes(lp), 0, NULL, NULL) == 1);
+        lpFree(lp);
+
+        lp = lpNew(0);
+        assert(lpValidateIntegrity(lp, lpBytes(lp), 0, NULL, NULL) == 1);
+        lpFree(lp);
+
+        /* Valid header and EOF, first entry claims 0x7FFFFFFF bytes. */
+        unsigned char bad_entry[] = "\x0D\x00\x00\x00\x02\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF";
+        assert(lpValidateIntegrity(bad_entry, 13, 0, NULL, NULL) == 0);
+
+        /* Empty listpack whose header claims elements. */
+        unsigned char bad_count[] = "\x07\x00\x00\x00\x01\x00\xFF";
+        assert(lpValidateIntegrity(bad_count, 7, 0, NULL, NULL) == 0);
+
+        /* EOF right after the header, followed by garbage. */
+        unsigned char early_eof[] = "\x09\x00\x00\x00\x00\x00\xFF\x01\xFF";
+        assert(lpValidateIntegrity(early_eof, 9, 0, NULL, NULL) == 0);
     }
 
     TEST("Test number of elements exceeds LP_HDR_NUMELE_UNKNOWN") {

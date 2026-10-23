@@ -2591,7 +2591,8 @@ static int _lpEntryValidation(unsigned char *p, unsigned int head_count, void *u
 }
 
 /* Validate the integrity of the listpack structure.
- * when `deep` is 0, only the integrity of the header is validated.
+ * when `deep` is 0, only the integrity of the header and the first entry is
+ * validated.
  * when `deep` is 1, we scan all the entries one by one.
  * tuple_len indicates what is a logical entry tuple size.
  * Whether tuple is of size 1 (set), 2 (field-value) or 3 (field-value[-ttl]),

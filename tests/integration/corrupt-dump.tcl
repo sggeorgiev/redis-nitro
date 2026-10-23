@@ -294,6 +294,82 @@ test {corrupt payload: stream listpack entry with corrupt encoding crashes lpFir
     }
 }
 
+# The listpack in the tests below has a valid header (total_bytes=13,
+# num_elements=2) and EOF, but its first entry is a 32 bit string (0xF0)
+# claiming 0x7FFFFFFF bytes. It must be rejected even without deep sanitization.
+
+test {corrupt payload: hash listpack with corrupt first entry - unsanitized} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        catch {
+            r restore key 0 "\x10\x0D\x0D\x00\x00\x00\x02\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF\x0C\x00\xF2\x20\xE5\xFB\xC9\xE8\x9D\xF6"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+        r ping
+    }
+}
+
+test {corrupt payload: hash listpackex with corrupt first entry - unsanitized} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        catch {
+            r restore key 0 "\x19\x00\x00\x00\x00\x00\x00\x00\x00\x0D\x0D\x00\x00\x00\x03\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF\x0C\x00\x66\x96\x7E\x8B\x65\xC1\x01\x49"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+        r ping
+    }
+}
+
+test {corrupt payload: zset listpack with corrupt first entry - unsanitized} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        catch {
+            r restore key 0 "\x11\x0D\x0D\x00\x00\x00\x02\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF\x0C\x00\xA9\xEA\x9C\x67\xC7\xC8\x45\x67"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+        r ping
+    }
+}
+
+test {corrupt payload: set listpack with corrupt first entry - unsanitized} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        catch {
+            r restore key 0 "\x14\x0D\x0D\x00\x00\x00\x02\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF\x0C\x00\x48\x2F\x2D\x3B\x55\x24\x4F\xE7"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+        r ping
+    }
+}
+
+test {corrupt payload: quicklist listpack with corrupt first entry - unsanitized} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        catch {
+            r restore key 0 "\x12\x01\x02\x0D\x0D\x00\x00\x00\x02\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF\x0C\x00\x43\xF7\x90\x75\xF2\x59\xCB\x8B"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+        r ping
+    }
+}
+
+test {corrupt payload: stream listpack with corrupt first entry - unsanitized} {
+    start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
+        r config set sanitize-dump-payload no
+        catch {
+            r restore key 0 "\x15\x01\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0D\x0D\x00\x00\x00\x02\x00\xF0\xFF\xFF\xFF\x7F\x05\xFF\x0C\x00\xB6\x84\xBE\x3A\x38\x0F\x0B\x2E"
+        } err
+        assert_match "*Bad data format*" $err
+        verify_log_message 0 "*integrity check failed*" 0
+        r ping
+    }
+}
+
 test {corrupt payload: stream entry with invalid lp_count causing infinite loop in reverse iteration} {
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r config set sanitize-dump-payload no
@@ -861,7 +937,10 @@ test {corrupt payload: fuzzer findings - gcc asan reports false leak on assert} 
     start_server [list overrides [list loglevel verbose use-exit-on-panic yes crash-memcheck-enabled no] ] {
         r debug set-skip-checksum-validation 1
         r config set sanitize-dump-payload no
-        catch { r restore _list 0 "\x12\x01\x02\x13\x13\x00\x00\x00\x10\x00\x00\x00\x03\x00\x00\xF3\xFE\x02\x5F\x31\x04\xF1\xFF\x0A\x00\x19\x8D\x3D\x74\x85\x94\x29\xBD" }
+        # The first listpack entry is valid, so the shallow validation passes,
+        # the second one has a bad backlen and asserts on the second LPOP.
+        catch { r restore _list 0 "\x12\x01\x02\x13\x13\x00\x00\x00\x10\x00\x00\x01\x03\x00\x00\xF3\xFE\x02\x5F\x31\x04\xF1\xFF\x0A\x00\x19\x8D\x3D\x74\x85\x94\x29\xBD" }
+        r LPOP _list
         catch { r LPOP _list } err
         assert_equal [count_log_message 0 "crashed by signal"] 0
         assert_equal [count_log_message 0 "ASSERTION FAILED"] 1

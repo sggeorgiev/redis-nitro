@@ -6080,11 +6080,13 @@ int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep) {
     unsigned char *p, *next;
 
     /* Since we don't want to run validation of all records twice, we'll
-     * run the listpack validation of just the header and do the rest here. */
+     * run the listpack validation of just the header and the first entry
+     * and do the rest here. */
     if (!lpValidateIntegrity(lp, size, 0, NULL, NULL))
         return 0;
 
-    /* In non-deep mode we just validated the listpack header (encoded size) */
+    /* In non-deep mode we just validated the listpack header (encoded size)
+     * and the first entry. */
     if (!deep) return 1;
 
     next = p = lpValidateFirst(lp);
