@@ -564,8 +564,10 @@ gcov:
 noopt:
 	$(MAKE) OPTIMIZATION="-O0"
 
+# Valgrind finds leaks by scanning memory for pointers, so dict slots must keep
+# plain pointers (see DICT_NO_SLOT_HASH_BITS in dict.c).
 valgrind:
-	$(MAKE) OPTIMIZATION="-O0" MALLOC="libc"
+	$(MAKE) OPTIMIZATION="-O0" MALLOC="libc" REDIS_CFLAGS="$(REDIS_CFLAGS) -DDICT_NO_SLOT_HASH_BITS"
 
 helgrind:
 	$(MAKE) OPTIMIZATION="-O0" MALLOC="libc" CFLAGS="-D__ATOMIC_VAR_FORCE_SYNC_MACROS" REDIS_CFLAGS="-I/usr/local/include" REDIS_LDFLAGS="-L/usr/local/lib"

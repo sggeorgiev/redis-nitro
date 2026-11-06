@@ -33,10 +33,19 @@
  * - Odd-address key (keys_are_odd=1): Direct pointer to a 
  *   key with odd address (e.g., all SDS strings), Left intact: 
  *   ENTRY_PTR_IS_ODD_KEY=XX1
- * - Even-address key  (keys_are_odd=0): Direct pointer to a key with 
- *   even address. Since 8-byte alignment yields bits = 000, same as dictEntry, 
- *   we tag it by setting bit 1 which results with: 
+ * - Even-address key  (keys_are_odd=0): Direct pointer to a key with
+ *   even address. Since 8-byte alignment yields bits = 000, same as dictEntry,
+ *   we tag it by setting bit 1 which results with:
  *   ENTRY_PTR_IS_EVEN_KEY=010.
+ *
+ * On x86-64 and AArch64 a slot also keeps bits of the hash of its entry in the
+ * top 16 bits of the pointer, so that rehashing can move most entries without
+ * reading their key (see "hash bits in the high bits of a slot" in dict.c).
+ * The dictEntry pointers returned by the API carry these bits too: like the
+ * tags above, use them only through dictGetKey(), dictGetVal() and the other
+ * accessors, and don't compare them with key pointers. Building with
+ * -DDICT_NO_SLOT_HASH_BITS turns this off; it is off in AddressSanitizer and
+ * "make valgrind" builds, as leak checkers don't recognize such pointers.
  */
 
 #ifndef __DICT_H

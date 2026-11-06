@@ -203,10 +203,6 @@
 static redisAtomic dictResizeEnable dict_can_resize = DICT_RESIZE_ENABLE;
 static const unsigned int dict_force_resize_ratio = 4;
 
-#ifndef UNUSED
-#define UNUSED(V) ((void) V)
-#endif
-
 /* -------------------------- types ----------------------------------------- */
 struct dictEntry {
     void *key;
@@ -310,8 +306,25 @@ uint64_t dictIdHash(uint64_t id) {
 /* --------------------- dictEntry pointer bit tricks ----------------------  */
 
 /* Slots may keep hash bits in the high bits of the pointer: see "hash bits in
- * the high bits of a slot" below. */
-#if UINTPTR_MAX == UINT64_MAX && (defined(__x86_64__) || defined(__aarch64__))
+ * the high bits of a slot" below. Building with -DDICT_NO_SLOT_HASH_BITS turns
+ * this off. It is off in builds for leak checkers, which find the live
+ * allocations by scanning memory for pointers to them and would take a slot
+ * with hash bits for something else, reporting its entry as leaked:
+ * AddressSanitizer (its LeakSanitizer) here, Valgrind through "make valgrind".
+ * It is also off where pointers carry tags in their top bits themselves
+ * (HWAddressSanitizer). */
+#ifndef DICT_NO_SLOT_HASH_BITS
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__)
+#define DICT_NO_SLOT_HASH_BITS 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer)
+#define DICT_NO_SLOT_HASH_BITS 1
+#endif
+#endif
+#endif
+
+#if !defined(DICT_NO_SLOT_HASH_BITS) && UINTPTR_MAX == UINT64_MAX && \
+    (defined(__x86_64__) || defined(__aarch64__))
 #define DICT_SLOT_HASH_BITS 1
 #define SLOT_PTR_BITS 48
 #define SLOT_HB_BITS 14
@@ -320,7 +333,6 @@ uint64_t dictIdHash(uint64_t id) {
 #define DICT_SLOT_HASH_BITS 0
 #define SLOT_PTR_MASK (~(uintptr_t)0)
 #endif
-
 
 /* The 3 least significant bits in a pointer to a dictEntry determines what the
  * pointer actually points to. If the least bit is set, it's a key. Otherwise,
@@ -373,28 +385,37 @@ static inline int entryHasValue(const dictEntry *de) {
  *
  * On x86-64 and AArch64 user-space addresses fit in 48 bits, so the top 16
  * bits of a slot are free. A slot keeps there 14 bits of the hash of its
- * entry and, in the top 2 bits, which ones: bits 8*w .. 8*w+13 for w in 0..3.
- * w is chosen from the exponent of the table the entry is placed in (its
- * exponent rounded down to a multiple of 8, up to 24):
+ * entry and, in the top 2 bits, which ones: bits 8*w .. 8*w+13 for w in 0..3:
  *
  *     63 62 61                 48 47                          0
  *    +-----+---------------------+-----------------------------+
  *    |  w  | hash bits 8w..8w+13 |    entry pointer (tagged)   |
  *    +-----+---------------------+-----------------------------+
  *
+ * The bits are set whenever the hash of the entry is computed: when it is
+ * inserted, and when a rehash can't use the bits its slot keeps. w comes from
+ * the exponent of the table the entry goes into, rounded down to a multiple
+ * of 8 (up to 24). They are absolute hash bits, so they stay valid when the
+ * entry moves to another slot or to a smaller table, and they move with it.
+ *
  * Growing a table from 2^k to 2^k' buckets moves an entry from bucket idx to
- * bucket idx + (hash bits k..k'-1) << k. When the stored bits cover k..k'-1,
+ * bucket idx + (hash bits k..k'-1) << k. When the slot keeps bits k..k'-1,
  * rehashing moves the entry without reading its key or computing its hash,
- * which is most of the cost of a rehash (the key is a cache miss). Otherwise
- * the hash is computed and the slot gets a new window. The bits stay valid
- * when a table shrinks (they are absolute hash bits), and they are carried
- * along whenever an entry moves between slots.
+ * which saves a cache miss on the key and the hash function. Otherwise the
+ * hash is computed and the slot gets a new window.
+ *
+ * A slot whose top 16 bits are all zero keeps no hash bits, and rehashing
+ * computes the hash of its entry. That is a slot written without hash bits,
+ * or the rare one whose w and bits are all zero (1 in 2^14 of the entries
+ * hashed in tables below 2^8 buckets). A slot written without the bits is
+ * only slower to rehash, never misplaced.
  *
  * Everything in this file that dereferences a slot, or prefetches the entry
  * it points to, strips the high bits with slotEntry(). The entries handed out
- * (dictFind(), dictNext(), dictScan() callbacks, ...) are the slot values,
- * hash bits included: like the low-bit tags, they must only be used through
- * dictGetKey(), dictGetVal() and the other accessors, which strip them. */
+ * (dictFind(), dictAddRaw(), dictNext(), dictScan() callbacks, ...) are the
+ * slot values, hash bits included: like the low-bit tags, they must only be
+ * used through dictGetKey(), dictGetVal() and the other accessors, which strip
+ * them. */
 
 /* The entry (tagged pointer) held by a slot, without the hash bits. */
 static inline dictEntry *slotEntry(const dictEntry *slot) {
@@ -410,7 +431,8 @@ static inline dictEntry *slotWithHash(const dictEntry *entry, uint64_t hash, int
     uintptr_t bits = (hash >> (8 * w)) & ((1u << SLOT_HB_BITS) - 1);
     return (dictEntry *)(void *)(e | ((uintptr_t)w << 62) | (bits << SLOT_PTR_BITS));
 #else
-    UNUSED(hash); UNUSED(exp);
+    (void)hash;
+    (void)exp;
     return (dictEntry *)entry;
 #endif
 }
@@ -421,17 +443,30 @@ static inline dictEntry *slotReplaceEntry(const dictEntry *slot, const dictEntry
     return (dictEntry *)(void *)((uintptr_t)(void *)entry | ((uintptr_t)(void *)slot & ~SLOT_PTR_MASK));
 }
 
+#if DICT_SLOT_HASH_BITS
+/* Returns the lowest hash bit that `slot` keeps and sets `*bits` to the
+ * SLOT_HB_BITS hash bits kept from there, or returns -1 if the slot keeps
+ * none. */
+static inline int slotHashBits(const dictEntry *slot, uint64_t *bits) {
+    uintptr_t high = (uintptr_t)(void *)slot >> SLOT_PTR_BITS;
+    if (high == 0) return -1;
+    *bits = high & ((1u << SLOT_HB_BITS) - 1);
+    return 8 * (int)(high >> SLOT_HB_BITS);
+}
+#endif
+
 /* Returns hash bits from_exp..to_exp-1 of the entry in `slot` if the slot
- * holds them, or -1. */
+ * keeps them, or -1. */
 static inline long slotSplitBits(const dictEntry *slot, int from_exp, int to_exp) {
 #if DICT_SLOT_HASH_BITS
-    uintptr_t v = (uintptr_t)(void *)slot;
-    int lo = 8 * (int)(v >> 62);
-    if (from_exp < lo || to_exp > lo + SLOT_HB_BITS) return -1;
-    unsigned long bits = (v >> SLOT_PTR_BITS) & ((1u << SLOT_HB_BITS) - 1);
+    uint64_t bits = 0;
+    int lo = slotHashBits(slot, &bits);
+    if (lo < 0 || from_exp < lo || to_exp > lo + SLOT_HB_BITS) return -1;
     return (long)((bits >> (from_exp - lo)) & ((1ul << (to_exp - from_exp)) - 1));
 #else
-    UNUSED(slot); UNUSED(from_exp); UNUSED(to_exp);
+    (void)slot;
+    (void)from_exp;
+    (void)to_exp;
     return -1;
 #endif
 }
@@ -1089,9 +1124,10 @@ dictEntry *dictAddRaw(dict *d, void *key __stored_key, dictEntry **existing)
 }
 
 /* Adds a key that is not in the dict yet, at a free position of the bucket
- * chain that its hash maps to, and returns the new entry. For no_value dicts
- * the entry is the encoded key. If `link` is not NULL, it is set to the link
- * of the new entry. This is a low level function which assumes that
+ * chain that its hash maps to, and returns the new entry as its slot holds it
+ * (with the hash bits, like dictFind() returns it). For no_value dicts the
+ * entry is the encoded key. If `link` is not NULL, it is set to the link of
+ * the new entry. This is a low level function which assumes that
  * dictExpandIfNeeded() was called before. */
 static dictEntry *dictInsertKey(dict *d, uint64_t hash, void *key __stored_key, dictEntryLink *link) {
     dictEntry *entry;
@@ -1107,9 +1143,11 @@ static dictEntry *dictInsertKey(dict *d, uint64_t hash, void *key __stored_key, 
         assert(entryIsNormal(entry)); /* Check alignment of allocation */
         entry->key = key;
     }
-    /* If rehashing is ongoing, we insert in table 1, otherwise in table 0. */
-    /* The high bits of the entry pointer must be free for the hash bits. */
+    /* The high bits of the entry pointer must be free for the hash bits. If
+     * the allocator tags its pointers there, build with
+     * -DDICT_NO_SLOT_HASH_BITS. */
     assert(((uintptr_t)(void *)entry & ~SLOT_PTR_MASK) == 0);
+    /* If rehashing is ongoing, we insert in table 1, otherwise in table 0. */
     dictBucket *b = findBucketForInsert(d, hash, &pos, &htidx);
     b->slots[pos] = slotWithHash(entry, hash, d->ht_size_exp[htidx]);
     b->hashes[pos] = hashTag(hash);
@@ -1117,7 +1155,7 @@ static dictEntry *dictInsertKey(dict *d, uint64_t hash, void *key __stored_key, 
     d->ht_used[htidx]++;
     if (link) *link = &b->slots[pos];
 
-    return entry;
+    return b->slots[pos];
 }
 
 /* Add or Overwrite:
@@ -2872,11 +2910,11 @@ static void dictVerify(dict *d) {
                     assert(hashTag(hash) == b->hashes[pos]);
                     assert((hash & DICTHT_SIZE_MASK(d->ht_size_exp[t])) == idx);
 #if DICT_SLOT_HASH_BITS
-                    /* The hash bits kept in the slot are those of the hash. */
-                    uintptr_t v = (uintptr_t)(void *)e;
-                    int lo = 8 * (int)(v >> 62);
-                    uint64_t hb = (v >> SLOT_PTR_BITS) & ((1u << SLOT_HB_BITS) - 1);
-                    assert(hb == ((hash >> lo) & ((1u << SLOT_HB_BITS) - 1)));
+                    /* The hash bits kept in the slot, if any, are those of
+                     * the hash. */
+                    uint64_t bits = 0;
+                    int lo = slotHashBits(e, &bits);
+                    if (lo >= 0) assert(bits == ((hash >> lo) & ((1u << SLOT_HB_BITS) - 1)));
 #endif
                     counted[t]++;
                 }
@@ -2902,6 +2940,51 @@ static void dictVerify(dict *d) {
 static void drainRehash(dict *d) {
     dictSetResizeEnabled(DICT_RESIZE_ENABLE);
     while (dictIsRehashing(d)) dictRehashMicroseconds(d, 1000);
+}
+
+/* Calls of the hash function of the counting dict types. */
+static long counted_hashes = 0;
+
+static uint64_t countingHashCallback(const void *key) {
+    counted_hashes++;
+    return hashCallback(key);
+}
+
+static dictType countingDictType = {
+    .hashFunction = countingHashCallback,
+    .keyCompare = compareCallback,
+    .keyDestructor = freeCallback,
+    .no_value = 1,
+    .bucketChanged = testBucketChanged,
+};
+
+static dictType countingDictTypeVal = {
+    .hashFunction = countingHashCallback,
+    .keyCompare = compareCallback,
+    .keyDestructor = freeCallback,
+    .bucketChanged = testBucketChanged,
+};
+
+/* Number of entries of ht_table[0] whose slot keeps no hash bits: all of
+ * them when slots don't keep hash bits. */
+static unsigned long slotsWithoutHashBits(dict *d) {
+    unsigned long n = 0;
+    for (size_t idx = 0; idx < DICTHT_SIZE(d->ht_size_exp[0]); idx++) {
+        for (dictBucket *b = &d->ht_table[0][idx]; b; b = getChildBucket(b)) {
+            for (bucketBits p = b->presence; p; p &= p - 1) {
+                dictEntry *slot = b->slots[__builtin_ctz(p)];
+                if (((uintptr_t)(void *)slot & ~SLOT_PTR_MASK) == 0) n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* Grows the dict to exactly 2^exp buckets and finishes the rehash. */
+static void expandToExp(dict *d, int exp) {
+    assert(dictExpand(d, DICTHT_SIZE(exp) * BUCKET_DIVISOR / BUCKET_FACTOR) == DICT_OK);
+    assert(dictIsRehashing(d) && d->ht_size_exp[1] == exp);
+    drainRehash(d);
 }
 
 /* Reference model for randomized tests: keys are "k<id>" strings. */
@@ -3861,6 +3944,65 @@ int dictTest(int argc, char **argv, int flags) {
             zfree(k);
         }
         dictRelease(d);
+    }
+
+    TEST("Rehash hashes only the keys whose slots don't keep the bits it needs") {
+        /* The keys are hashed into tables below 2^8 buckets, so their slots
+         * keep hash bits 0..13. Growing to 2^14 buckets hashes no key, growing
+         * to 2^15 needs bit 14 and hashes every key, giving its slot bits
+         * 8..21. A shrink keeps the bits, so growing again hashes no key. The
+         * rare slot whose bits are all zero keeps none, so its key is hashed
+         * by the first grow. Where slots don't keep hash bits, every grow
+         * hashes every key. */
+        dictType *types[] = {&countingDictType, &countingDictTypeVal};
+        for (int t = 0; t < 2; t++) {
+            test_buckets = 0;
+            dict *d = dictCreate(types[t]);
+            const unsigned long n = 700;
+            for (unsigned long i = 0; i < n; i++)
+                assert(dictAdd(d, keyForId((int)i), NULL) == DICT_OK);
+            drainRehash(d);
+            assert(d->ht_size_exp[0] < 8);
+#if DICT_SLOT_HASH_BITS
+            assert(slotsWithoutHashBits(d) * 100 <= n);
+#endif
+            unsigned long nobits = slotsWithoutHashBits(d);
+            counted_hashes = 0;
+            expandToExp(d, 14);
+            assert((unsigned long)counted_hashes == nobits);
+            dictVerify(d);
+
+            counted_hashes = 0;
+            expandToExp(d, 15);
+#if DICT_SLOT_HASH_BITS
+            /* Not the keys hashed by the grow above: their slots got bits
+             * 8..21 then. */
+            assert((unsigned long)counted_hashes == n - nobits);
+#else
+            assert((unsigned long)counted_hashes == n);
+#endif
+            dictVerify(d);
+#if DICT_SLOT_HASH_BITS
+            assert(slotsWithoutHashBits(d) == 0);
+#endif
+            nobits = slotsWithoutHashBits(d);
+            counted_hashes = 0;
+            expandToExp(d, 16);
+            assert((unsigned long)counted_hashes == nobits);
+
+            /* Shrink to 2^10 buckets, which hashes no key, then grow. */
+            counted_hashes = 0;
+            assert(dictShrink(d, DICTHT_SIZE(10) * BUCKET_DIVISOR / BUCKET_FACTOR) == DICT_OK);
+            assert(dictIsRehashing(d) && d->ht_size_exp[1] == 10);
+            drainRehash(d);
+            assert(counted_hashes == 0);
+            nobits = slotsWithoutHashBits(d);
+            expandToExp(d, 11);
+            assert((unsigned long)counted_hashes == nobits);
+            dictVerify(d);
+            dictRelease(d);
+            assert(test_buckets == 0);
+        }
     }
 
     TEST("Rehash during safe iteration is paused and resumes afterwards") {
