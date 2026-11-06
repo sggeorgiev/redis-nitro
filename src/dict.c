@@ -203,6 +203,10 @@
 static redisAtomic dictResizeEnable dict_can_resize = DICT_RESIZE_ENABLE;
 static const unsigned int dict_force_resize_ratio = 4;
 
+#ifndef UNUSED
+#define UNUSED(V) ((void) V)
+#endif
+
 /* -------------------------- types ----------------------------------------- */
 struct dictEntry {
     void *key;
@@ -305,6 +309,19 @@ uint64_t dictIdHash(uint64_t id) {
 
 /* --------------------- dictEntry pointer bit tricks ----------------------  */
 
+/* Slots may keep hash bits in the high bits of the pointer: see "hash bits in
+ * the high bits of a slot" below. */
+#if UINTPTR_MAX == UINT64_MAX && (defined(__x86_64__) || defined(__aarch64__))
+#define DICT_SLOT_HASH_BITS 1
+#define SLOT_PTR_BITS 48
+#define SLOT_HB_BITS 14
+#define SLOT_PTR_MASK (((uintptr_t)1 << SLOT_PTR_BITS) - 1)
+#else
+#define DICT_SLOT_HASH_BITS 0
+#define SLOT_PTR_MASK (~(uintptr_t)0)
+#endif
+
+
 /* The 3 least significant bits in a pointer to a dictEntry determines what the
  * pointer actually points to. If the least bit is set, it's a key. Otherwise,
  * the bit pattern of the least 3 significant bits mark the kind of entry. */
@@ -332,7 +349,7 @@ static inline dictEntry *encodeMaskedPtr(const void *ptr, unsigned int bits) {
 }
 
 static inline void *decodeMaskedPtr(const dictEntry *de) {
-    return (void *)((uintptr_t)(void *)de & ~ENTRY_PTR_MASK);
+    return (void *)((uintptr_t)(void *)de & ~ENTRY_PTR_MASK & SLOT_PTR_MASK);
 }
 
 /* Encode a key pointer for storage in a no_value dict bucket.
@@ -350,6 +367,73 @@ static inline dictEntry *encodeEntryKey(dict *d, void *key) {
 /* Returns 1 if the entry has a value field and 0 otherwise. */
 static inline int entryHasValue(const dictEntry *de) {
     return entryIsNormal(de);
+}
+
+/* ------------------- hash bits in the high bits of a slot -------------------
+ *
+ * On x86-64 and AArch64 user-space addresses fit in 48 bits, so the top 16
+ * bits of a slot are free. A slot keeps there 14 bits of the hash of its
+ * entry and, in the top 2 bits, which ones: bits 8*w .. 8*w+13 for w in 0..3.
+ * w is chosen from the exponent of the table the entry is placed in (its
+ * exponent rounded down to a multiple of 8, up to 24):
+ *
+ *     63 62 61                 48 47                          0
+ *    +-----+---------------------+-----------------------------+
+ *    |  w  | hash bits 8w..8w+13 |    entry pointer (tagged)   |
+ *    +-----+---------------------+-----------------------------+
+ *
+ * Growing a table from 2^k to 2^k' buckets moves an entry from bucket idx to
+ * bucket idx + (hash bits k..k'-1) << k. When the stored bits cover k..k'-1,
+ * rehashing moves the entry without reading its key or computing its hash,
+ * which is most of the cost of a rehash (the key is a cache miss). Otherwise
+ * the hash is computed and the slot gets a new window. The bits stay valid
+ * when a table shrinks (they are absolute hash bits), and they are carried
+ * along whenever an entry moves between slots.
+ *
+ * Everything in this file that dereferences a slot, or prefetches the entry
+ * it points to, strips the high bits with slotEntry(). The entries handed out
+ * (dictFind(), dictNext(), dictScan() callbacks, ...) are the slot values,
+ * hash bits included: like the low-bit tags, they must only be used through
+ * dictGetKey(), dictGetVal() and the other accessors, which strip them. */
+
+/* The entry (tagged pointer) held by a slot, without the hash bits. */
+static inline dictEntry *slotEntry(const dictEntry *slot) {
+    return (dictEntry *)(void *)((uintptr_t)(void *)slot & SLOT_PTR_MASK);
+}
+
+/* The value of a slot holding `entry`, whose hash is `hash`, in a table of
+ * 2^exp buckets. */
+static inline dictEntry *slotWithHash(const dictEntry *entry, uint64_t hash, int exp) {
+#if DICT_SLOT_HASH_BITS
+    uintptr_t e = (uintptr_t)(void *)slotEntry(entry);
+    unsigned w = exp >= 24 ? 3 : (unsigned)exp >> 3;
+    uintptr_t bits = (hash >> (8 * w)) & ((1u << SLOT_HB_BITS) - 1);
+    return (dictEntry *)(void *)(e | ((uintptr_t)w << 62) | (bits << SLOT_PTR_BITS));
+#else
+    UNUSED(hash); UNUSED(exp);
+    return (dictEntry *)entry;
+#endif
+}
+
+/* Replaces the entry of a slot, keeping its hash bits (same key, same hash). */
+static inline dictEntry *slotReplaceEntry(const dictEntry *slot, const dictEntry *entry) {
+    assert(((uintptr_t)(void *)entry & ~SLOT_PTR_MASK) == 0);
+    return (dictEntry *)(void *)((uintptr_t)(void *)entry | ((uintptr_t)(void *)slot & ~SLOT_PTR_MASK));
+}
+
+/* Returns hash bits from_exp..to_exp-1 of the entry in `slot` if the slot
+ * holds them, or -1. */
+static inline long slotSplitBits(const dictEntry *slot, int from_exp, int to_exp) {
+#if DICT_SLOT_HASH_BITS
+    uintptr_t v = (uintptr_t)(void *)slot;
+    int lo = 8 * (int)(v >> 62);
+    if (from_exp < lo || to_exp > lo + SLOT_HB_BITS) return -1;
+    unsigned long bits = (v >> SLOT_PTR_BITS) & ((1u << SLOT_HB_BITS) - 1);
+    return (long)((bits >> (from_exp - lo)) & ((1ul << (to_exp - from_exp)) - 1));
+#else
+    UNUSED(slot); UNUSED(from_exp); UNUSED(to_exp);
+    return -1;
+#endif
 }
 
 /* ----------------------------- bucket helpers ----------------------------- */
@@ -764,6 +848,7 @@ int dictShrink(dict *d, unsigned long size) {
  * in the bucket chain at index `idx` from the old to the new hash HT. */
 static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
     dictBucket *root = &d->ht_table[0][idx];
+    int from_exp = d->ht_size_exp[0], to_exp = d->ht_size_exp[1];
     for (dictBucket *b = root; b; b = getChildBucket(b)) {
         bucketBits present = b->presence;
         while (present) {
@@ -773,10 +858,19 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
             uint64_t h;
             uint8_t tag;
             /* Get the hash bits that locate the bucket in the new hash table */
-            if (d->ht_size_exp[1] > d->ht_size_exp[0]) {
-                const void *key = dictStoredKey2Key(d, dictGetKey(de));
-                h = dictGetHash(d, key);
-                tag = hashTag(h);
+            if (to_exp > from_exp) {
+                long split = slotSplitBits(de, from_exp, to_exp);
+                if (split >= 0) {
+                    /* The slot holds the hash bits that pick the new bucket:
+                     * no need to read the key. */
+                    h = idx | ((uint64_t)split << from_exp);
+                    tag = b->hashes[pos];
+                } else {
+                    const void *key = dictStoredKey2Key(d, dictGetKey(de));
+                    h = dictGetHash(d, key);
+                    tag = hashTag(h);
+                    de = slotWithHash(de, h, to_exp);
+                }
             } else {
                 /* We're shrinking the table. The tables sizes are powers of
                  * two, so we simply mask the bucket index in the larger table
@@ -1014,8 +1108,10 @@ static dictEntry *dictInsertKey(dict *d, uint64_t hash, void *key __stored_key, 
         entry->key = key;
     }
     /* If rehashing is ongoing, we insert in table 1, otherwise in table 0. */
+    /* The high bits of the entry pointer must be free for the hash bits. */
+    assert(((uintptr_t)(void *)entry & ~SLOT_PTR_MASK) == 0);
     dictBucket *b = findBucketForInsert(d, hash, &pos, &htidx);
-    b->slots[pos] = entry;
+    b->slots[pos] = slotWithHash(entry, hash, d->ht_size_exp[htidx]);
     b->hashes[pos] = hashTag(hash);
     b->presence |= (1u << pos);
     d->ht_used[htidx]++;
@@ -1360,10 +1456,11 @@ void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int 
     
     dictEntry **de = *link;
     if (entryIsKey(*de)) {
-        /* `de` opt-out to be actually a key. Replace key but keep the lsb flags */
-        *de = encodeEntryKey(d, addedKey);
+        /* `de` opt-out to be actually a key. Replace key but keep the lsb flags
+         * and the hash bits (it is the same key) */
+        *de = slotReplaceEntry(*de, encodeEntryKey(d, addedKey));
     } else {
-        (*de)->key = addedKey;
+        slotEntry(*de)->key = addedKey;
     }
 }
 
@@ -1446,6 +1543,7 @@ void dictTwoPhaseUnlinkFree(dict *d, dictEntryLink plink, int table_index) {
 
 void dictSetKey(dict *d, dictEntry* de, void *key __stored_key) {
     assert(!d->type->no_value);
+    de = slotEntry(de);
     if (d->type->keyDup)
         de->key = d->type->keyDup(d, key);
     else
@@ -1454,70 +1552,82 @@ void dictSetKey(dict *d, dictEntry* de, void *key __stored_key) {
 
 void dictSetVal(dict *d, dictEntry *de, void *val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     de->v.val = d->type->valDup ? d->type->valDup(d, val) : val;
 }
 
 void dictSetSignedIntegerVal(dictEntry *de, int64_t val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     de->v.s64 = val;
 }
 
 void dictSetUnsignedIntegerVal(dictEntry *de, uint64_t val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     de->v.u64 = val;
 }
 
 void dictSetDoubleVal(dictEntry *de, double val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     de->v.d = val;
 }
 
 int64_t dictIncrSignedIntegerVal(dictEntry *de, int64_t val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.s64 += val;
 }
 
 uint64_t dictIncrUnsignedIntegerVal(dictEntry *de, uint64_t val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.u64 += val;
 }
 
 double dictIncrDoubleVal(dictEntry *de, double val) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.d += val;
 }
 
 void *dictGetKey(const dictEntry *de) {
     /* if entryIsKey() */
-    if ((uintptr_t)de & ENTRY_PTR_IS_ODD_KEY) return (void *) de;
+    if ((uintptr_t)de & ENTRY_PTR_IS_ODD_KEY) return (void *) slotEntry(de);
     if ((uintptr_t)de & ENTRY_PTR_IS_EVEN_KEY) return decodeMaskedPtr(de);    
     /* Regular entry */
-    return de->key;
+    return slotEntry(de)->key;
 }
 
 void *dictGetVal(const dictEntry *de) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.val;
 }
 
 int64_t dictGetSignedIntegerVal(const dictEntry *de) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.s64;
 }
 
 uint64_t dictGetUnsignedIntegerVal(const dictEntry *de) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.u64;
 }
 
 double dictGetDoubleVal(const dictEntry *de) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return de->v.d;
 }
 
 /* Returns a mutable reference to the value as a double within the entry. */
 double *dictGetDoubleValPtr(dictEntry *de) {
     assert(entryHasValue(de));
+    de = slotEntry(de);
     return &de->v.d;
 }
 
@@ -1629,7 +1739,7 @@ dictIterator *dictGetSafeIterator(dict *d) {
 static inline void prefetchBucketEntries(const dictBucket *b) {
     bucketBits present = b->presence;
     while (present) {
-        redis_prefetch_read(b->slots[__builtin_ctz(present)]);
+        redis_prefetch_read(slotEntry(b->slots[__builtin_ctz(present)]));
         present &= present - 1;
     }
     if (b->chained) redis_prefetch_read(getChildBucket(b));
@@ -1929,11 +2039,11 @@ static void dictDefragBucket(dict *d, dictBucket *b, dictDefragFunctions *defrag
         while (present) {
             int pos = __builtin_ctz(present);
             present &= present - 1;
-            dictEntry *de = b->slots[pos], *newde = NULL;
+            dictEntry *slot = b->slots[pos], *de = slotEntry(slot), *newde = NULL;
             void *newkey = defragkey ? defragkey(dictGetKey(de)) : NULL;
 
             if (d->type->no_value) {
-                if (newkey) b->slots[pos] = encodeEntryKey(d, newkey);
+                if (newkey) b->slots[pos] = slotReplaceEntry(slot, encodeEntryKey(d, newkey));
             } else {
                 void *newval = defragval ? defragval(dictGetVal(de)) : NULL;
                 assert(entryIsNormal(de));
@@ -1943,7 +2053,7 @@ static void dictDefragBucket(dict *d, dictBucket *b, dictDefragFunctions *defrag
                 if (newval) de->v.val = newval;
             }
             if (newde) {
-                b->slots[pos] = newde;
+                b->slots[pos] = slotReplaceEntry(slot, newde);
             }
         }
         dictBucket *child = getChildBucket(b), *newchild;
@@ -2546,7 +2656,7 @@ void *dictPrefetchNext(dictPrefetchState *st) {
                     st->candidates &= st->candidates - 1;
                     st->current_entry = b->slots[pos];
                     st->stage = PREFETCH_ENTRY_VALUE;
-                    return st->current_entry;
+                    return slotEntry(st->current_entry);
                 }
                 /* No (more) candidates here: the child bucket, else the next table. */
                 dictBucket *child = getChildBucket(b);
@@ -2761,6 +2871,13 @@ static void dictVerify(dict *d) {
                     uint64_t hash = dictGetHash(d, dictStoredKey2Key(d, dictGetKey(e)));
                     assert(hashTag(hash) == b->hashes[pos]);
                     assert((hash & DICTHT_SIZE_MASK(d->ht_size_exp[t])) == idx);
+#if DICT_SLOT_HASH_BITS
+                    /* The hash bits kept in the slot are those of the hash. */
+                    uintptr_t v = (uintptr_t)(void *)e;
+                    int lo = 8 * (int)(v >> 62);
+                    uint64_t hb = (v >> SLOT_PTR_BITS) & ((1u << SLOT_HB_BITS) - 1);
+                    assert(hb == ((hash >> lo) & ((1u << SLOT_HB_BITS) - 1)));
+#endif
                     counted[t]++;
                 }
             }
@@ -3113,7 +3230,7 @@ static int prefetchLookupReads(dict *d, uint64_t hash, const void *addr) {
             if (addr == b) return 1;
             bucketBits m = b->presence & findHashMatches(b->hashes, hashTag(hash));
             for (; m; m &= m - 1)
-                if (addr == b->slots[__builtin_ctz(m)]) return 1;
+                if (addr == slotEntry(b->slots[__builtin_ctz(m)])) return 1;
         }
     }
     return 0;
@@ -3697,6 +3814,53 @@ int dictTest(int argc, char **argv, int flags) {
 
     TEST("Randomized operations with very long chains") {
         dictRandomizedTest(&fewBucketsDictType, accurate ? 200 : 20, 1000);
+    }
+
+    TEST("Rehash places entries by the hash bits kept in their slots") {
+        /* Grow across the boundaries of the slot hash-bit windows (table
+         * exponents 8 and 16), expand several steps at once, shrink and grow
+         * again. dictVerify() checks every entry's bucket, tag and slot hash
+         * bits; then every key must still be found. */
+        test_buckets = 0;
+        dict *d = dictCreate(&verifyDictType);
+        int n = accurate ? 1000000 : 200000;
+        signed char last_exp = -1;
+        for (int i = 0; i < n; i++) {
+            assert(dictAdd(d, keyForId(i), NULL) == DICT_OK);
+            if (!dictIsRehashing(d) && d->ht_size_exp[0] != last_exp) {
+                last_exp = d->ht_size_exp[0];
+                dictVerify(d);
+            }
+        }
+        drainRehash(d);
+        dictVerify(d);
+        /* Expand several steps at once. */
+        assert(dictExpand(d, (unsigned long)n * 40) == DICT_OK);
+        drainRehash(d);
+        dictVerify(d);
+        /* Shrink (entries keep their bits), then grow again. */
+        for (int i = n / 64; i < n; i++) {
+            char *k = keyForId(i);
+            assert(dictDelete(d, k) == DICT_OK);
+            zfree(k);
+        }
+        drainRehash(d);
+        dictVerify(d);
+        for (int i = n / 64; i < n; i++) {
+            assert(dictAdd(d, keyForId(i), NULL) == DICT_OK);
+            if (!dictIsRehashing(d) && d->ht_size_exp[0] != last_exp) {
+                last_exp = d->ht_size_exp[0];
+                dictVerify(d);
+            }
+        }
+        drainRehash(d);
+        dictVerify(d);
+        for (int i = 0; i < n; i++) {
+            char *k = keyForId(i);
+            assert(dictFind(d, k) != NULL);
+            zfree(k);
+        }
+        dictRelease(d);
     }
 
     TEST("Rehash during safe iteration is paused and resumes afterwards") {
