@@ -240,6 +240,10 @@ struct dictBucket {
 };
 
 static_assert(sizeof(dictBucket) == DICT_BUCKET_BYTES, "dictBucket must be one cache line");
+#if DICT_BUCKET_SLOTS == 7 && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+/* joinTagMatches() reads the presence byte and the tags as one word. */
+static_assert(offsetof(dictBucket, hashes) == 1, "the tags must follow the presence byte");
+#endif
 
 typedef BUCKET_BITS_TYPE bucketBits;
 
@@ -1324,6 +1328,57 @@ dictEntryLink dictFindLinkWithHash(dict *d, const void *key, uint64_t hash, dict
     return dictFindLinkInternal(d, key, hash, bucket);
 }
 
+/* Looks up n keys whose hashes the caller already has (dictGetHash(d, key)),
+ * overlapping their cache misses: first the buckets of all the keys are
+ * prefetched, then the first entry whose tag matches in each bucket, and then
+ * the lookups are done with dictFindLinkWithHash(), mostly in cache (and with
+ * its rehash step per key). found[i] is set to the entry of keys[i], or NULL.
+ * In a no_value dict the entry is the key itself, so all the misses of a
+ * lookup overlap. Otherwise the entry points to the key, and the miss on the
+ * key is still taken in the lookup. The lookups go through
+ * dictFindLinkWithHash() rather than the static helpers it uses, so that the
+ * code of the other callers of those helpers is compiled as before. */
+void dictFindBatchWithHash(dict *d, const void **keys, const uint64_t *hashes, int n,
+                           dictEntry **found)
+{
+    dictBucket *buckets[DICT_FIND_BATCH_MAX];
+    assert(n <= DICT_FIND_BATCH_MAX);
+    if (dictSize(d) == 0) {
+        for (int i = 0; i < n; i++) found[i] = NULL;
+        return;
+    }
+    const int rehashing = dictIsRehashing(d);
+    for (int i = 0; i < n; i++) {
+        /* The bucket that holds the key now, as in findBucketForKey(). */
+        size_t idx = hashes[i] & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
+        int t = 0;
+        if (rehashing) {
+            size_t idx1 = hashes[i] & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
+            if ((long)idx < d->rehashidx) {
+                t = 1;
+                idx = idx1;
+            } else {
+                /* The rehash step of the lookup moves the bucket of the key to
+                 * the new table, and the lookup then reads it there. */
+                redis_prefetch_read(&d->ht_table[1][idx1]);
+            }
+        }
+        buckets[i] = &d->ht_table[t][idx];
+        redis_prefetch_read(buckets[i]);
+    }
+    for (int i = 0; i < n; i++) {
+        dictBucket *b = buckets[i];
+        bucketBits m = b->presence & findHashMatches(b->hashes, hashTag(hashes[i]));
+        /* The entry, not dictGetKey() of it: that would load it. */
+        if (m) redis_prefetch_read(b->slots[__builtin_ctz(m)]);
+        else if (b->chained) redis_prefetch_read(getChildBucket(b));
+    }
+    for (int i = 0; i < n; i++) {
+        dictEntryLink link = dictFindLinkWithHash(d, keys[i], hashes[i], NULL);
+        found[i] = link ? *link : NULL;
+    }
+}
+
 /* Set the key with link
  *
  * link:    - When `newItem` is set, `link` points to the bucket of the key, or
@@ -2189,6 +2244,282 @@ unsigned long dictScanDefrag(dict *d,
     return v;
 }
 
+/* ------------------------------- Join ------------------------------------- */
+
+/* dictJoin() pairs the entries of two dicts that hash keys the same way by
+ * walking their tables bucket by bucket, instead of looking up every entry of
+ * one dict in the other.
+ *
+ * An entry with hash h is in bucket h & mask of a table, so an entry in bucket
+ * i of a table of 2^ea buckets can only be equal to an entry in bucket j of a
+ * table of 2^eb buckets if i and j agree on their low min(ea, eb) bits. With E
+ * the smallest exponent of all the tables of both dicts (a rehashing dict has
+ * two), the buckets whose index is x mod 2^E form group x, and an entry can
+ * only be equal to an entry of its own group. For each group, the tag of every
+ * entry of `a` is compared with the tags of the compatible buckets of `b`. Keys
+ * are compared only when the tags match, so most entries without a match are
+ * ruled out without touching any key:
+ *
+ *   a: 4 buckets, b: 8 buckets, E = 2, group x = 1:
+ *
+ *   a bucket 1:  [ka kb kc]        tags 3A 11 7F
+ *   b bucket 1:  [k1 k2]           tags 11 22      kb vs k1: compare the keys
+ *   b bucket 5:  [k3 k4 k5]        tags 7F 33 44   kc vs k3: compare the keys
+ *                                                  ka: no tag match, no match
+ *
+ * The tables are read in index order: the ones with 2^(e-E) buckets per group
+ * as that many interleaved sequential streams. Entries of `a` with candidates
+ * wait in a small ring while their keys are prefetched, so that the key
+ * compares of different entries overlap. */
+
+#define DICT_JOIN_MAX_SHIFT 6   /* At most 2^6 buckets of a table per group. */
+#define DICT_JOIN_RING      16  /* Entries of `a` whose keys are in flight. */
+#define DICT_JOIN_CANDS     4   /* Candidates of an entry kept in the ring. */
+#define DICT_JOIN_AHEAD     8   /* Groups ahead for the table prefetch. */
+
+typedef struct joinTable {
+    dictBucket *table;
+    long start;         /* Buckets before it were rehashed and are empty. */
+    signed char exp;
+    signed char shift;  /* exp - E: the table has 2^shift buckets per group. */
+} joinTable;
+
+typedef struct joinItem {
+    dictEntry *a;
+    dictEntry *match;   /* The entry of b equal to a, once known. */
+    int ncand;          /* Entries of b with a's tag, yet to be compared. */
+    dictEntry *cand[DICT_JOIN_CANDS];
+} joinItem;
+
+typedef struct joinGroupBucket {
+    dictBucket *root;
+    unsigned long idx;
+    signed char exp;
+} joinGroupBucket;
+
+typedef struct joinState {
+    dict *a, *b;
+    int flags;
+    dictJoinFunction *fn;
+    void *privdata;
+    keyCmpFunc cmp;
+    int stop;
+    unsigned head, used;
+    joinItem ring[DICT_JOIN_RING];
+} joinState;
+
+/* Returns 1 if dictJoin() can pair the entries of `a` and `b`: different
+ * no_value dicts that hash and compare keys the same way. */
+int dictJoinSupported(dict *a, dict *b) {
+    return a != b && a->type->no_value && b->type->no_value &&
+           a->type->hashFunction == b->type->hashFunction &&
+           a->type->keyCompare == b->type->keyCompare &&
+           a->type->keyFromStoredKey == b->type->keyFromStoredKey;
+}
+
+/* Returns the mask of the positions of bucket `b` whose tag is `tag`, like
+ * findHashMatches(), with one SWAR compare of the 8 bytes that hold the
+ * presence bits and the 7 tags, where the layout allows it. */
+static inline bucketBits joinTagMatches(const dictBucket *b, uint8_t tag) {
+#if DICT_BUCKET_SLOTS == 7 && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    const uint64_t lo7 = 0x7f7f7f7f7f7f7f7fULL;
+    uint64_t w;
+    memcpy(&w, b, sizeof(w));
+    w ^= 0x0101010101010101ULL * tag;
+    /* 0x80 in each byte of w that is zero, nothing anywhere else. */
+    uint64_t z = ~((((w & lo7) + lo7) | w) | lo7);
+    /* Drop byte 0 (the presence bits), then gather bit 7 of the bytes of the
+     * 7 tags into bits 0..6. */
+    return (bucketBits)((((z >> 8) >> 7) * 0x0102040810204080ULL) >> 56);
+#else
+    return findHashMatches(b->hashes, tag);
+#endif
+}
+
+/* Returns the candidate equal to the entry of a, or NULL. */
+static dictEntry *joinCompare(joinState *s, dictEntry *a, dictEntry **cand, int n) {
+    dictCmpCache cache = {0};
+    const void *ka = dictStoredKey2Key(s->a, dictGetKey(a));
+    for (int i = 0; i < n; i++) {
+        const void *kb = dictStoredKey2Key(s->b, dictGetKey(cand[i]));
+        if (ka == kb || s->cmp(&cache, ka, kb)) return cand[i];
+    }
+    return NULL;
+}
+
+/* Compares the candidates of an item if needed and emits it. */
+static void joinResolve(joinState *s, joinItem *it) {
+    if (it->match == NULL && it->ncand) it->match = joinCompare(s, it->a, it->cand, it->ncand);
+    if (it->match || (s->flags & DICT_JOIN_UNMATCHED))
+        s->stop = s->fn(s->privdata, it->a, it->match);
+}
+
+/* Queues an item, prefetching its keys. When the ring is full, the oldest
+ * item, whose keys are in cache by now, is emitted first. */
+static void joinPush(joinState *s, const joinItem *it) {
+    if (s->used == DICT_JOIN_RING) {
+        joinResolve(s, &s->ring[s->head]);
+        s->head = (s->head + 1) % DICT_JOIN_RING;
+        s->used--;
+        if (s->stop) return;
+    }
+    if (!(s->flags & DICT_JOIN_NO_PREFETCH)) {
+        redis_prefetch_read(dictGetKey(it->a));
+        for (int i = 0; i < it->ncand; i++) redis_prefetch_read(dictGetKey(it->cand[i]));
+    }
+    s->ring[(s->head + s->used) % DICT_JOIN_RING] = *it;
+    s->used++;
+}
+
+/* Collects in `it` the entries of b with the tag of a's entry, from the
+ * buckets of the group compatible with bucket `idx` of a table of 2^exp
+ * buckets. Stops at the first match when the candidates overflow. */
+static void joinCollect(joinState *s, joinItem *it, uint8_t tag, unsigned long idx, int exp,
+                        joinGroupBucket *gb, int ngb)
+{
+    for (int g = 0; g < ngb; g++) {
+        int lo = exp < gb[g].exp ? exp : gb[g].exp;
+        if ((idx ^ gb[g].idx) & ((1UL << lo) - 1)) continue;
+        for (dictBucket *bb = gb[g].root; bb; bb = getChildBucket(bb)) {
+            bucketBits m = bb->presence & joinTagMatches(bb, tag);
+            while (m) {
+                dictEntry *cand = bb->slots[__builtin_ctz(m)];
+                m &= m - 1;
+                if (it->ncand == DICT_JOIN_CANDS) {
+                    it->match = joinCompare(s, it->a, it->cand, it->ncand);
+                    it->ncand = 0;
+                    if (it->match) return;
+                }
+                it->cand[it->ncand++] = cand;
+            }
+        }
+    }
+}
+
+/* Prefetches the buckets of group x + 2*AHEAD and the child buckets of group
+ * x + AHEAD, whose top-level buckets are in cache by then. */
+static void joinPrefetchAhead(joinTable *t, int n, unsigned long x, unsigned long groups, int E) {
+    for (int i = 0; i < n; i++) {
+        for (unsigned long m = 0; m < (1UL << t[i].shift); m++) {
+            unsigned long far = x + 2 * DICT_JOIN_AHEAD, near = x + DICT_JOIN_AHEAD;
+            if (far < groups) redis_prefetch_read(&t[i].table[far | (m << E)]);
+            if (near < groups) {
+                dictBucket *b = &t[i].table[near | (m << E)];
+                if (b->chained) redis_prefetch_read(getChildBucket(b));
+            }
+        }
+    }
+}
+
+/* Returns the tables of d that may hold entries. */
+static int joinLiveTables(dict *d, joinTable *t) {
+    int n = 0;
+    for (int i = 0; i <= 1; i++) {
+        if (d->ht_table[i] == NULL || (i == 1 && !dictIsRehashing(d))) continue;
+        long start = (i == 0 && dictIsRehashing(d)) ? d->rehashidx : 0;
+        if (start >= (long)DICTHT_SIZE(d->ht_size_exp[i])) continue;
+        t[n].table = d->ht_table[i];
+        t[n].start = start;
+        t[n].exp = d->ht_size_exp[i];
+        n++;
+    }
+    return n;
+}
+
+/* Calls fn(privdata, ea, eb) for every entry ea of `a` that has an equal entry
+ * eb in `b` and, with DICT_JOIN_UNMATCHED, fn(privdata, ea, NULL) for every
+ * entry of `a` that has none, in no particular order. A non-zero return value
+ * of fn stops the join. Any rehashing state works, and holes and long chains
+ * too.
+ *
+ * Rehashing and compaction are paused on both dicts while it runs: fn may look
+ * up keys in them (or in other dicts) but must not modify them.
+ *
+ * With DICT_JOIN_PREFETCH_UNMATCHED the key of an unmatched entry is
+ * prefetched before it is emitted, for callers that read it.
+ * DICT_JOIN_NO_PREFETCH turns off all the software prefetches (for tests).
+ *
+ * Returns DICT_ERR, without calling fn, if the dicts can't be joined (see
+ * dictJoinSupported()), if one is empty, or if the size ratio of their tables
+ * is above 2^DICT_JOIN_MAX_SHIFT: the caller looks up the entries instead. */
+int dictJoin(dict *a, dict *b, int flags, dictJoinFunction *fn, void *privdata) {
+    if (!dictJoinSupported(a, b) || dictSize(a) == 0 || dictSize(b) == 0) return DICT_ERR;
+
+    joinTable ta[2], tb[2];
+    int na = joinLiveTables(a, ta), nb = joinLiveTables(b, tb);
+    if (na == 0 || nb == 0) return DICT_ERR;
+    int E = ta[0].exp;
+    for (int i = 0; i < na; i++) if (ta[i].exp < E) E = ta[i].exp;
+    for (int i = 0; i < nb; i++) if (tb[i].exp < E) E = tb[i].exp;
+    for (int i = 0; i < na; i++)
+        if ((ta[i].shift = ta[i].exp - E) > DICT_JOIN_MAX_SHIFT) return DICT_ERR;
+    for (int i = 0; i < nb; i++)
+        if ((tb[i].shift = tb[i].exp - E) > DICT_JOIN_MAX_SHIFT) return DICT_ERR;
+
+    joinState s = {.a = a, .b = b, .flags = flags, .fn = fn, .privdata = privdata,
+                   .cmp = dictGetCmpFunc(a), .stop = 0, .head = 0, .used = 0};
+    const int prefetch = !(flags & DICT_JOIN_NO_PREFETCH);
+    const int unmatched = flags & DICT_JOIN_UNMATCHED;
+    unsigned long long fpa = dictFingerprint(a), fpb = dictFingerprint(b);
+    dictPauseRehashing(a);
+    dictPauseRehashing(b);
+
+    joinGroupBucket gb[2 << DICT_JOIN_MAX_SHIFT];
+    unsigned long groups = 1UL << E;
+    for (unsigned long x = 0; x < groups && !s.stop; x++) {
+        if (prefetch) {
+            joinPrefetchAhead(ta, na, x, groups, E);
+            joinPrefetchAhead(tb, nb, x, groups, E);
+        }
+        /* The buckets of b in this group. */
+        int ngb = 0;
+        for (int u = 0; u < nb; u++) {
+            for (unsigned long m = 0; m < (1UL << tb[u].shift); m++) {
+                unsigned long idx = x | (m << E);
+                if ((long)idx < tb[u].start || bucketIsEmpty(&tb[u].table[idx])) continue;
+                gb[ngb].root = &tb[u].table[idx];
+                gb[ngb].idx = idx;
+                gb[ngb].exp = tb[u].exp;
+                ngb++;
+            }
+        }
+        if (ngb == 0 && !unmatched) continue;
+
+        /* Each entry of a in this group, against them. */
+        for (int t = 0; t < na && !s.stop; t++) {
+            for (unsigned long m = 0; m < (1UL << ta[t].shift) && !s.stop; m++) {
+                unsigned long idx = x | (m << E);
+                if ((long)idx < ta[t].start) continue;
+                for (dictBucket *ab = &ta[t].table[idx]; ab && !s.stop; ab = getChildBucket(ab)) {
+                    bucketBits present = ab->presence;
+                    while (present && !s.stop) {
+                        int pos = __builtin_ctz(present);
+                        present &= present - 1;
+                        joinItem it = {.a = ab->slots[pos], .match = NULL, .ncand = 0};
+                        joinCollect(&s, &it, ab->hashes[pos], idx, ta[t].exp, gb, ngb);
+                        if (it.match || it.ncand || (unmatched && (flags & DICT_JOIN_PREFETCH_UNMATCHED)))
+                            joinPush(&s, &it);
+                        else if (unmatched)
+                            s.stop = fn(privdata, it.a, NULL);
+                    }
+                }
+            }
+        }
+    }
+    /* Emit the items still in the ring. */
+    while (s.used && !s.stop) {
+        joinResolve(&s, &s.ring[s.head]);
+        s.head = (s.head + 1) % DICT_JOIN_RING;
+        s.used--;
+    }
+
+    dictResumeRehashing(a);
+    dictResumeRehashing(b);
+    /* fn must not modify the dicts. */
+    assert(fpa == dictFingerprint(a) && fpb == dictFingerprint(b));
+    return DICT_OK;
+}
+
 /* ------------------------- private functions ------------------------------ */
 
 /* Because we may need to allocate huge memory chunk at once when dict
@@ -2825,6 +3156,163 @@ static int modelAdd(modelCtx *m, dict *d, int id) {
     return 1;
 }
 
+/* ---- dictJoin() tests ---- */
+
+static dictType fewBucketsNoValueDictType = {
+    .hashFunction = fewBucketsHashCallback,
+    .keyCompare = compareCallback,
+    .keyDestructor = freeCallback,
+    .no_value = 1,
+    .bucketChanged = testBucketChanged,
+};
+
+typedef struct joinTestCtx {
+    uint8_t inA[MODEL_KEYS], inB[MODEL_KEYS], seen[MODEL_KEYS];
+    unsigned long matched, unmatched, stop_after;
+} joinTestCtx;
+
+static int joinTestCallback(void *privdata, dictEntry *a, dictEntry *b) {
+    joinTestCtx *t = privdata;
+    int id = keyId(dictGetKey(a));
+    assert(id >= 0 && id < MODEL_KEYS && t->inA[id]);
+    assert(t->seen[id]++ == 0);
+    if (b) {
+        assert(keyId(dictGetKey(b)) == id && t->inB[id]);
+        t->matched++;
+    } else {
+        assert(!t->inB[id]);
+        t->unmatched++;
+    }
+    return t->stop_after && t->matched + t->unmatched >= t->stop_after;
+}
+
+/* Fills d with the keys of the model (in random order), and leaves it in a
+ * random state: holes left by deletes while rehashing is paused, in the
+ * middle of an expand or of a shrink. */
+static void joinTestBuild(dict *d, uint8_t *in, int n) {
+    int ids[MODEL_KEYS], k = 0;
+    for (int i = 0; i < MODEL_KEYS; i++) if (in[i]) ids[k++] = i;
+    assert(k == n);
+    for (int i = k - 1; i > 0; i--) { int j = rand() % (i + 1), t = ids[i]; ids[i] = ids[j]; ids[j] = t; }
+    /* Extra keys, deleted at the end: they make holes and shrinks. */
+    int extra = (rand() % 3 == 0) ? n * (1 + rand() % 8) : 0;
+    for (int i = 0; i < k; i++) assert(dictAdd(d, keyForId(ids[i]), NULL) == DICT_OK);
+    for (int i = 0; i < extra; i++) assert(dictAdd(d, keyForId(MODEL_KEYS + i), NULL) == DICT_OK);
+    int mode = rand() % 4;
+    if (mode == 0) dictPauseRehashing(d); /* holes stay, maybe empty child buckets */
+    for (int i = 0; i < extra; i++) {
+        char *key = keyForId(MODEL_KEYS + i);
+        assert(dictDelete(d, key) == DICT_OK);
+        zfree(key);
+        /* Stop a shrink half way. */
+        if (mode == 1 && dictIsRehashing(d) && rand() % 4 == 0) break;
+    }
+    if (mode == 0) dictResumeRehashing(d);
+    if (mode == 1) {
+        /* The extra keys left go in the middle of a shrink, if any. */
+        for (int i = 0; i < extra; i++) {
+            char *key = keyForId(MODEL_KEYS + i);
+            dictDelete(d, key);
+            zfree(key);
+        }
+    } else if (mode == 2 && !dictIsRehashing(d) && dictSize(d)) {
+        /* In the middle of an expand. */
+        dictExpand(d, dictSize(d) * (2 << (rand() % 3)));
+        if (dictIsRehashing(d)) dictRehash(d, rand() % (1 + (int)DICTHT_SIZE(d->ht_size_exp[0])));
+    } else if (mode == 3) {
+        drainRehash(d);
+    }
+}
+
+/* The largest difference of the exponents of the tables that may hold entries
+ * of a or b: dictJoin() needs it to be at most DICT_JOIN_MAX_SHIFT. */
+static int joinTestShift(dict *a, dict *b) {
+    int lo = 64, hi = -1;
+    dict *ds[2] = {a, b};
+    for (int k = 0; k < 2; k++) {
+        dict *d = ds[k];
+        for (int t = 0; t <= 1; t++) {
+            if (!d->ht_table[t] || (t == 1 && !dictIsRehashing(d))) continue;
+            if (t == 0 && dictIsRehashing(d) && d->rehashidx >= (long)DICTHT_SIZE(d->ht_size_exp[0])) continue;
+            if (d->ht_size_exp[t] < lo) lo = d->ht_size_exp[t];
+            if (d->ht_size_exp[t] > hi) hi = d->ht_size_exp[t];
+        }
+    }
+    return hi - lo;
+}
+
+static void dictJoinRandomizedTest(dictType *jtype, int rounds, int maxkeys) {
+    /* Two dicts are alive at once: no bucket accounting (it is global). */
+    dictType jt = *jtype, *type = &jt;
+    jt.bucketChanged = NULL;
+    joinTestCtx *t = zmalloc(sizeof(*t));
+    for (int r = 0; r < rounds; r++) {
+        int pa = rand() % 101, pb = rand() % 101, maxid = 1 + rand() % maxkeys;
+        int na = 0, nb = 0, both = 0, onlya = 0;
+        memset(t, 0, sizeof(*t));
+        for (int i = 0; i < maxid; i++) {
+            t->inA[i] = rand() % 100 < pa;
+            t->inB[i] = rand() % 100 < pb;
+            na += t->inA[i];
+            nb += t->inB[i];
+            both += t->inA[i] && t->inB[i];
+            onlya += t->inA[i] && !t->inB[i];
+        }
+        dict *a = dictCreate(type), *b = dictCreate(type);
+        joinTestBuild(a, t->inA, na);
+        joinTestBuild(b, t->inB, nb);
+        unsigned long long fpa = dictFingerprint(a), fpb = dictFingerprint(b);
+        const int flagsets[] = {0, DICT_JOIN_UNMATCHED, DICT_JOIN_UNMATCHED | DICT_JOIN_PREFETCH_UNMATCHED,
+                                DICT_JOIN_NO_PREFETCH, DICT_JOIN_UNMATCHED | DICT_JOIN_NO_PREFETCH};
+        for (int f = 0; f < 5; f++) {
+            memset(t->seen, 0, sizeof(t->seen));
+            t->matched = t->unmatched = 0;
+            t->stop_after = (rand() % 4 == 0) ? 1 + rand() % (na + 1) : 0;
+            int flags = flagsets[f];
+            int ret = dictJoin(a, b, flags, joinTestCallback, t);
+            if (dictSize(a) && dictSize(b) && joinTestShift(a, b) <= DICT_JOIN_MAX_SHIFT) assert(ret == DICT_OK);
+            if (ret == DICT_ERR) {
+                /* Only an empty dict or too different sizes. */
+                assert(dictSize(a) == 0 || dictSize(b) == 0 || joinTestShift(a, b) > DICT_JOIN_MAX_SHIFT);
+                assert(t->matched == 0 && t->unmatched == 0);
+                continue;
+            }
+            unsigned long expect = both + ((flags & DICT_JOIN_UNMATCHED) ? onlya : 0);
+            if (t->stop_after && t->stop_after < expect) {
+                assert(t->matched + t->unmatched == t->stop_after);
+            } else {
+                assert(t->matched == (unsigned long)both);
+                assert(t->unmatched == ((flags & DICT_JOIN_UNMATCHED) ? (unsigned long)onlya : 0));
+            }
+        }
+        /* The join changes nothing. */
+        assert(fpa == dictFingerprint(a) && fpb == dictFingerprint(b));
+        assert(!dictIsRehashingPaused(a) && !dictIsRehashingPaused(b));
+        assert(dictJoin(a, a, 0, joinTestCallback, t) == DICT_ERR);
+        dictVerify(a);
+        dictVerify(b);
+
+        /* dictFindBatchWithHash() finds what dictFind() finds. */
+        const void *keys[DICT_FIND_BATCH_MAX];
+        uint64_t hashes[DICT_FIND_BATCH_MAX];
+        dictEntry *found[DICT_FIND_BATCH_MAX];
+        int n = 1 + rand() % DICT_FIND_BATCH_MAX;
+        for (int i = 0; i < n; i++) {
+            keys[i] = keyForId(rand() % (maxid + 10));
+            hashes[i] = dictGetHash(b, keys[i]);
+        }
+        dictFindBatchWithHash(b, keys, hashes, n, found);
+        for (int i = 0; i < n; i++) {
+            assert(found[i] == dictFind(b, keys[i]));
+            zfree((void *)keys[i]);
+        }
+        dictVerify(b);
+        dictRelease(a);
+        dictRelease(b);
+    }
+    zfree(t);
+}
+
 static int modelDel(modelCtx *m, dict *d, int id) {
     char *k = keyForId(id);
     int ret = dictDelete(d, k);
@@ -2857,6 +3345,22 @@ static void modelCheck(modelCtx *m, dict *d) {
         char *k = keyForId(i);
         assert((dictFind(d, k) != NULL) == m->present[i]);
         zfree(k);
+    }
+    /* dictFindBatchWithHash() finds what dictFind() finds, with values too. */
+    for (int i = rand() % 7; i < MODEL_KEYS;) {
+        const void *keys[DICT_FIND_BATCH_MAX];
+        uint64_t hashes[DICT_FIND_BATCH_MAX];
+        dictEntry *found[DICT_FIND_BATCH_MAX];
+        int n = 0;
+        for (; i < MODEL_KEYS && n < DICT_FIND_BATCH_MAX; i += 7, n++) {
+            keys[n] = keyForId(i);
+            hashes[n] = dictGetHash(d, keys[n]);
+        }
+        dictFindBatchWithHash(d, keys, hashes, n, found);
+        for (int k = 0; k < n; k++) {
+            assert(found[k] == dictFind(d, keys[k]));
+            zfree((void *)keys[k]);
+        }
     }
     dictVerify(d);
 }
@@ -3697,6 +4201,16 @@ int dictTest(int argc, char **argv, int flags) {
 
     TEST("Randomized operations with very long chains") {
         dictRandomizedTest(&fewBucketsDictType, accurate ? 200 : 20, 1000);
+    }
+
+    TEST("dictJoin() against a reference model, in every rehashing state") {
+        dictJoinRandomizedTest(&verifyDictType, accurate ? 2000 : 200, MODEL_KEYS);
+    }
+
+    TEST("dictJoin() with long chains and equal tags") {
+        dictJoinRandomizedTest(&fewBucketsNoValueDictType, accurate ? 200 : 30, MODEL_KEYS);
+        dictJoinRandomizedTest(&sameTagDictType, accurate ? 400 : 50, MODEL_KEYS);
+        dictJoinRandomizedTest(&chainDictType, accurate ? 50 : 10, 300);
     }
 
     TEST("Rehash during safe iteration is paused and resumes afterwards") {

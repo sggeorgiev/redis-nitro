@@ -3052,6 +3052,283 @@ int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
     return 0;
 }
 
+/* Members of the first set looked up together in the other sets, so that the
+ * cache misses of the lookups overlap (see dictFindBatchWithHash()). Only the
+ * sets whose table is large enough to miss the cache are looked up in batches,
+ * and the iterator of the first set prefetches only if it is large enough. */
+#define SETOP_BATCH DICT_FIND_BATCH_MAX /* dictFindBatchWithHash() takes at most this many */
+#define SETOP_BATCH_MIN_BUCKETS 65536
+#define SETOP_ITER_PREFETCH_MIN 65536
+
+/* The number of buckets from which a table is looked up in batches. DEBUG
+ * SETOP-BATCH-MIN-BUCKETS lowers it, so that the tests get to the batched
+ * paths with small sets. */
+static unsigned long setop_batch_min_buckets = SETOP_BATCH_MIN_BUCKETS;
+
+/* Sets setop_batch_min_buckets, or restores its default if n is 0. */
+void setopSetBatchMinBuckets(unsigned long n) {
+    setop_batch_min_buckets = n ? n : SETOP_BATCH_MIN_BUCKETS;
+}
+
+/* Returns 1 if the sets are all hashtables that hash members the same way. */
+static int setopAllHT(setopsrc *sets, unsigned long setnum) {
+    if (!sets[0].set || sets[0].set->encoding != OBJ_ENCODING_HT) return 0;
+    dict *d0 = sets[0].set->ptr;
+    for (unsigned long j = 1; j < setnum; j++) {
+        if (!sets[j].set) continue;
+        if (sets[j].set->encoding != OBJ_ENCODING_HT) return 0;
+        if (((dict *)sets[j].set->ptr)->type->hashFunction != d0->type->hashFunction) return 0;
+    }
+    return 1;
+}
+
+/* Returns 1 if the members of sets[0] should be looked up in batches in the
+ * other sets: all hashtables, and the first one looked up is large enough to
+ * miss the cache. */
+static int setopUseBatches(setopsrc *sets, unsigned long setnum) {
+    return setopAllHT(sets, setnum) && setnum > 1 && sets[1].set &&
+           dictBuckets((dict *)sets[1].set->ptr) >= setop_batch_min_buckets;
+}
+
+/* Makes the iterator of sets[0] prefetch its members, if it is large. */
+static void setopIterPrefetch(setTypeIterator *si, robj *set) {
+    if (set->encoding == OBJ_ENCODING_HT && setTypeSize(set) >= SETOP_ITER_PREFETCH_MIN)
+        dictIteratorEnablePrefetch(&si->di);
+}
+
+/* A batch of members of the first set. */
+typedef struct setopBatch {
+    int n;
+    sds member[SETOP_BATCH];
+    uint64_t expire[SETOP_BATCH];   /* nearest expiration of the member in the sets
+                                     * it was found in so far, the first one too */
+    uint64_t hash[SETOP_BATCH];
+    int in[SETOP_BATCH];            /* still a candidate for the result */
+} setopBatch;
+
+/* Fills the batch with the next members of sets[0] (an HT set). Returns 0 when
+ * the iterator has no member left. */
+static int setopBatchFill(setopBatch *bt, setTypeIterator *si, dict *d0) {
+    char *str;
+    size_t len;
+    int64_t llval;
+    bt->n = 0;
+    while (bt->n < SETOP_BATCH && setTypeNext(si, &str, &len, &llval) != -1) {
+        bt->member[bt->n] = str;
+        bt->expire[bt->n] = si->expire;
+        bt->hash[bt->n] = dictGetHash(d0, str);
+        bt->n++;
+    }
+    return bt->n;
+}
+
+/* Looks up the members of the batch that are still candidates (in[i] == 1)
+ * in an HT set, and sets found[i] to whether set holds member i (not
+ * logically expired). The expiration of a member found is merged into
+ * expire[i]. That changes nothing for SDIFF, which drops the members found. */
+static void setopBatchLookup(setopBatch *bt, robj *set, int *found) {
+    dict *d = set->ptr;
+    const void *keys[SETOP_BATCH];
+    uint64_t hashes[SETOP_BATCH];
+    int idx[SETOP_BATCH], m = 0;
+    dictEntry *des[SETOP_BATCH];
+    for (int i = 0; i < bt->n; i++) {
+        found[i] = 0;
+        if (!bt->in[i]) continue;
+        keys[m] = bt->member[i];
+        hashes[m] = bt->hash[i];
+        idx[m++] = i;
+    }
+    if (m == 0) return;
+    if (dictBuckets(d) >= setop_batch_min_buckets) {
+        dictFindBatchWithHash(d, keys, hashes, m, des);
+    } else {
+        for (int k = 0; k < m; k++) {
+            dictEntryLink link = dictFindLinkWithHash(d, keys[k], hashes[k], NULL);
+            des[k] = link ? *link : NULL;
+        }
+    }
+    const int hasExpire = setTypeHasExpireSupport(set);
+    for (int k = 0; k < m; k++) {
+        if (des[k] == NULL) continue;
+        if (hasExpire) {
+            uint64_t e = sEntryGetExpiry(dictGetKey(des[k]));
+            if (setTypeExpireTimeElapsed(e)) continue;
+            if (e < bt->expire[idx[k]]) bt->expire[idx[k]] = e;
+        }
+        found[idx[k]] = 1;
+    }
+}
+
+/* State of a SINTER / SINTERSTORE / SINTERCARD. */
+typedef struct sinterState {
+    client *c;
+    setopsrc *sets;
+    unsigned long setnum;
+    robj *dstkey;
+    robj *dstset;
+    int cardinality_only;
+    unsigned long limit;
+    unsigned long cardinality;
+    int only_integers;
+    setopBatch *bt;     /* members of the join waiting for the lookups in sets[2..] */
+} sinterState;
+
+/* Adds a member that all the sets hold to the result. `expire` is its nearest
+ * expiration in sets[0..from-1], the sets its lookups already read it from
+ * (from >= 1). Returns 1 if the LIMIT is reached. */
+static int sinterEmit(sinterState *x, char *str, size_t len, int64_t intobj, int encoding,
+                      uint64_t expire, unsigned long from)
+{
+    setopsrc *sets = x->sets;
+    /* The stored member gets the nearest expiration of all the sets. */
+    if (x->dstkey && !x->cardinality_only) {
+        for (unsigned long j = from; j < x->setnum; j++) {
+            if (sets[j].set == sets[0].set || !setTypeHasExpireSupport(sets[j].set)) continue;
+            uint64_t e = EB_EXPIRE_TIME_INVALID;
+            setTypeGetExpireAux(sets[j].set, str, len, intobj, encoding == OBJ_ENCODING_HT, &e);
+            if (e < expire) expire = e;
+        }
+    }
+    if (x->cardinality_only) {
+        x->cardinality++;
+        /* We stop the searching after reaching the limit. */
+        if (x->limit && x->cardinality >= x->limit) return 1;
+    } else if (!x->dstkey) {
+        if (str != NULL)
+            addReplyBulkCBuffer(x->c, str, len);
+        else
+            addReplyBulkLongLong(x->c, intobj);
+        x->cardinality++;
+    } else {
+        robj *dstset = x->dstset;
+        if (str && x->only_integers) {
+            /* It may be an integer although we got it as a string. */
+            if (encoding == OBJ_ENCODING_HT &&
+                string2ll(str, len, (long long *)&intobj))
+            {
+                if (dstset->encoding == OBJ_ENCODING_LISTPACK ||
+                    dstset->encoding == OBJ_ENCODING_INTSET)
+                {
+                    /* Adding it as an integer is more efficient. */
+                    str = NULL;
+                }
+            } else {
+                /* It's not an integer */
+                x->only_integers = 0;
+            }
+        }
+        setTypeAddMergeExpire(dstset, str, len, intobj, encoding == OBJ_ENCODING_HT, expire, 0);
+    }
+    return 0;
+}
+
+/* The join (dictJoin()) reads both tables in full, while the lookups touch
+ * only the buckets of the members of the set they iterate, `a`. So the join is
+ * used when the table of `b` is at most SETOP_JOIN_MAX_RATIO times the table of
+ * `a` (at 4 the join is still faster than the lookups, at 8 it is slower), and
+ * the table of `a` is not much sparser than usual. A smaller table of `b` is
+ * fine: then each member of `a` is compared with a single bucket of `b`. */
+#define SETOP_JOIN_MAX_RATIO 4
+
+/* Returns 1 if `a` (the set the lookups would iterate) and `b` should be
+ * joined rather than looked up. */
+static int setopUseJoin(robj *a, robj *b) {
+    if (a->encoding != OBJ_ENCODING_HT || b->encoding != OBJ_ENCODING_HT) return 0;
+    dict *da = a->ptr, *db = b->ptr;
+    if (!dictJoinSupported(da, db)) return 0;
+    unsigned long ba = dictBuckets(da), bb = dictBuckets(db);
+    return bb <= SETOP_JOIN_MAX_RATIO * ba && ba <= 2 * dictSize(da);
+}
+
+/* Looks up the members of the batch in sets[from..], and adds the ones they
+ * all hold to the result. The lookups merge the expirations of the members,
+ * so sinterEmit() looks up none. Returns 1 if the LIMIT is reached. */
+static int sinterBatchFlush(sinterState *x, setopBatch *bt, unsigned long from) {
+    int found[SETOP_BATCH], stop = 0;
+    for (int i = 0; i < bt->n; i++) bt->in[i] = 1;
+    for (unsigned long j = from; j < x->setnum; j++) {
+        if (x->sets[j].set == x->sets[0].set) continue;
+        setopBatchLookup(bt, x->sets[j].set, found);
+        for (int i = 0; i < bt->n; i++) bt->in[i] = found[i];
+    }
+    for (int i = 0; i < bt->n && !stop; i++) {
+        if (bt->in[i])
+            stop = sinterEmit(x, bt->member[i], sdslen(bt->member[i]), 0, OBJ_ENCODING_HT,
+                              bt->expire[i], x->setnum);
+    }
+    bt->n = 0;
+    return stop;
+}
+
+/* dictJoin() callback of SINTER: ea and eb are the same member of sets[0] and
+ * sets[1]. */
+static int sinterJoinCallback(void *privdata, dictEntry *ea, dictEntry *eb) {
+    sinterState *x = privdata;
+    sds member = dictGetKey(ea);
+    /* A logically expired member is not a member. The nearest expiration of
+     * the two is the one SINTERSTORE stores, unless another set has a nearer one. */
+    uint64_t expire = EB_EXPIRE_TIME_INVALID;
+    if (setTypeHasExpireSupport(x->sets[0].set)) {
+        expire = sEntryGetExpiry((SetEntry *)member);
+        if (setTypeExpireTimeElapsed(expire)) return 0;
+    }
+    if (setTypeHasExpireSupport(x->sets[1].set)) {
+        uint64_t e = sEntryGetExpiry(dictGetKey(eb));
+        if (setTypeExpireTimeElapsed(e)) return 0;
+        if (e < expire) expire = e;
+    }
+    if (x->setnum > 2) {
+        /* Look it up in the other sets with the next members, in a batch. */
+        setopBatch *bt = x->bt;
+        bt->member[bt->n] = member;
+        bt->expire[bt->n] = expire;
+        bt->hash[bt->n] = dictGetHash(x->sets[2].set->ptr, member);
+        if (++bt->n == SETOP_BATCH) return sinterBatchFlush(x, bt, 2);
+        return 0;
+    }
+    return sinterEmit(x, member, sdslen(member), 0, OBJ_ENCODING_HT, expire, 2);
+}
+
+/* The SINTER loop when all the sets are hashtables: the members of sets[0] are
+ * hashed once and looked up in batches in the other sets. */
+static void sinterBatched(sinterState *x) {
+    setopsrc *sets = x->sets;
+    setTypeIterator si;
+    setopBatch bt;
+    setTypeInitIterator(&si, sets[0].set, SET_ITER_SKIP_EXPIRED);
+    setopIterPrefetch(&si, sets[0].set);
+    while (setopBatchFill(&bt, &si, sets[0].set->ptr)) {
+        if (sinterBatchFlush(x, &bt, 1)) break; /* We reached the limit */
+    }
+    setTypeResetIterator(&si);
+}
+
+/* SINTER of hashtable sets: joins the two smallest sets (see dictJoin()), or
+ * looks up the members of the smallest one in batches. Returns 0 if neither
+ * applies, and the caller looks up the members one by one. Not inlined, so
+ * that the batches stay off the stack frame of the caller. */
+static __attribute__((noinline)) int sinterHashtables(sinterState *x) {
+    setopsrc *sets = x->sets;
+    unsigned long setnum = x->setnum;
+    setopBatch joinbt = {.n = 0};
+    int done = 1;
+    x->bt = &joinbt;
+    if (setnum >= 2 && setopAllHT(sets, setnum) && setopUseJoin(sets[0].set, sets[1].set) &&
+        dictJoin(sets[0].set->ptr, sets[1].set->ptr, 0, sinterJoinCallback, x) == DICT_OK)
+    {
+        /* The two smallest sets were joined, and their common members looked
+         * up in the other ones, but the last batch of them. */
+        if (joinbt.n && !(x->limit && x->cardinality >= x->limit)) sinterBatchFlush(x, &joinbt, 2);
+    } else if (setopUseBatches(sets, setnum)) {
+        sinterBatched(x);
+    } else {
+        done = 0;
+    }
+    x->bt = NULL;
+    return done;
+}
+
 /* SINTER / SINTERSTORE / SINTERCARD
  *
  * 'cardinality_only' work for SINTERCARD, only return the cardinality
@@ -3156,65 +3433,27 @@ void sinterGenericCommand(client *c, robj **setkeys,
     /* Iterate all the elements of the first (smallest) set, and test
      * the element against all the other sets, if at least one set does
      * not include the element it is discarded */
-    int only_integers = 1;
-    setTypeInitIterator(&si, sets[0].set, SET_ITER_SKIP_EXPIRED);
-    while((encoding = setTypeNext(&si, &str, &len, &intobj)) != -1) {
-        for (j = 1; j < setnum; j++) {
-            if (sets[j].set == sets[0].set) continue;
-            if (!setTypeIsMemberAux(sets[j].set, str, len, intobj,
-                                    encoding == OBJ_ENCODING_HT))
-                break;
-        }
-
-        /* Only take action when all sets contain the member */
-        if (j == setnum) {
-            /* The stored member gets the nearest expiration of all the sets. */
-            uint64_t expire = EB_EXPIRE_TIME_INVALID;
-            if (dstkey && !cardinality_only) {
-                for (j = 0; j < setnum; j++) {
-                    uint64_t e = si.expire;
-                    if (j > 0 && sets[j].set != sets[0].set) {
-                        if (!setTypeHasExpireSupport(sets[j].set)) continue;
-                        setTypeGetExpireAux(sets[j].set, str, len, intobj,
-                                            encoding == OBJ_ENCODING_HT, &e);
-                    } else if (j > 0) continue;
-                    if (e != EB_EXPIRE_TIME_INVALID && e < expire) expire = e;
-                }
-            }
-            if (cardinality_only) {
-                cardinality++;
-
-                /* We stop the searching after reaching the limit. */
-                if (limit && cardinality >= limit)
+    sinterState x = {.c = c, .sets = sets, .setnum = setnum, .dstkey = dstkey, .dstset = dstset,
+                     .cardinality_only = cardinality_only, .limit = limit, .cardinality = 0,
+                     .only_integers = 1};
+    if (!sinterHashtables(&x)) {
+        setTypeInitIterator(&si, sets[0].set, SET_ITER_SKIP_EXPIRED);
+        while((encoding = setTypeNext(&si, &str, &len, &intobj)) != -1) {
+            for (j = 1; j < setnum; j++) {
+                if (sets[j].set == sets[0].set) continue;
+                if (!setTypeIsMemberAux(sets[j].set, str, len, intobj,
+                                        encoding == OBJ_ENCODING_HT))
                     break;
-            } else if (!dstkey) {
-                if (str != NULL)
-                    addReplyBulkCBuffer(c, str, len);
-                else
-                    addReplyBulkLongLong(c,intobj);
-                cardinality++;
-            } else {
-                if (str && only_integers) {
-                    /* It may be an integer although we got it as a string. */
-                    if (encoding == OBJ_ENCODING_HT &&
-                        string2ll(str, len, (long long *)&intobj))
-                    {
-                        if (dstset->encoding == OBJ_ENCODING_LISTPACK ||
-                            dstset->encoding == OBJ_ENCODING_INTSET)
-                        {
-                            /* Adding it as an integer is more efficient. */
-                            str = NULL;
-                        }
-                    } else {
-                        /* It's not an integer */
-                        only_integers = 0;
-                    }
-                }
-                setTypeAddMergeExpire(dstset, str, len, intobj, encoding == OBJ_ENCODING_HT, expire, 0);
             }
+
+            /* Only take action when all sets contain the member */
+            if (j == setnum && sinterEmit(&x, str, len, intobj, encoding, si.expire, 1))
+                break; /* We reached the limit */
         }
+        setTypeResetIterator(&si);
     }
-    setTypeResetIterator(&si);
+    cardinality = x.cardinality;
+    const int only_integers = x.only_integers;
 
     if (server.memory_tracking_enabled) {
         for (j = 0; j < setnum; j++) {
@@ -3344,10 +3583,105 @@ void sinterstoreCommand(client *c) {
     sinterGenericCommand(c, c->argv+2, c->argc-2, c->argv[1], 0, 0);
 }
 
+/* State of the DIFF algorithm 1 of SDIFF / SDIFFSTORE / SDIFFCARD. */
+typedef struct sdiffState {
+    client *c;
+    robj *dstkey;
+    robj *dstset;
+    int cardinality_only;
+    int direct;          /* reply with each member, no result set */
+    long limit;
+    long cardinality;
+    setopsrc *sets;      /* for the dictJoin() callback */
+    int setnum;
+    setopBatch *bt;      /* members of the join waiting for the lookups in sets[2..] */
+} sdiffState;
+
+/* Adds a member of sets[0] that no other set holds to the result. Returns 1
+ * if the LIMIT is reached. */
+static int sdiffEmit(sdiffState *x, char *str, size_t len, int64_t llval, int encoding, uint64_t expire) {
+    if (x->cardinality_only) {
+        x->cardinality++;
+        if (x->limit > 0 && x->cardinality >= x->limit) return 1;
+    } else if (x->direct) {
+        /* The members of a hashtable set are unique: no result set needed. */
+        if (str)
+            addReplyBulkCBuffer(x->c, str, len);
+        else
+            addReplyBulkLongLong(x->c, llval);
+        x->cardinality++;
+    } else {
+        x->cardinality += setTypeAddMergeExpire(x->dstset, str, len, llval, encoding == OBJ_ENCODING_HT,
+                                                x->dstkey ? expire : EB_EXPIRE_TIME_INVALID, 0);
+    }
+    return 0;
+}
+
+/* Looks up the members of the batch in sets[from..], and adds the ones none
+ * of them holds to the result. None of these sets is sets[0] (see sameset).
+ * Returns 1 if the LIMIT is reached. */
+static int sdiffBatchFlush(sdiffState *x, setopBatch *bt, int from) {
+    int found[SETOP_BATCH], stop = 0;
+    for (int i = 0; i < bt->n; i++) bt->in[i] = 1;
+    for (int j = from; j < x->setnum; j++) {
+        if (!x->sets[j].set) continue; /* no key is an empty set. */
+        setopBatchLookup(bt, x->sets[j].set, found);
+        for (int i = 0; i < bt->n; i++) if (found[i]) bt->in[i] = 0;
+    }
+    for (int i = 0; i < bt->n && !stop; i++) {
+        if (bt->in[i])
+            stop = sdiffEmit(x, bt->member[i], sdslen(bt->member[i]), 0, OBJ_ENCODING_HT, bt->expire[i]);
+    }
+    bt->n = 0;
+    return stop;
+}
+
+/* dictJoin() callback of SDIFF: ea is a member of sets[0], eb the same member
+ * of sets[1] or NULL. */
+static int sdiffJoinCallback(void *privdata, dictEntry *ea, dictEntry *eb) {
+    sdiffState *x = privdata;
+    setopsrc *sets = x->sets;
+    /* A logically expired member is not a member. */
+    if (eb && !(setTypeHasExpireSupport(sets[1].set) &&
+                setTypeExpireTimeElapsed(sEntryGetExpiry(dictGetKey(eb)))))
+        return 0;
+    sds member = dictGetKey(ea);
+    uint64_t expire = EB_EXPIRE_TIME_INVALID;
+    if (setTypeHasExpireSupport(sets[0].set)) {
+        expire = sEntryGetExpiry((SetEntry *)member);
+        if (setTypeExpireTimeElapsed(expire)) return 0;
+    }
+    if (x->setnum > 2) {
+        /* Look it up in the other sets with the next members, in a batch. */
+        setopBatch *bt = x->bt;
+        bt->member[bt->n] = member;
+        bt->expire[bt->n] = expire;
+        bt->hash[bt->n] = dictGetHash(sets[0].set->ptr, member);
+        if (++bt->n == SETOP_BATCH) return sdiffBatchFlush(x, bt, 2);
+        return 0;
+    }
+    return sdiffEmit(x, member, sdslen(member), 0, OBJ_ENCODING_HT, expire);
+}
+
+/* DIFF algorithm 1 when all the sets are hashtables: the members of sets[0]
+ * are hashed once and looked up in batches in the other sets. */
+static void sdiffBatched(sdiffState *x) {
+    setopsrc *sets = x->sets;
+    setTypeIterator si;
+    setopBatch bt;
+    setTypeInitIterator(&si, sets[0].set, SET_ITER_SKIP_EXPIRED);
+    setopIterPrefetch(&si, sets[0].set);
+    while (setopBatchFill(&bt, &si, sets[0].set->ptr)) {
+        if (sdiffBatchFlush(x, &bt, 1)) break; /* We reached the limit */
+    }
+    setTypeResetIterator(&si);
+}
+
 void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
                               robj *dstkey, int op,
                               int cardinality_only, int approx, long limit)
 {
+    void *replylen = NULL;
     /* Approximate cardinality is only ever requested for SUNIONCARD, i.e. a
      * non-storing UNION that returns a count. */
     serverAssert(!approx || (op == SET_OP_UNION && cardinality_only && dstkey == NULL));
@@ -3447,13 +3781,21 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
         }
     }
 
+    /* SDIFF with algorithm 1 of a hashtable set replies with each member as it
+     * finds it, with no result set (a corrupt listpack or intset loaded without
+     * sanitization may have duplicates). */
+    const int direct = op == SET_OP_DIFF && !sameset && sets[0].set && diff_algo == 1 &&
+                       !dstkey && !cardinality_only && sets[0].set->encoding == OBJ_ENCODING_HT;
+
     /* We need a temp set object to store our union/diff. If the dstkey
      * is not NULL (that is, we are inside an SUNIONSTORE/SDIFFSTORE operation) then
      * this set object will be the resulting object to set into the target key*/
-    if (dstset_encoding == OBJ_ENCODING_INTSET) {
-        dstset = createIntsetObject();
-    } else {
-        dstset = createSetObject();
+    if (!direct) {
+        if (dstset_encoding == OBJ_ENCODING_INTSET) {
+            dstset = createIntsetObject();
+        } else {
+            dstset = createSetObject();
+        }
     }
 
     if (op == SET_OP_UNION) {
@@ -3519,29 +3861,43 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
          *
          * This way we perform at max N*M operations, where N is the size of
          * the first set, and M the number of sets. */
-        setTypeInitIterator(&si, sets[0].set, SET_ITER_SKIP_EXPIRED);
-        while ((encoding = setTypeNext(&si, &str, &len, &llval)) != -1) {
-            for (j = 1; j < setnum; j++) {
-                if (!sets[j].set) continue; /* no key is an empty set. */
-                if (sets[j].set == sets[0].set) break; /* same set! */
-                if (setTypeIsMemberAux(sets[j].set, str, len, llval,
-                                       encoding == OBJ_ENCODING_HT))
-                    break;
-            }
-            if (j == setnum) {
-                /* There is no other set with this element. Add or count it if cardinality_only. */
-                if (cardinality_only) {
-                    cardinality++;
-                    if (limit > 0 && cardinality >= limit) {
-                        break; /* We reached the limit, break from the while loop iterating sets[0] */
-                    }
-                } else {
-                    cardinality += setTypeAddMergeExpire(dstset, str, len, llval, encoding == OBJ_ENCODING_HT,
-                                                         dstkey ? si.expire : EB_EXPIRE_TIME_INVALID, 0);
+        setopBatch joinbt = {.n = 0};
+        sdiffState x = {.c = c, .dstkey = dstkey, .dstset = dstset, .cardinality_only = cardinality_only,
+                        .direct = direct, .limit = limit, .cardinality = 0,
+                        .sets = sets, .setnum = setnum, .bt = &joinbt};
+        if (direct) replylen = addReplyDeferredLen(c);
+        /* Join sets[0] with the largest of the other sets, then look up its
+         * members not in it in the other ones. The key of such a member is read,
+         * unless only counting them. */
+        int flags = DICT_JOIN_UNMATCHED;
+        if (!cardinality_only || setnum > 2 || setTypeHasExpireSupport(sets[0].set))
+            flags |= DICT_JOIN_PREFETCH_UNMATCHED;
+        if (setnum >= 2 && sets[1].set && setopAllHT(sets, setnum) && setopUseJoin(sets[0].set, sets[1].set) &&
+            dictJoin(sets[0].set->ptr, sets[1].set->ptr, flags, sdiffJoinCallback, &x) == DICT_OK)
+        {
+            /* The last batch of members not in sets[1]. */
+            if (joinbt.n && !(cardinality_only && limit > 0 && x.cardinality >= limit))
+                sdiffBatchFlush(&x, &joinbt, 2);
+        } else if (setopUseBatches(sets, setnum)) {
+            sdiffBatched(&x);
+        } else {
+            setTypeInitIterator(&si, sets[0].set, SET_ITER_SKIP_EXPIRED);
+            setopIterPrefetch(&si, sets[0].set);
+            while ((encoding = setTypeNext(&si, &str, &len, &llval)) != -1) {
+                for (j = 1; j < setnum; j++) {
+                    if (!sets[j].set) continue; /* no key is an empty set. */
+                    if (sets[j].set == sets[0].set) break; /* same set! */
+                    if (setTypeIsMemberAux(sets[j].set, str, len, llval,
+                                           encoding == OBJ_ENCODING_HT))
+                        break;
                 }
+                /* There is no other set with this element. Add or count it. */
+                if (j == setnum && sdiffEmit(&x, str, len, llval, encoding, si.expire))
+                    break; /* We reached the limit */
             }
+            setTypeResetIterator(&si);
         }
-        setTypeResetIterator(&si);
+        cardinality = x.cardinality;
     } else if (op == SET_OP_DIFF && sets[0].set && diff_algo == 2 && cardinality_only && limit > 0) {
         /* DIFF Algorithm 2b (cardinality-only with LIMIT):
          *
@@ -3615,6 +3971,9 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
         addReplyLongLong(c, cardinality);
         server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstset, -1) :
                                           decrRefCount(dstset);
+    } else if (direct) {
+        /* The members were sent already. */
+        setDeferredSetLen(c, replylen, cardinality);
     } else if (!dstkey) {
         addReplySetLen(c,cardinality);
         setTypeInitIterator(&si, dstset, SET_ITER_SKIP_EXPIRED);

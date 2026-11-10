@@ -312,6 +312,14 @@ void dictSetHashFunctionSeed(uint8_t *seed);
 unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, void *privdata);
 unsigned long dictScanDefrag(dict *d, unsigned long v, dictScanFunction *fn, dictDefragFunctions *defragfns, void *privdata);
 uint64_t dictGetHash(dict *d, const void *key);
+
+/* See dictJoin(). */
+#define DICT_JOIN_UNMATCHED          (1<<0) /* Also emit the entries of a without a match. */
+#define DICT_JOIN_PREFETCH_UNMATCHED (1<<1) /* Prefetch their keys before emitting them. */
+#define DICT_JOIN_NO_PREFETCH        (1<<2) /* No software prefetch (for tests). */
+typedef int (dictJoinFunction)(void *privdata, dictEntry *a, dictEntry *b);
+int dictJoinSupported(dict *a, dict *b);
+int dictJoin(dict *a, dict *b, int flags, dictJoinFunction *fn, void *privdata);
 void dictRehashingInfo(dict *d, unsigned long long *from_size, unsigned long long *to_size);
 
 size_t dictGetStatsMsg(char *buf, size_t bufsize, dictStats *stats, int full);
@@ -321,6 +329,8 @@ void dictFreeStats(dictStats *stats);
 
 dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket);
 dictEntryLink dictFindLinkWithHash(dict *d, const void *key, uint64_t hash, dictEntryLink *bucket);
+#define DICT_FIND_BATCH_MAX 32
+void dictFindBatchWithHash(dict *d, const void **keys, const uint64_t *hashes, int n, dictEntry **found);
 void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int newItem);
 
 /* API relevant only when dict is used as a hash-map (no_value=0) */ 

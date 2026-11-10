@@ -4112,6 +4112,7 @@ int setTypeCanHoldExpire(const robj *set);
 void setTypeUpdateSubexpiry(redisDb *db, kvobj *set);
 int setIsRegisteredInSubexpires(const kvobj *set);
 int setTypeGetExpireAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds, uint64_t *expire);
+void setopSetBatchMinBuckets(unsigned long n);
 int setTypeAddExAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds, uint64_t expire);
 robj *createSetListpackExObject(void);
 unsigned char *setListpackExGetLp(const robj *set);

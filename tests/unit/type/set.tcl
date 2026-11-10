@@ -1617,3 +1617,172 @@ if {[lindex [r config get proto-max-bulk-len] 1] == 10000000000} {
 } ;# skip 32bit builds
 }
 } ;# run_solo
+
+# SINTER and SDIFF look up the members of the first set in batches only in the
+# sets of at least 65536 buckets. DEBUG SETOP-BATCH-MIN-BUCKETS 1 makes them do
+# it in small sets: the replies must be the same as without the batches.
+start_server {tags {"set external:skip needs:debug"}} {
+    r config set set-max-listpack-entries 0
+
+    proc setop_range {prefix from to} {
+        set members {}
+        for {set i $from} {$i < $to} {incr i} {lappend members $prefix$i}
+        return $members
+    }
+
+    proc setop_add {key prefix from to} {
+        r sadd $key {*}[setop_range $prefix $from $to]
+    }
+
+    # Runs the commands without and then with the batches, checks that they
+    # reply the same and returns the replies, with the members sorted.
+    proc setop_with_batches {cmds} {
+        set runs {}
+        foreach buckets {0 1} {
+            r debug setop-batch-min-buckets $buckets
+            set replies {}
+            foreach cmd $cmds {
+                set reply [r {*}$cmd]
+                if {[string tolower [lindex $cmd 0]] in {sinter sdiff smembers}} {
+                    set reply [lsort $reply]
+                }
+                lappend replies $reply
+            }
+            lappend runs $replies
+        }
+        r debug setop-batch-min-buckets 0
+        assert_equal [lindex $runs 0] [lindex $runs 1]
+        return [lindex $runs 1]
+    }
+
+    test "SINTER and SDIFF in batches - The first set is much smaller than the others" {
+        r flushall
+        # a{t} has 64 buckets, too few to be joined with the others.
+        setop_add a{t} m 0 400
+        setop_add b{t} m 0 150
+        setop_add b{t} f 0 5000
+        setop_add c{t} m 0 120
+        setop_add c{t} g 0 3000
+        foreach key {a{t} b{t} c{t}} {assert_encoding hashtable $key}
+        set inter [lsort [setop_range m 0 120]]
+        set diff [lsort [setop_range m 150 400]]
+        assert_equal [setop_with_batches {
+            {sinter a{t} b{t} c{t}}
+            {sinter a{t} b{t} a{t} c{t}}
+            {sintercard 3 a{t} b{t} c{t}}
+            {sintercard 3 a{t} b{t} c{t} limit 1}
+            {sintercard 3 a{t} b{t} c{t} limit 33}
+            {sintercard 3 a{t} b{t} c{t} limit 64}
+            {sintercard 3 a{t} b{t} c{t} limit 500}
+            {sinterstore d{t} a{t} b{t} c{t}}
+            {smembers d{t}}
+            {sdiff a{t} b{t} c{t}}
+            {sdiff a{t} b{t} nokey{t} c{t}}
+            {sdiffcard 3 a{t} b{t} c{t}}
+            {sdiffcard 3 a{t} b{t} c{t} limit 1}
+            {sdiffcard 3 a{t} b{t} c{t} limit 33}
+            {sdiffstore d{t} a{t} b{t} c{t}}
+            {smembers d{t}}
+        }] [list $inter $inter 120 1 33 64 120 120 $inter $diff $diff 250 1 33 250 $diff]
+    }
+
+    test "SINTER and SDIFF in batches - The two first sets are joined, the others looked up" {
+        r flushall
+        # a{t} and b{t} have 64 buckets each, and are joined.
+        setop_add a{t} m 0 300
+        setop_add b{t} m 0 200
+        setop_add b{t} x 0 200
+        setop_add c{t} m 0 100
+        setop_add c{t} m 250 300
+        setop_add c{t} y 0 3000
+        setop_add e{t} m 250 280
+        setop_add e{t} z 0 50
+        set inter [lsort [setop_range m 0 100]]
+        set diff [lsort [concat [setop_range m 200 250] [setop_range m 280 300]]]
+        assert_equal [setop_with_batches {
+            {sinter a{t} b{t} c{t}}
+            {sintercard 3 a{t} b{t} c{t}}
+            {sintercard 3 a{t} b{t} c{t} limit 33}
+            {sinterstore d{t} a{t} b{t} c{t}}
+            {smembers d{t}}
+            {sdiff a{t} b{t} e{t}}
+            {sdiffcard 3 a{t} b{t} e{t}}
+            {sdiffcard 3 a{t} b{t} e{t} limit 33}
+            {sdiffstore d{t} a{t} b{t} e{t}}
+            {smembers d{t}}
+        }] [list $inter 100 33 100 $inter $diff 70 33 70 $diff]
+    }
+
+    test "SINTER and SDIFF in batches - Expired members, and the nearest expiration is stored" {
+        r flushall
+        r debug set-active-expire 0
+        set base [expr {[clock milliseconds] + 100000000}]
+        # a{t} is not joined with the others, a2{t} is joined with c{t} for
+        # SINTER and with b{t} for SDIFF.
+        setop_add a{t} m 0 200
+        setop_add a{t} n 0 60
+        setop_add a2{t} m 0 200
+        setop_add a2{t} n 0 60
+        setop_add a2{t} h 0 900
+        setop_add b{t} m 0 200
+        setop_add b{t} f 0 5000
+        setop_add c{t} m 0 150
+        setop_add c{t} g 0 3000
+        # The expiration of m<i> is the nearest of base+3000+i in a{t} and
+        # a2{t} if i is even, base+2000+i in b{t} if i%3 == 0, and base+1000+i
+        # in c{t} if i%5 == 0.
+        set nearest {}
+        for {set i 0} {$i < 200} {incr i} {
+            set e -1
+            if {$i % 2 == 0} {
+                set e [expr {$base + 3000 + $i}]
+                r spexpireat a{t} $e MEMBERS 1 m$i
+                r spexpireat a2{t} $e MEMBERS 1 m$i
+            }
+            if {$i % 3 == 0} {
+                set e [expr {$base + 2000 + $i}]
+                r spexpireat b{t} $e MEMBERS 1 m$i
+            }
+            if {$i % 5 == 0 && $i < 150} {
+                set e [expr {$base + 1000 + $i}]
+                r spexpireat c{t} $e MEMBERS 1 m$i
+            }
+            lappend nearest $e
+        }
+        # Members that are logically expired, but still there.
+        r spexpire a{t} 20 MEMBERS 10 {*}[setop_range m 0 5] {*}[setop_range n 0 5]
+        r spexpire b{t} 20 MEMBERS 20 {*}[setop_range m 140 150] {*}[setop_range m 190 200]
+        r debug sleep 0.05
+
+        set inter [setop_range m 5 140]
+        set inter2 [setop_range m 0 140]
+        set diff [concat [setop_range m 190 200] [setop_range n 5 60]]
+        set diff2 [concat [setop_range m 190 200] [setop_range n 0 60] [setop_range h 0 900]]
+        assert_equal [setop_with_batches {
+            {sinter a{t} b{t} c{t}}
+            {sintercard 3 a{t} b{t} c{t}}
+            {sintercard 3 a{t} b{t} c{t} limit 40}
+            {sinter a2{t} b{t} c{t}}
+            {sdiff a{t} b{t} c{t}}
+            {sdiffcard 3 a{t} b{t} c{t}}
+            {sdiff a2{t} b{t} c{t}}
+            {sdiffcard 3 a2{t} b{t} c{t}}
+        }] [list [lsort $inter] 135 40 [lsort $inter2] [lsort $diff] 65 [lsort $diff2] 970]
+
+        # The STORE commands remove the expired members of the sources first.
+        set diffexpire {}
+        foreach m $diff {
+            set i [string range $m 1 end]
+            lappend diffexpire [expr {[string index $m 0] eq "m" && $i % 2 == 0 ? $base + 3000 + $i : -1}]
+        }
+        assert_equal [setop_with_batches [list \
+            {sinterstore d{t} a{t} b{t} c{t}} \
+            [list spexpiretime d{t} MEMBERS [llength $inter] {*}$inter] \
+            {sinterstore d{t} a2{t} b{t} c{t}} \
+            [list spexpiretime d{t} MEMBERS [llength $inter2] {*}$inter2] \
+            {sdiffstore d{t} a{t} b{t} c{t}} \
+            [list spexpiretime d{t} MEMBERS [llength $diff] {*}$diff] \
+        ]] [list 135 [lrange $nearest 5 139] 140 [lrange $nearest 0 139] 65 $diffexpire]
+        r debug set-active-expire 1
+    }
+}

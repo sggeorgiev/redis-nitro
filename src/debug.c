@@ -699,6 +699,9 @@ void debugCommand(client *c) {
 "    Pause the server's main process during various replication steps.",
 "DICT-RESIZING <0|1>",
 "    Enable or disable the main dict and expire dict resizing.",
+"SETOP-BATCH-MIN-BUCKETS <buckets>",
+"    Look up the members of SINTER/SDIFF in batches in the sets with at least",
+"    this many buckets. 0 restores the default.",
 "SCRIPT <LIST|<sha>>",
 "    Output SHA and content of all scripts or of a specific script with its SHA.",
 "MARK-INTERNAL-CLIENT [UNMARK]",
@@ -1350,6 +1353,12 @@ NULL
         addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "dict-resizing") && c->argc == 3) {
         server.dict_resizing = atoi(c->argv[2]->ptr);
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "setop-batch-min-buckets") && c->argc == 3) {
+        long buckets;
+        if (getRangeLongFromObjectOrReply(c, c->argv[2], 0, LONG_MAX, &buckets, NULL) != C_OK)
+            return;
+        setopSetBatchMinBuckets((unsigned long)buckets);
         addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"script") && c->argc == 3) {
         if (server.hide_user_data_from_log) {
