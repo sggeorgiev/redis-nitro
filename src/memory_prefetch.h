@@ -16,6 +16,7 @@
 #define MEMORY_PREFETCH_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 struct client;
 struct dict;
@@ -35,6 +36,13 @@ void prefetchCommands(void);
  * nkeys must be <= DICT_PREFETCH_MAX_SIZE (the function asserts this).
  * Callers should batch larger inputs into chunks of this size or smaller. */
 #define DICT_PREFETCH_MAX_SIZE 64
-void dictPrefetchKeys(struct dict **dicts, void **keys, size_t nkeys);
+/* If 'hashes' is not NULL, hashes[i] is set to the dict hash of keys[i] for
+ * every i with a non-NULL dicts[i], so the caller can look the keys up with
+ * dictFindLinkWithHash() and friends without hashing them again. */
+/* If 'found' is not NULL, the prefetch also completes each lookup: found[i]
+ * is set to the stored key that matches keys[i], or NULL if it is absent, and
+ * the function returns 1 (it returns 0 if it did not run, e.g. nkeys <= 1).
+ * The results are only valid until the dicts are next modified. */
+int dictPrefetchKeys(struct dict **dicts, void **keys, size_t nkeys, uint64_t *hashes, void **found);
 
 #endif /* MEMORY_PREFETCH_H */

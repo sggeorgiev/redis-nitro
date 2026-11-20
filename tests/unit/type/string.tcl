@@ -297,6 +297,44 @@ start_server {tags {"string"}} {
         r debug set-active-expire 1
     } {OK} {needs:debug}
 
+    test {Pipelined MGET and MSET prefetch every key exactly once} {
+        # Two pipelined commands of 100 keys: the cross-command batch has room
+        # for 2 * prefetch-batch-max-size = 32 keys, all from the first command,
+        # which must prefetch its other 68 keys itself (and not the 32 again).
+        # The second command prefetches all its keys: 32 + 68 + 100 = 200.
+        # If the two commands arrive in separate reads no batch is formed, and
+        # each command prefetches its own 100 keys: still 200.
+        r flushdb
+        r config set prefetch-batch-max-size 16
+        set keys {}
+        set mset_args {}
+        for {set i 0} {$i < 100} {incr i} {
+            lappend keys "k:${i}{t}"
+            lappend mset_args "k:${i}{t}" "v:$i"
+        }
+        r mset {*}$mset_args
+
+        set before [getInfoProperty [r info stats] io_threaded_total_prefetch_entries]
+        set rd [redis_deferring_client]
+        $rd write "[format_command mget {*}$keys][format_command mget {*}$keys]"
+        $rd flush
+        assert_equal [lindex [$rd read] 99] "v:99"
+        assert_equal [lindex [$rd read] 99] "v:99"
+        set after [getInfoProperty [r info stats] io_threaded_total_prefetch_entries]
+        assert_equal 200 [expr {$after - $before}]
+
+        # Same for MSET (stride 2): 50 keys each, 32 + 18 + 50 = 100.
+        set half [lrange $mset_args 0 99]
+        set before $after
+        $rd write "[format_command mset {*}$half][format_command mset {*}$half]"
+        $rd flush
+        assert_equal OK [$rd read]
+        assert_equal OK [$rd read]
+        set after [getInfoProperty [r info stats] io_threaded_total_prefetch_entries]
+        assert_equal 100 [expr {$after - $before}]
+        $rd close
+    }
+
     test {MSETEX - all expiration flags} {
         # Test each expiration type separately (EX, PX, EXAT, PXAT)
         set future_sec [expr [clock seconds] + 10]

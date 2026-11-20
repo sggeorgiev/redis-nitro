@@ -1382,6 +1382,98 @@ static int tryAvoidBulkStrCopyToReply(client *c, robj *obj, size_t len) {
     return C_OK;
 }
 
+/* Emit "$<len>\r\n", the payload and the trailing CRLF as a single batched
+ * append. The payload is handed over by reference rather than copied into a
+ * scratch buffer. The caller must have called _prepareClientToWrite(). */
+/* Copy n bytes with overlapping word moves for short strings (no libc call). */
+static inline void _replyCopySmall(char *dst, const char *src, size_t n) {
+    if (n >= 8) {
+        if (n > 16) { memcpy(dst, src, n); return; }
+        uint64_t a, b;
+        memcpy(&a, src, 8); memcpy(&b, src + n - 8, 8);
+        memcpy(dst, &a, 8); memcpy(dst + n - 8, &b, 8);
+    } else if (n >= 4) {
+        uint32_t a, b;
+        memcpy(&a, src, 4); memcpy(&b, src + n - 4, 4);
+        memcpy(dst, &a, 4); memcpy(dst + n - 4, &b, 4);
+    } else {
+        for (size_t i = 0; i < n; i++) dst[i] = src[i];
+    }
+}
+
+/* Fast path of _addReplyBulkFrame(): if the whole "$<len>\r\n<payload>\r\n"
+ * frame fits in the plain static buffer, or in the plain tail block of the
+ * reply list, write it there in one go. Returns 0 if the caller must take
+ * the generic path (_addReplySegmentsToBufferOrList() does the same checks). */
+static inline int _addReplyBulkFrameFast(client *c, const void *p, size_t len) {
+    const size_t hdr_len = len < 10 ? 4 : len < 100 ? 5 : len < 1000 ? 6 : len < 10000 ? 7 : 0;
+    if (unlikely(hdr_len == 0)) return 0;
+    if (unlikely(c->flags & (CLIENT_CLOSE_AFTER_REPLY | CLIENT_PUSHING)) || unlikely(clientTypeIsSlave(c)))
+        return 0;
+
+    const size_t total = hdr_len + len + 2;
+    clientReplyBlock *tail = NULL;
+    char *dst;
+    if (listLength(c->reply) == 0) {
+        if (c->buf_encoded || c->buf_usable_size - c->bufpos < total) return 0;
+        dst = c->buf + c->bufpos;
+    } else {
+        tail = listNodeValue(listLast(c->reply));
+        if (!tail || tail->buf_encoded || tail->size - tail->used < total) return 0;
+        dst = tail->buf + tail->used;
+    }
+
+    c->net_output_bytes_curr_cmd += total;
+    reqresSaveClientReplyOffset(c);
+
+    dst[0] = '$';
+    size_t v = len;
+    char *d = dst + hdr_len - 3;
+    do { *d-- = '0' + (v % 10); v /= 10; } while (v);
+    dst[hdr_len - 2] = '\r';
+    dst[hdr_len - 1] = '\n';
+    _replyCopySmall(dst + hdr_len, p, len);
+    dst[hdr_len + len] = '\r';
+    dst[hdr_len + len + 1] = '\n';
+
+    if (tail) {
+        tail->used += total;
+    } else {
+        c->bufpos += total;
+        if (c->buf_peak < (size_t)c->bufpos) c->buf_peak = (size_t)c->bufpos;
+    }
+    return 1;
+}
+
+static inline __attribute__((always_inline))
+void _addReplyBulkFrame(client *c, const void *p, size_t len) {
+    if (likely(_addReplyBulkFrameFast(c, p, len))) return;
+    const char *hdr;
+    size_t hdr_len;
+    /* '$' + up to 20 digits (64-bit) + "\r\n"; LONG_STR_SIZE already budgets the NUL. */
+    char hdrbuf[LONG_STR_SIZE + 3];
+    if (likely(len < OBJ_SHARED_BULKHDR_LEN)) {
+        /* Point straight at the shared "$<len>\r\n" object — no copy needed. */
+        hdr = shared.bulkhdr[len]->ptr;
+        hdr_len = OBJ_SHARED_HDR_STRLEN(len);
+    } else {
+        char *h = hdrbuf;
+        *h++ = '$';
+        /* Room left after '$', reserving the 2 trailing bytes for "\r\n". */
+        h += ll2string(h, sizeof(hdrbuf) - (size_t)(h - hdrbuf) - 2, (long long)len);
+        *h++ = '\r';
+        *h++ = '\n';
+        hdr = hdrbuf;
+        hdr_len = (size_t)(h - hdrbuf);
+    }
+    replySegment seg[3] = {
+        { hdr,    hdr_len },
+        { p,      len },
+        { "\r\n", 2 },
+    };
+    _addReplySegmentsToBufferOrList(c, seg, sizeof(seg) / sizeof(seg[0]));
+}
+
 /* Add a Redis Object as a bulk reply.
  * If avoid_copy is non-zero, attempt to use copy avoidance optimization. */
 void addReplyBulkWithFlag(client *c, robj *obj, int avoid_copy) {
@@ -1389,11 +1481,12 @@ void addReplyBulkWithFlag(client *c, robj *obj, int avoid_copy) {
 
     if (sdsEncodedObject(obj)) {
         const size_t len = sdslen(obj->ptr);
-        if (avoid_copy && tryAvoidBulkStrCopyToReply(c, obj, len) == C_OK)
+        /* Only RAW strings can be referenced (see isCopyAvoidPreferred()):
+         * test that first, so EMBSTR replies skip the call. */
+        if (avoid_copy && obj->encoding == OBJ_ENCODING_RAW &&
+            tryAvoidBulkStrCopyToReply(c, obj, len) == C_OK)
             return;
-        _addReplyLongLongBulk(c, len);
-        _addReplyToBufferOrList(c,obj->ptr,len);
-        _addReplyToBufferOrList(c,"\r\n",2);
+        _addReplyBulkFrame(c, obj->ptr, len);
     } else if (obj->encoding == OBJ_ENCODING_INT) {
         /* For integer encoded strings we just convert it into a string
          * using our optimized function, and attach the resulting string
@@ -1422,30 +1515,7 @@ void addReplyBulk(client *c, robj *obj) {
  * three per-call passes into one for payloads of any size. */
 void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     if (_prepareClientToWrite(c) != C_OK) return;
-    const char *hdr;
-    size_t hdr_len;
-    /* '$' + up to 20 digits (64-bit) + "\r\n"; LONG_STR_SIZE already budgets the NUL. */
-    char hdrbuf[LONG_STR_SIZE + 3];
-    if (likely(len < OBJ_SHARED_BULKHDR_LEN)) {
-        /* Point straight at the shared "$<len>\r\n" object — no copy needed. */
-        hdr = shared.bulkhdr[len]->ptr;
-        hdr_len = OBJ_SHARED_HDR_STRLEN(len);
-    } else {
-        char *h = hdrbuf;
-        *h++ = '$';
-        /* Room left after '$', reserving the 2 trailing bytes for "\r\n". */
-        h += ll2string(h, sizeof(hdrbuf) - (size_t)(h - hdrbuf) - 2, (long long)len);
-        *h++ = '\r';
-        *h++ = '\n';
-        hdr = hdrbuf;
-        hdr_len = (size_t)(h - hdrbuf);
-    }
-    replySegment seg[3] = {
-        { hdr,    hdr_len },
-        { p,      len },
-        { "\r\n", 2 },
-    };
-    _addReplySegmentsToBufferOrList(c, seg, sizeof(seg) / sizeof(seg[0]));
+    _addReplyBulkFrame(c, p, len);
 }
 
 /* Add sds to reply (takes ownership of sds and frees it) */

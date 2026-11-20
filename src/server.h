@@ -2938,7 +2938,6 @@ enum {
     PENDING_CMD_FLAG_INCOMPLETE = 1 << 0,     /* Command parsing is incomplete, still waiting for more data */
     PENDING_CMD_FLAG_PREPROCESSED = 1 << 1,   /* This command has passed pre-processing */
     PENDING_CMD_KEYS_RESULT_VALID = 1 << 2,   /* Command's keys_result is valid and cached */
-    PENDING_CMD_KEYS_PREFETCHED = 1 << 3,     /* Command's keys were prefetched by the cross-command batch */
 };
 
 /* Parser state and parse result of a command from a client's input buffer. */
@@ -2955,6 +2954,8 @@ struct pendingCommand {
     int slot;         /* The slot the command is executing against. Set to INVALID_CLUSTER_SLOT
                        * if no slot is being used or if the command has a cross slot error */
     uint8_t read_error;
+    int prefetched_keys;      /* How many leading keys (in keys_result order) the
+                               * cross-command batch prefetched, see addCommandToBatch(). */
 
     struct pendingCommand *next;
     struct pendingCommand *prev;
@@ -4528,6 +4529,8 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
 int checkAlreadyExpired(long long when);
 int parseExtendedExpireArgumentsOrReply(client *c, int *flags);
 kvobj *lookupKeyRead(redisDb *db, robj *key);
+kvobj *lookupKeyReadWithHash(redisDb *db, robj *key, uint64_t hash);
+kvobj *lookupKeyReadFound(redisDb *db, robj *key, kvobj *kv);
 kvobj *lookupKeyWrite(redisDb *db, robj *key);
 kvobj *lookupKeyWriteWithLink(redisDb *db, robj *key, dictEntryLink *link);
 kvobj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);

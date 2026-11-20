@@ -694,14 +694,21 @@ void getrangeCommand(client *c) {
 
 /* Pick the next prefetch batch starting at argv[start] and warm it via
  * dictPrefetchKeys. 'stride' is 1 for keys-only args (MGET) or 2 for
- * key/value pairs (MSET). Returns the chosen batch size in items. */
-static int prefetchKeysBatch(client *c, int slot, int start, int stride) {
+ * key/value pairs (MSET). Returns the chosen batch size in items.
+ * If 'hashes' is not NULL and the batch was prefetched, the keys' dict
+ * hashes are stored there and *hashed is set to 1 (0 otherwise). If 'found'
+ * is not NULL, the prefetch also completes the lookups (see dictPrefetchKeys())
+ * and *resolved is set to 1 when found[] holds their results. */
+static int prefetchKeysBatch(client *c, int slot, int start, int stride,
+                             uint64_t *hashes, void **found, int *hashed, int *resolved) {
     int batch = (c->argc - start) / stride;
 
     /* If at least two full batches remain, take one; otherwise fall
      * through with batch = remaining keys, doing them in one go. */
     if (batch >= PREFETCH_BATCH_SIZE*2) batch = PREFETCH_BATCH_SIZE;
 
+    if (hashed) *hashed = 0;
+    if (resolved) *resolved = 0;
     dict *d = kvstoreGetDict(c->db->keys, slot);
     if (d != NULL && dictSize(d) > 0) {
         void *keys[PREFETCH_BATCH_SIZE*2];
@@ -710,9 +717,36 @@ static int prefetchKeysBatch(client *c, int slot, int start, int stride) {
             keys[k]  = c->argv[start + k * stride]->ptr;
             dicts[k] = d;
         }
-        dictPrefetchKeys(dicts, keys, batch);
+        int r = dictPrefetchKeys(dicts, keys, batch, hashes, found);
+        if (hashed && hashes) *hashed = 1;
+        if (resolved) *resolved = r;
     }
     return batch;
+}
+
+/* How many leading keys of the running command the cross-command batch
+ * already prefetched (see addCommandToBatch()), at most 'numkeys'. The
+ * count follows keys_result order, which for MGET and MSET is argv order. */
+static int crossBatchPrefetchedKeys(client *c, int numkeys) {
+    pendingCommand *pcmd = c->current_pending_cmd;
+    int n = pcmd ? pcmd->prefetched_keys : 0;
+    return n < numkeys ? n : numkeys;
+}
+
+/* Size of the next batch of a multi-key loop at argv[start] ('stride' as in
+ * prefetchKeysBatch()). The first 'warm' keys, already prefetched by the
+ * cross-command batch, form one batch of their own. After them, take one
+ * prefetch batch if 'prefetch' is set, otherwise all remaining items.
+ * 'hashes', 'found', 'hashed' and 'resolved' go to prefetchKeysBatch();
+ * *hashed and *resolved stay 0 for the warm batch and when not prefetching. */
+static int nextKeysBatch(client *c, int slot, int start, int stride, int warm, int prefetch,
+                         uint64_t *hashes, void **found, int *hashed, int *resolved) {
+    if (hashed) *hashed = 0;
+    if (resolved) *resolved = 0;
+    int idx = (start - 1) / stride;
+    if (idx < warm) return warm - idx;
+    return prefetch ? prefetchKeysBatch(c, slot, start, stride, hashes, found, hashed, resolved)
+                    : (c->argc - start) / stride;
 }
 
 void mgetCommand(client *c) {
@@ -731,20 +765,36 @@ void mgetCommand(client *c) {
     }
 
     /* Decide whether to prefetch within this command. Skip if disabled by
-     * config (prefetch_batch_max_size == 0), or if the cross-command batch
-     * path already warmed our keys — running both paths would just contend
-     * for cache bandwidth. */
-    int already_prefetched = c->current_pending_cmd &&
-        (c->current_pending_cmd->flags & PENDING_CMD_KEYS_PREFETCHED);
-    int do_prefetch = server.prefetch_batch_max_size && !already_prefetched && numkeys > 1;
+     * config (prefetch_batch_max_size == 0). The keys the cross-command batch
+     * already warmed are not prefetched again (running both paths would just
+     * contend for cache bandwidth), but the ones it had no room for are. */
+    int warm = crossBatchPrefetchedKeys(c, numkeys);
+    int do_prefetch = server.prefetch_batch_max_size && numkeys - warm > 1;
 
+    uint64_t hashes[PREFETCH_BATCH_SIZE*2];
+    void *found[PREFETCH_BATCH_SIZE*2];
+    /* A keymiss callback of a module could change the keyspace. */
+    const int keymiss_hooks = moduleHasSubscribersForKeyspaceEvent(NOTIFY_KEY_MISS);
     int j = 1;
     while (j < c->argc) {
-        /* If prefetching, take one batch; otherwise take all items. */
-        int batch = do_prefetch ? prefetchKeysBatch(c, slot, j, 1) : c->argc - j;
+        /* The prefetch hands back the keys' hashes, so the lookups skip
+         * hashing, and the lookup results themselves ('resolved'). */
+        int hashed = 0, resolved = 0;
+        int batch = nextKeysBatch(c, slot, j, 1, warm, do_prefetch, hashes, found, &hashed, &resolved);
 
         for (int k = 0; k < batch; k++) {
-            kvobj *o = lookupKeyRead(c->db, c->argv[j + k]);
+            robj *key = c->argv[j + k];
+            kvobj *o;
+            if (resolved) {
+                o = lookupKeyReadFound(c->db, key, found[k]);
+                /* The batch results stay valid until the keyspace may have
+                 * changed: an expired key got deleted (and notified), or a
+                 * module saw a keymiss. Look the rest of the batch up again. */
+                if ((found[k] && !o) || (!found[k] && keymiss_hooks)) resolved = 0;
+            } else {
+                o = hashed ? lookupKeyReadWithHash(c->db, key, hashes[k])
+                           : lookupKeyRead(c->db, key);
+            }
             if (o == NULL || o->type != OBJ_STRING)
                 addReplyNull(c);
             else
@@ -769,18 +819,15 @@ void msetGenericCommand(client *c, int nx) {
         slot = (pcmd && pcmd->slot != INVALID_CLUSTER_SLOT) ?
                 pcmd->slot : getKeySlot(c->argv[1]->ptr);
     }
-    int already_prefetched = c->current_pending_cmd &&
-        (c->current_pending_cmd->flags & PENDING_CMD_KEYS_PREFETCHED);
-    int do_prefetch = server.prefetch_batch_max_size && !already_prefetched && numkeys > 1;
+    int warm = crossBatchPrefetchedKeys(c, numkeys);
+    int do_prefetch = server.prefetch_batch_max_size && numkeys - warm > 1;
 
     /* Handle the NX flag. The MSETNX semantic is to return zero and don't
      * set anything if at least one key already exists. */
     if (nx) {
         int j = 1;
         while (j < c->argc) {
-            /* If prefetching, take one batch; otherwise take all items. */
-            int batch = do_prefetch ? prefetchKeysBatch(c, slot, j, 2)
-                                    : (c->argc - j) / 2;
+            int batch = nextKeysBatch(c, slot, j, 2, warm, do_prefetch, NULL, NULL, NULL, NULL);
             for (int k = 0; k < batch; k++) {
                 if (lookupKeyWrite(c->db, c->argv[j + k * 2]) != NULL) {
                     addReply(c, shared.czero);
@@ -796,8 +843,7 @@ void msetGenericCommand(client *c, int nx) {
 
     int j = 1;
     while (j < c->argc) {
-        int batch = do_prefetch ? prefetchKeysBatch(c, slot, j, 2)
-                                : (c->argc - j) / 2;
+        int batch = nextKeysBatch(c, slot, j, 2, warm, do_prefetch, NULL, NULL, NULL, NULL);
         for (int k = 0; k < batch; k++) {
             int i = j + k * 2;
             c->argv[i + 1] = tryObjectEncoding(c->argv[i + 1]);

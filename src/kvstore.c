@@ -846,6 +846,14 @@ dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
     return dictFind(d, key);
 }
 
+/* Like kvstoreDictFind(), with the key's hash already computed by the caller. */
+dictEntry *kvstoreDictFindWithHash(kvstore *kvs, int didx, void *key, uint64_t hash) {
+    dict *d = kvstoreGetDict(kvs, didx);
+    if (!d) return NULL;
+    dictEntryLink link = dictFindLinkWithHash(d, key, hash, NULL);
+    return link ? *link : NULL;
+}
+
 /* Find a link to a key in the specified kvstore. If not found return NULL.
  *
  * This function is a wrapper around dictFindLink(), used to locate a key in a dict

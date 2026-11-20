@@ -299,10 +299,9 @@ void dbgRunAssertions(redisDb *db) {
  * Even if the key expiry is master-driven, we can correctly report a key is
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
-kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
-
-    kvobj *val = dbFindByLink(db, key->ptr, link);
-
+static inline kvobj *lookupKeyFound(redisDb *db, robj *key, int flags,
+                                    dictEntryLink *link, kvobj *val)
+{
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the master. We forbid it on readonly replicas, but
@@ -358,6 +357,26 @@ kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
     }
 
     return val;
+}
+
+kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
+    kvobj *val = dbFindByLink(db, key->ptr, link);
+    return lookupKeyFound(db, key, flags, link, val);
+}
+
+/* Like lookupKeyRead(), for a caller that already found the key in the
+ * keyspace dict (kv, or NULL if absent) and nothing changed the keyspace
+ * since. Applies the usual side effects (expire, LRU/LFU, stats, keymiss). */
+kvobj *lookupKeyReadFound(redisDb *db, robj *key, kvobj *kv) {
+    return lookupKeyFound(db, key, LOOKUP_NONE, NULL, kv);
+}
+
+/* Like lookupKeyRead(), for a caller that already computed the key's dict
+ * hash (for example via dictPrefetchKeys()). 'hash' must be the hash of
+ * key->ptr in the keyspace dicts, or the wrong bucket is searched. */
+kvobj *lookupKeyReadWithHash(redisDb *db, robj *key, uint64_t hash) {
+    dictEntry *de = kvstoreDictFindWithHash(db->keys, getKeySlot(key->ptr), key->ptr, hash);
+    return lookupKeyFound(db, key, LOOKUP_NONE, NULL, de ? dictGetKV(de) : NULL);
 }
 
 /* Lookup a key for read operations, or return NULL if the key is not found
