@@ -1260,11 +1260,24 @@ raxNode **raxFindParentLink(raxNode *parent, raxNode *child) {
     return cp;
 }
 
-/* Low level child removal from node. The new node pointer (after the child
- * removal) is returned. Note that this function does not fix the pointer
- * of the parent node in its parent, so this task is up to the caller.
- * The function never fails for out of memory. */
-raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
+/* Like raxFindParentLink(), for a 'parent' found at depth 'depth' while
+ * walking the key 's': its child on the path of 's' is behind the edge
+ * s[depth]. Finding that edge byte with memchr() avoids scanning the child
+ * pointers, which costs up to 256 pointer compares in a wide node. */
+static inline raxNode **raxFindParentLinkByKey(raxNode *parent, unsigned char *s, size_t depth) {
+    raxNode **cp = raxNodeFirstChildPtr(parent);
+    if (parent->iscompr) return cp;
+    unsigned char *e = memchr(parent->data, s[depth], parent->size);
+    debugAssert(e != NULL);
+    return cp + (e - parent->data);
+}
+
+/* Low level child removal from node, given the address 'c' of the child
+ * pointer inside 'parent' (ignored if 'parent' is compressed). The new node
+ * pointer (after the child removal) is returned. Note that this function
+ * does not fix the pointer of the parent node in its parent, so this task
+ * is up to the caller. The function never fails for out of memory. */
+static raxNode *raxRemoveChildAt(rax *rax, raxNode *parent, raxNode **c) {
     debugnode("raxRemoveChild before", parent);
     /* If parent is a compressed node (having a single child, as for definition
      * of the data structure), the removal of the child consists into turning
@@ -1280,26 +1293,14 @@ raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
         return parent;
     }
 
-    /* Otherwise we need to scan for the child pointer and memmove()
-     * accordingly.
+    /* Otherwise we need to memmove() the edges and the child pointers.
      *
      * 1. To start we seek the first element in both the children
-     *    pointers and edge bytes in the node. */
+     *    pointers and edge bytes in the node, and the edge of 'c'. */
     raxNode **cp = raxNodeFirstChildPtr(parent);
-    raxNode **c = cp;
-    unsigned char *e = parent->data;
+    unsigned char *e = parent->data + (c - cp);
 
-    /* 2. Search the child pointer to remove inside the array of children
-     *    pointers. */
-    while(1) {
-        raxNode *aux;
-        memcpy(&aux,c,sizeof(aux));
-        if (aux == child) break;
-        c++;
-        e++;
-    }
-
-    /* 3. Remove the edge and the pointer by memmoving the remaining children
+    /* 2. Remove the edge and the pointer by memmoving the remaining children
      *    pointer and edge bytes one position before. */
     int taillen = parent->size - (e - parent->data) - 1;
     debugf("raxRemoveChild tail len: %d\n", taillen);
@@ -1321,7 +1322,7 @@ raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
     size_t valuelen = (parent->iskey && !parent->isnull) ? sizeof(void*) : 0;
     memmove(((char*)c)-shift,c+1,taillen*sizeof(raxNode**)+valuelen);
 
-    /* 4. Update size. */
+    /* 3. Update size. */
     parent->size--;
 
     /* realloc the node according to the theoretical memory usage, to free
@@ -1333,6 +1334,26 @@ raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
     /* Note: if raxNodeRealloc() fails we just return the old address, which
      * is valid. */
     return newnode ? newnode : parent;
+}
+
+/* Low level child removal from node. The new node pointer (after the child
+ * removal) is returned. Note that this function does not fix the pointer
+ * of the parent node in its parent, so this task is up to the caller.
+ * The function never fails for out of memory. */
+raxNode *raxRemoveChild(rax *rax, raxNode *parent, raxNode *child) {
+    raxNode **c = NULL;
+    if (!parent->iscompr) {
+        /* Search the child pointer to remove inside the array of children
+         * pointers. */
+        c = raxNodeFirstChildPtr(parent);
+        while(1) {
+            raxNode *aux;
+            memcpy(&aux,c,sizeof(aux));
+            if (aux == child) break;
+            c++;
+        }
+    }
+    return raxRemoveChildAt(rax,parent,c);
 }
 
 /* Remove the specified item. Returns 1 if the item was found and
@@ -1351,20 +1372,28 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
     raxNode *h = link.stopnode;
     rax->numele--;
 
+    /* Depth of 'h', that is the number of key bytes consumed to reach it.
+     * Going up, the depth of a parent is the depth of its child minus the
+     * parent's own step length, and the parent's link to the child is the
+     * edge s[parent depth]: see raxFindParentLinkByKey(). */
+    size_t hdepth = link.consumed;
+
     /* Fixed-length leaf-parent slot removal. We stopped at h before entering the
      * leaf slot. link.leafSlot is the inlined value-slot index: 0 when
      * iscompr=1, otherwise the matched edge index. Drop it, then unlink h if it
      * becomes useless and continue the normal upward cleanup. */
     if (link.splitpos == RAX_LEAF_PARENT_STOP) {
         int slot_idx = link.leafSlot;
+        /* The walk consumed h's step too: it stopped before the slot. */
+        hdepth -= raxStepLenNode(h);
 
         /* Case A: iscompr=0 leaf parent with > 1 slots. Shrink h and done. */
         if (!h->iscompr && h->size > 1) {
             raxNode *newh = raxRemoveSlotAt(rax, h, slot_idx);
             if (newh != h) {
                 raxNode *parent = raxStackPeek(&ts);
-                raxNode **parentlink = parent == NULL
-                    ? &rax->head : raxFindParentLink(parent, h);
+                raxNode **parentlink = parent == NULL ? &rax->head :
+                    raxFindParentLinkByKey(parent, s, hdepth - raxStepLenNode(parent));
                 memcpy(parentlink, &newh, sizeof(newh));
             }
             raxStackFree(&ts);
@@ -1401,6 +1430,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
             raxFreeNode(rax,child);
             rax->numnodes--;
             h = raxStackPop(&ts);
+            hdepth -= raxStepLenNode(h);
              /* If this node has more than one child, or actually holds
               * a key, stop here. */
             if (h->iskey || (!h->iscompr && h->size != 1)) break;
@@ -1408,14 +1438,16 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
         if (child) {
             debugf("Unlinking child %p from parent %p\n",
                 (void*)child, (void*)h);
-            raxNode *new = raxRemoveChild(rax,h,child);
+            raxNode *new = raxRemoveChildAt(rax,h,
+                raxFindParentLinkByKey(h,s,hdepth));
             if (new != h) {
                 raxNode *parent = raxStackPeek(&ts);
                 raxNode **parentlink;
                 if (parent == NULL) {
                     parentlink = &rax->head;
                 } else {
-                    parentlink = raxFindParentLink(parent,h);
+                    parentlink = raxFindParentLinkByKey(parent,s,
+                        hdepth - raxStepLenNode(parent));
                 }
                 memcpy(parentlink,&new,sizeof(new));
             }
@@ -1494,6 +1526,7 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
             if (!parent || parent->iskey ||
                 (!parent->iscompr && parent->size != 1)) break;
             h = parent;
+            hdepth -= raxStepLenNode(h);
             debugnode("Going up to",h);
         }
         raxNode *start = h; /* Compression starting node. */
@@ -1575,7 +1608,8 @@ int raxRemove(rax *rax, unsigned char *s, size_t len, void **old) {
 
             /* Fix parent link. */
             if (parent) {
-                raxNode **parentlink = raxFindParentLink(parent,start);
+                raxNode **parentlink = raxFindParentLinkByKey(parent,s,
+                    hdepth - raxStepLenNode(parent));
                 memcpy(parentlink,&new,sizeof(new));
             } else {
                 rax->head = new;
@@ -1744,6 +1778,41 @@ void raxIteratorDelChars(raxIterator *it, size_t count) {
     it->key_len -= count;
 }
 
+/* Nodes wider than this use memchr() to find the edge the iterator comes
+ * back from; smaller ones are scanned byte by byte. */
+#define RAX_ITER_MEMCHR_MIN_SIZE 16
+
+/* Return the index of the first edge of the non-compressed node 'n' greater
+ * than 'c', or n->size if there is none. Edges are sorted and unique, so
+ * when 'c' is known to be one of them ('isedge' is true: the iterator goes
+ * back up from the child behind 'c') the answer is the index right after
+ * it. On wide nodes memchr() finds it much faster than the byte-by-byte
+ * scan (libc memchr() is SIMD optimized, see raxLowWalk()), which was the
+ * main cost of iterating a tree with wide nodes. */
+static inline int raxIteratorEdgeAfter(raxNode *n, unsigned char c, int isedge) {
+    if (isedge && n->size > RAX_ITER_MEMCHR_MIN_SIZE) {
+        unsigned char *p = memchr(n->data, c, n->size);
+        debugAssert(p != NULL);
+        return (int)(p - n->data) + 1;
+    }
+    int i = 0;
+    while (i < (int)n->size && n->data[i] <= c) i++;
+    return i;
+}
+
+/* Like raxIteratorEdgeAfter() but return the index of the last edge smaller
+ * than 'c', or -1 if there is none. */
+static inline int raxIteratorEdgeBefore(raxNode *n, unsigned char c, int isedge) {
+    if (isedge && n->size > RAX_ITER_MEMCHR_MIN_SIZE) {
+        unsigned char *p = memchr(n->data, c, n->size);
+        debugAssert(p != NULL);
+        return (int)(p - n->data) - 1;
+    }
+    int i = (int)n->size - 1;
+    while (i >= 0 && n->data[i] >= c) i--;
+    return i;
+}
+
 /* Do an iteration step towards the next element. At the end of the step the
  * iterator key will represent the (new) current key. If it is not possible
  * to step in the specified direction since there are no longer elements, the
@@ -1862,14 +1931,10 @@ int raxIteratorNextStep(raxIterator *it, int noup) {
                 /* Try visiting the next child if there was at least one
                  * additional child. */
                 if (!it->node->iscompr && it->node->size > (old_noup ? 0 : 1)) {
-                    raxNode **cp = raxNodeFirstChildPtr(it->node);
-                    int i = 0;
-                    while (i < it->node->size) {
-                        debugf("SCAN NEXT %c\n", it->node->data[i]);
-                        if (it->node->data[i] > prevchild) break;
-                        i++;
-                        cp++;
-                    }
+                    /* Unless 'noup' was set, 'prevchild' is the edge of the
+                     * child we just went up from. */
+                    int i = raxIteratorEdgeAfter(it->node, prevchild, !old_noup);
+                    raxNode **cp = raxNodeFirstChildPtr(it->node) + i;
                     if (i != it->node->size) {
                         debugf("SCAN found a new node\n");
                         /* Fixed-length leaf inlining: at leaf depth slot `i`
@@ -1991,14 +2056,10 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
         /* Try visiting the prev child if there is at least one
          * child. */
         if (!it->node->iscompr && it->node->size > (old_noup ? 0 : 1)) {
-            raxNode **cp = raxNodeLastChildPtr(it->node);
-            int i = it->node->size-1;
-            while (i >= 0) {
-                debugf("SCAN PREV %c\n", it->node->data[i]);
-                if (it->node->data[i] < prevchild) break;
-                i--;
-                cp--;
-            }
+            /* Unless 'noup' was set, 'prevchild' is the edge of the child
+             * we just went up from. */
+            int i = raxIteratorEdgeBefore(it->node, prevchild, !old_noup);
+            raxNode **cp = raxNodeFirstChildPtr(it->node) + i;
             /* If we found a new subtree to explore in this node,
              * go deeper following all the last children in order to
              * find the key lexicographically greater. */
